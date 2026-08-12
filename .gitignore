@@ -1,0 +1,17 @@
+# Build artifacts
+bin/
+obj/
+
+# Visual Studio
+.vs/
+*.user
+*.Backup.tmp
+*.suo
+
+# User secrets are stored outside the repo (%APPDATA%\Microsoft\UserSecrets\<id>\secrets.json),
+# never in-repo — this entry is defense-in-depth only.
+secrets.json
+
+# OS cruft
+.DS_Store
+Thumbs.db
