@@ -1,0 +1,96 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #12162b;
+  --card: #ffffff;
+  --card-foreground: #12162b;
+  --muted: #f5f6fb;
+  --muted-foreground: #667085;
+  --border: #e7e9f3;
+
+  --primary: #12162b;
+  --primary-foreground: #ffffff;
+
+  --accent: #4a5cff;
+  --accent-foreground: #ffffff;
+  --accent-soft: #eef0ff;
+
+  --purple: #8b5cf6;
+  --purple-soft: #f3effe;
+
+  --success: #17a673;
+  --success-foreground: #ffffff;
+  --success-soft: #e8faf3;
+
+  --orange: #f97316;
+  --orange-soft: #fff1e6;
+
+  --pink: #ec4899;
+  --pink-soft: #fdf0f7;
+
+  --destructive: #e2364a;
+  --destructive-foreground: #ffffff;
+  --destructive-soft: #fdecef;
+
+  --ring: #4a5cff;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent-soft: var(--accent-soft);
+
+  --color-purple: var(--purple);
+  --color-purple-soft: var(--purple-soft);
+
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-success-soft: var(--success-soft);
+
+  --color-orange: var(--orange);
+  --color-orange-soft: var(--orange-soft);
+
+  --color-pink: var(--pink);
+  --color-pink-soft: var(--pink-soft);
+
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-destructive-soft: var(--destructive-soft);
+
+  --color-ring: var(--ring);
+
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
