@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 const productLinks = [
   { href: "/product", label: "Product" },
   { href: "/use-cases", label: "Use cases" },
@@ -24,7 +26,7 @@ export function Footer() {
         <div className="grid gap-12 md:grid-cols-[1.5fr_1fr_1fr_1fr]">
           {/* Brand */}
           <div>
-            <a
+            <Link
               href="/"
               className="inline-flex items-center gap-2.5 text-sm font-semibold tracking-tight text-foreground transition-opacity hover:opacity-70"
             >
@@ -36,7 +38,7 @@ export function Footer() {
               </span>
 
               <span className="tracking-[0.12em]">NIVORA</span>
-            </a>
+            </Link>
 
             <p className="mt-5 max-w-sm text-sm leading-6 text-muted-foreground">
               AI customer support for modern businesses — grounded in your

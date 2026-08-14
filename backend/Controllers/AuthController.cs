@@ -135,4 +135,33 @@ public class AuthController(
         await signInManager.SignOutAsync();
         return NoContent();
     }
+
+    /// <summary>
+    /// Returns the currently signed-in staff user, for the dashboard to
+    /// confirm session state on load (e.g. the post-login home page) without
+    /// guessing from cookie presence alone. Tenant-scoped like everything
+    /// else: the Business lookup goes through the global query filter, so it
+    /// can only ever resolve the caller's own business.
+    /// </summary>
+    [HttpGet("me")]
+    [Authorize(Policy = NivoraPolicies.AnyStaff)]
+    public async Task<IActionResult> Me()
+    {
+        var user = await userManager.GetUserAsync(User);
+        if (user is null)
+        {
+            return Unauthorized();
+        }
+
+        var business = await db.Businesses.FindAsync(user.BusinessId);
+        if (business is null)
+        {
+            return Unauthorized();
+        }
+
+        var roles = await userManager.GetRolesAsync(user);
+
+        return Ok(new MeResponse(
+            user.Id, user.BusinessId, user.Email!, business.Name, business.PlanTier, roles.ToList()));
+    }
 }

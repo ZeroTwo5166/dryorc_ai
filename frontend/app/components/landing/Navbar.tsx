@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 
 const links = [
@@ -16,7 +17,7 @@ export function Navbar() {
     <header className="sticky top-0 z-50 w-full border-b border-border/60 bg-white backdrop-blur-xl">
       <div className="mx-auto flex h-[72px] max-w-[1440px] items-center px-6 sm:px-10 lg:px-14">
         {/* Logo */}
-        <a
+        <Link
           href="/"
           className="group flex shrink-0 items-center gap-2.5"
         >
@@ -27,7 +28,7 @@ export function Navbar() {
           <span className="text-[13px] font-semibold tracking-[0.18em] text-foreground">
             NIVORA
           </span>
-        </a>
+        </Link>
 
         {/* Desktop Navigation */}
         <nav className="ml-16 hidden items-center gap-1 md:flex">
@@ -54,7 +55,7 @@ export function Navbar() {
           </a>
 
           <a
-            href="/contact"
+            href="/signup"
             className="group inline-flex items-center gap-2 rounded-full bg-foreground px-5 py-2.5 text-[13px] font-medium text-background shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md"
           >
             Get started
@@ -133,7 +134,7 @@ export function Navbar() {
               </a>
 
               <a
-                href="/contact"
+                href="/signup"
                 onClick={() => setOpen(false)}
                 className="rounded-xl bg-foreground px-4 py-3.5 text-center text-sm font-medium text-background transition-opacity hover:opacity-90"
               >

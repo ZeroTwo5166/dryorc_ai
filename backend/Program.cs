@@ -24,6 +24,21 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 
 builder.Services.AddHttpContextAccessor();
 
+// Dev-only: lets the Next.js dashboard (a different origin even on the same
+// scheme/host — different port) call this API with cookies attached.
+// AllowCredentials requires an explicit origin list, never AllowAnyOrigin.
+if (builder.Environment.IsDevelopment())
+{
+    builder.Services.AddCors(options =>
+    {
+        options.AddPolicy("DashboardDev", policy => policy
+            .WithOrigins("http://localhost:3000")
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials());
+    });
+}
+
 // Real as of Step 4 — resolves BusinessId from the authenticated user's
 // claims (see Auth/ClaimsCurrentTenantAccessor.cs). Fail-closed: null
 // (unauthenticated, missing/invalid claim) means the global EF Core tenant
@@ -118,6 +133,11 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseCors("DashboardDev");
+}
 
 app.UseAuthentication();
 app.UseAuthorization();
