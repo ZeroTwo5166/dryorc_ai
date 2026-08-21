@@ -23,6 +23,10 @@ namespace backend.Models;
 /// The AI's requested update is never executed on trust alone — the
 /// backend must verify CustomerId matches the conversation's Level-2-
 /// verified customer before calling Shopify.
+///
+/// Not touched by CustomerErasureService/ConversationPurgeService at all —
+/// see FinancialRecordRetentionPolicy for why (a legal retention
+/// obligation, not indefinite retention; no enforcement job exists yet).
 /// </summary>
 public class CustomerUpdateAction : ITenantOwned
 {

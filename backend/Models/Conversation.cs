@@ -13,12 +13,15 @@ public class Conversation : ITenantOwned
     public Guid? CustomerId { get; set; }
 
     /// <summary>
-    /// Always set, from widget init — this is what an anonymous visitor is
-    /// tracked by before (and after) a CustomerId is attached. Not unique —
-    /// a single visitor session can create multiple conversations over
-    /// time (e.g. a resolved conversation weeks ago, a new one today).
+    /// Set from widget init — this is what an anonymous visitor is tracked
+    /// by before (and after) a CustomerId is attached. Not unique — a
+    /// single visitor session can create multiple conversations over time
+    /// (e.g. a resolved conversation weeks ago, a new one today). Nulled by
+    /// ConversationPurgeService (customer erasure or retention expiry) —
+    /// this is the one remaining session-linkable identifier on the
+    /// conversation shell once its Messages are gone.
     /// </summary>
-    public required string VisitorSessionId { get; set; }
+    public string? VisitorSessionId { get; set; }
 
     public ConversationStatus Status { get; set; } = ConversationStatus.Open;
 
@@ -55,13 +58,21 @@ public class Conversation : ITenantOwned
     /// </summary>
     public DateTimeOffset? LastMessageAt { get; set; }
 
+    /// <summary>
+    /// True once ConversationPurgeService has purged this conversation
+    /// (customer erasure or retention expiry) — its Messages are gone and
+    /// VisitorSessionId is nulled, but the row survives as an analytics
+    /// shell (Channel/Status/Tags/CreatedAt/LastMessageAt all remain).
+    /// Doubles as the idempotency marker: PurgeConversationAsync checks
+    /// this first and no-ops if already true, rather than re-attempting
+    /// work that already committed.
+    /// </summary>
+    public bool IsAnonymized { get; set; } = false;
+    public DateTimeOffset? AnonymizedAt { get; set; }
+
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
 }
-
-
-
-
 
 
 

@@ -363,6 +363,9 @@ namespace backend.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("uuid");
 
+                    b.Property<DateTimeOffset?>("AnonymizedAt")
+                        .HasColumnType("timestamp with time zone");
+
                     b.Property<Guid>("BusinessId")
                         .HasColumnType("uuid");
 
@@ -381,6 +384,9 @@ namespace backend.Migrations
                         .IsRequired()
                         .HasMaxLength(32)
                         .HasColumnType("character varying(32)");
+
+                    b.Property<bool>("IsAnonymized")
+                        .HasColumnType("boolean");
 
                     b.Property<DateTimeOffset?>("LastMessageAt")
                         .HasColumnType("timestamp with time zone");
@@ -401,7 +407,6 @@ namespace backend.Migrations
                         .HasColumnType("timestamp with time zone");
 
                     b.Property<string>("VisitorSessionId")
-                        .IsRequired()
                         .HasColumnType("text");
 
                     b.Property<Guid>("WidgetId")

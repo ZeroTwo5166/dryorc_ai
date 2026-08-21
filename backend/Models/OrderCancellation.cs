@@ -30,6 +30,10 @@ namespace backend.Models;
 /// the backend must verify CustomerId actually owns ExternalOrderId
 /// before calling Shopify, independent of whether the conversation is
 /// Level 2 verified for some customer in general.
+///
+/// Not touched by CustomerErasureService/ConversationPurgeService at all —
+/// see FinancialRecordRetentionPolicy for why (a legal retention
+/// obligation, not indefinite retention; no enforcement job exists yet).
 /// </summary>
 public class OrderCancellation : ITenantOwned
 {

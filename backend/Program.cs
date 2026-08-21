@@ -4,6 +4,7 @@ using backend.Data;
 using backend.Email;
 using backend.Interfaces;
 using backend.Models;
+using backend.Services;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
@@ -46,6 +47,20 @@ if (builder.Environment.IsDevelopment())
 // (unauthenticated, missing/invalid claim) means the global EF Core tenant
 // query filter matches zero rows, never everything.
 builder.Services.AddScoped<ICurrentTenantAccessor, ClaimsCurrentTenantAccessor>();
+
+// ─────────────────────────────────────────────────────────────
+// Customer data lifecycle (GDPR erasure + retention) — see
+// Services/ConversationPurgeService.cs for why CustomerErasureService and
+// RetentionEnforcementService share one purge operation instead of two.
+// IPurgeFailurePoint is a real DI-registered no-op in production; tests
+// substitute a fake to deterministically fail PurgeConversationAsync
+// partway through, proving its transaction rolls back.
+builder.Services.AddScoped<IPurgeFailurePoint, NoOpPurgeFailurePoint>();
+builder.Services.AddScoped<IConversationPurgeService, ConversationPurgeService>();
+builder.Services.AddScoped<ICustomerErasureService, CustomerErasureService>();
+builder.Services.AddScoped<IRetentionEnforcementService, RetentionEnforcementService>();
+builder.Services.AddScoped<IVerificationCodeCleanupService, VerificationCodeCleanupService>();
+builder.Services.AddHostedService<DataLifecycleBackgroundService>();
 
 // ─────────────────────────────────────────────────────────────
 // Identity — cookie-based auth for staff/dashboard users.

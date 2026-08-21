@@ -22,7 +22,10 @@ namespace backend.Models;
 /// against the business toggle and refund policy before executing.
 ///
 /// ExternalRefundId is kept (not redacted on customer anonymization) —
-/// an operational fact, same as OrderCancellation.ExternalOrderId.
+/// an operational fact, same as OrderCancellation.ExternalOrderId. Not
+/// touched by CustomerErasureService/ConversationPurgeService at all — see
+/// FinancialRecordRetentionPolicy for why (a legal retention obligation,
+/// not indefinite retention; no enforcement job exists yet).
 ///
 /// The backend must verify CustomerId actually owns ExternalOrderId
 /// before calling Shopify.
