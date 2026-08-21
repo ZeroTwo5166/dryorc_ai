@@ -1,3 +1,4 @@
+import brand from "@/brand.json";
 import { AuditLogPanel, TenantIsolationPanel } from "./Mockups";
 
 export function Security() {
@@ -44,7 +45,7 @@ export function Security() {
         <div className="mt-12 flex flex-col gap-6 border-t border-border pt-8 sm:flex-row">
           <p className="max-w-sm text-sm leading-relaxed text-muted-foreground">
             <span className="font-semibold text-foreground">
-              Nivora executes, the model never does.
+              {brand.name} executes, the model never does.
             </span>{" "}
             The AI can propose a cancellation or refund. It cannot call your
             commerce platform directly.

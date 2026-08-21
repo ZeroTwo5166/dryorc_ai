@@ -1,8 +1,8 @@
 "use client";
 
-import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { useRouter } from "next/navigation";
+import brand from "@/brand.json";
 import {
   IconLayers,
   IconMessageSquare,
@@ -11,7 +11,8 @@ import {
   IconWorkflow,
 } from "../components/landing/icons";
 import { StatusPill } from "../components/landing/Mockups";
-import { logout, me, type MeResponse } from "../lib/api";
+import { DashboardShell } from "../components/layout/DashboardShell";
+import { useAuth } from "../lib/auth-context";
 
 const stats = [
   { label: "Conversations", icon: IconMessageSquare, tone: "accent" },
@@ -31,7 +32,7 @@ const checklist = [
   {
     icon: IconStore,
     title: "Connect your store",
-    description: "Link Shopify so Nivora can see orders, customers, and products.",
+    description: `Link Shopify so ${brand.name} can see orders, customers, and products.`,
   },
   {
     icon: IconLayers,
@@ -52,35 +53,13 @@ const checklist = [
 
 export default function HomePage() {
   const router = useRouter();
-  const [user, setUser] = useState<MeResponse | null>(null);
-  const [status, setStatus] = useState<"loading" | "ready">("loading");
-  const [signingOut, setSigningOut] = useState(false);
+  const { user, status } = useAuth();
 
   useEffect(() => {
-    let cancelled = false;
-    me()
-      .then((data) => {
-        if (!cancelled) {
-          setUser(data);
-          setStatus("ready");
-        }
-      })
-      .catch(() => {
-        if (!cancelled) router.replace("/login");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [router]);
-
-  async function handleSignOut() {
-    setSigningOut(true);
-    try {
-      await logout();
-    } finally {
-      router.push("/login");
+    if (status === "ready" && !user) {
+      router.replace("/login");
     }
-  }
+  }, [status, user, router]);
 
   if (status === "loading" || !user) {
     return (
@@ -93,46 +72,15 @@ export default function HomePage() {
   const firstName = user.email.split("@")[0];
 
   return (
-    <div className="min-h-screen bg-muted/30">
-      {/* Top bar */}
-      <header className="sticky top-0 z-40 border-b border-border bg-white/80 backdrop-blur-xl">
-        <div className="mx-auto flex h-[68px] max-w-[1200px] items-center px-6 sm:px-10">
-          <Link href="/" className="flex shrink-0 items-center gap-2.5">
-            <span className="flex h-8 w-8 items-center justify-center rounded-[9px] bg-foreground text-[11px] font-bold tracking-tight text-background">
-              N
-            </span>
-            <span className="text-[13px] font-semibold tracking-[0.18em] text-foreground">
-              NIVORA
-            </span>
-          </Link>
-
-          <div className="ml-6 hidden items-center gap-2 border-l border-border pl-6 sm:flex">
-            <span className="text-sm font-medium text-foreground">
-              {user.businessName}
-            </span>
-            <StatusPill label={user.planTier ?? "trial"} tone="accent" />
-          </div>
-
-          <div className="ml-auto flex items-center gap-3">
-            <span className="hidden text-sm text-muted-foreground sm:inline">
-              {user.email}
-            </span>
-            <button
-              type="button"
-              onClick={handleSignOut}
-              disabled={signingOut}
-              className="rounded-full border border-border px-4 py-2 text-[13px] font-medium text-foreground transition-colors hover:bg-muted disabled:opacity-60"
-            >
-              {signingOut ? "Signing out…" : "Sign out"}
-            </button>
-          </div>
-        </div>
-      </header>
-
+    <DashboardShell>
       <main className="mx-auto max-w-[1200px] px-6 py-12 sm:px-10">
-        <p className="text-sm font-medium text-accent">
-          {user.roles[0] ?? "Staff"}
-        </p>
+        <div className="flex flex-wrap items-center gap-2.5">
+          <p className="text-sm font-medium text-accent">
+            {user.roles[0] ?? "Staff"}
+          </p>
+          <span className="h-1 w-1 rounded-full bg-border" />
+          <StatusPill label={user.planTier ?? "trial"} tone="accent" />
+        </div>
         <h1 className="mt-2 text-3xl font-semibold tracking-tight text-foreground sm:text-4xl">
           Welcome back, {firstName}.
         </h1>
@@ -205,6 +153,6 @@ export default function HomePage() {
           </div>
         </div>
       </main>
-    </div>
+    </DashboardShell>
   );
 }

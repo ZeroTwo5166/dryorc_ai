@@ -36,6 +36,77 @@
   --ring: #4a5cff;
 }
 
+/*
+ * Dark palette. Brand/status colors (accent, purple, success, orange, pink,
+ * destructive) are deliberately kept identical to the light theme — they're
+ * already vivid enough to read on a dark surface, and design systems that
+ * keep semantic colors constant across themes stay far more predictable
+ * than ones that re-tune every hue twice. Only surfaces, text, borders, and
+ * each color's pale "soft" background wash actually change here.
+ *
+ * Applies only for an explicit data-theme="dark" (set by ThemeProvider/
+ * theme-context.tsx) — there's no OS prefers-color-scheme fallback: the
+ * three themes (light / dark / nivora) are peers a visitor picks from, not
+ * something that should silently follow the system. "light" and "nivora"
+ * share the same values above with no override needed here for ordinary
+ * page content — the two only diverge in the app's persistent chrome
+ * (Sidebar, Navbar) and in the auth-form surface below, each of which reads
+ * the theme directly to special-case its own fixed blue-navy look only when
+ * "nivora" is active.
+ */
+:root[data-theme="dark"] {
+  --background: #0a0a0a;
+  --foreground: #fafafa;
+  --card: #171717;
+  --card-foreground: #fafafa;
+  --muted: #262626;
+  --muted-foreground: #a3a3a3;
+  --border: #333333;
+
+  --primary: #fafafa;
+  --primary-foreground: #0a0a0a;
+
+  --accent-soft: #1a2050;
+  --purple-soft: #241a42;
+  --success-soft: #0f2a22;
+  --orange-soft: #2e1d10;
+  --pink-soft: #2e1626;
+  --destructive-soft: #341620;
+}
+
+/*
+ * The login/signup/etc. card itself (AuthShell.tsx, the box marked with the
+ * "auth-card" class — form fields, error/success banners, the checkbox all
+ * live inside it) goes brand-navy under "nivora." The page around it
+ * (background, ambient glow, header aside) is untouched — this is scoped to
+ * `.auth-card`, not the whole AuthShell root, specifically so the page stays
+ * light and only the card itself reads as the brand's blue. Reuses the same
+ * surface/text/border shape as the dark palette (only genuinely
+ * dark-surface-appropriate values change; accent/status hues stay
+ * constant), just tuned navy instead of neutral gray, and with --primary
+ * swapped to the brand accent blue so every bg-primary button inside the
+ * card (not just SubmitButton, which already branches on nivora itself)
+ * reads as "the brand's blue," not a generic dark pill.
+ */
+:root[data-theme="nivora"] .auth-card {
+  --card: #161c3d;
+  --card-foreground: #f5f6fb;
+  --foreground: #f5f6fb;
+  --muted: #1c2350;
+  --muted-foreground: #9aa1cf;
+  --border: rgba(255, 255, 255, 0.12);
+
+  --primary: #4a5cff;
+  --primary-foreground: #ffffff;
+
+  --accent-soft: #1a2050;
+  --purple-soft: #241a42;
+  --success-soft: #0f2a22;
+  --orange-soft: #2e1d10;
+  --pink-soft: #2e1626;
+  --destructive-soft: #341620;
+}
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);

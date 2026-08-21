@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import brand from "@/brand.json";
 import {
   IconLayers,
   IconLock,
@@ -31,7 +32,7 @@ const resources = [
     icon: IconLock,
     tone: "accent",
     title: "Terms of Service",
-    description: "The agreement covering your use of Nivora's platform and widget.",
+    description: `The agreement covering your use of ${brand.name}'s platform and widget.`,
     href: "/terms",
     cta: "Read terms",
   },
@@ -54,9 +55,9 @@ const toneBg: Record<string, string> = {
 };
 
 export const metadata: Metadata = {
-  title: "Resources — Nivora",
+  title: `Resources — ${brand.name}`,
   description:
-    "Trust Center, privacy policy, terms of service, and documentation for building on Nivora.",
+    `Trust Center, privacy policy, terms of service, and documentation for building on ${brand.name}.`,
 };
 
 export default function ResourcesPage() {
@@ -65,7 +66,7 @@ export default function ResourcesPage() {
       <PageHero
         eyebrow="Resources"
         tone="success"
-        title="Everything behind how Nivora works."
+        title={`Everything behind how ${brand.name} works.`}
         subtitle="Policies, security posture, and documentation — for the people who ask before they buy."
       />
 

@@ -1,3 +1,5 @@
+import brand from "@/brand.json";
+
 export type LegalSection = {
   heading: string;
   body: string[];
@@ -54,8 +56,8 @@ export function LegalDocument({
         <div className="mt-14 rounded-2xl border border-border bg-muted/50 p-6">
           <p className="text-sm leading-relaxed text-muted-foreground">
             Questions about this document? Reach us at{" "}
-            <a href="mailto:hello@nivora.app" className="font-medium text-foreground hover:text-accent">
-              hello@nivora.app
+            <a href={`mailto:${brand.email}`} className="font-medium text-foreground hover:text-accent">
+              {brand.email}
             </a>
             .
           </p>

@@ -2,9 +2,12 @@
 
 import { Suspense, useState, type FormEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import brand from "@/brand.json";
 import { AuthShell } from "../components/auth/AuthShell";
-import { FormError, FormField, SubmitButton } from "../components/auth/FormField";
-import { ApiError, login } from "../lib/api";
+import { FormError, FormField, PasswordInput, SubmitButton } from "../components/auth/FormField";
+import { IconLock } from "../components/landing/icons";
+import { useAuth } from "../lib/auth-context";
+import { ApiError, login, resendVerificationEmail } from "../lib/api";
 
 export default function LoginPage() {
   return (
@@ -17,37 +20,60 @@ export default function LoginPage() {
 function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const registered = searchParams.get("registered") === "1";
+  const verified = searchParams.get("verified") === "1";
+  const { refresh } = useAuth();
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [rememberMe, setRememberMe] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [needsVerification, setNeedsVerification] = useState(false);
+  const [resendState, setResendState] = useState<"idle" | "sending" | "sent">("idle");
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setError(null);
+    setNeedsVerification(false);
+    setResendState("idle");
     setLoading(true);
     try {
       await login({ email, password, rememberMe });
+      await refresh();
       router.push("/home");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Something went wrong. Please try again.");
+      if (err instanceof ApiError) {
+        setError(err.message);
+        setNeedsVerification(err.status === 403);
+      } else {
+        setError("Something went wrong. Please try again.");
+      }
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleResend() {
+    setResendState("sending");
+    try {
+      await resendVerificationEmail(email);
+    } finally {
+      setResendState("sent");
     }
   }
 
   return (
     <AuthShell
       eyebrow="Welcome back"
-      title="Sign in to Nivora"
+      title={`Sign in to ${brand.name}`}
       subtitle="Access your dashboard, conversations, and queue."
+      icon={IconLock}
+      switchLabel="Create account"
+      switchHref="/signup"
     >
-      {registered && (
+      {verified && (
         <div className="mb-6 rounded-xl border border-success-soft bg-success-soft px-3.5 py-3 text-[13px] text-success">
-          Account created — sign in to continue.
+          Email verified — sign in to continue.
         </div>
       )}
 
@@ -68,19 +94,17 @@ function LoginForm() {
             <label htmlFor="password" className="text-[13px] font-medium text-foreground">
               Password
             </label>
-            <a href="/contact" className="text-[12.5px] font-medium text-accent hover:opacity-80">
+            <a href="/forgot-password" className="text-[12.5px] font-medium text-accent hover:opacity-80">
               Forgot password?
             </a>
           </div>
-          <input
+          <PasswordInput
             id="password"
-            type="password"
             autoComplete="current-password"
             placeholder="••••••••"
             required
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            className="w-full rounded-xl border border-border bg-card px-3.5 py-2.5 text-sm text-foreground shadow-sm outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-accent focus:ring-2 focus:ring-accent/20"
           />
         </div>
 
@@ -96,15 +120,28 @@ function LoginForm() {
 
         {error && <FormError message={error} />}
 
+        {needsVerification && (
+          <p className="-mt-2 text-[13px] text-muted-foreground">
+            {resendState === "sent" ? (
+              "Verification email sent — check your inbox."
+            ) : (
+              <>
+                Didn&apos;t get the link?{" "}
+                <button
+                  type="button"
+                  onClick={handleResend}
+                  disabled={resendState === "sending"}
+                  className="cursor-pointer font-medium text-accent hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {resendState === "sending" ? "Sending…" : "Resend verification email"}
+                </button>
+              </>
+            )}
+          </p>
+        )}
+
         <SubmitButton loading={loading}>Sign in</SubmitButton>
       </form>
-
-      <p className="mt-8 text-center text-sm text-muted-foreground">
-        Don&apos;t have an account?{" "}
-        <a href="/signup" className="font-medium text-foreground hover:text-accent">
-          Create one
-        </a>
-      </p>
     </AuthShell>
   );
 }

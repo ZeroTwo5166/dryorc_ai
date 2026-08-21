@@ -1,5 +1,7 @@
+using System.Net.Http.Headers;
 using backend.Auth;
 using backend.Data;
+using backend.Email;
 using backend.Interfaces;
 using backend.Models;
 using Microsoft.AspNetCore.Authentication.Cookies;
@@ -64,10 +66,41 @@ builder.Services.AddScoped<ICurrentTenantAccessor, ClaimsCurrentTenantAccessor>(
 // Auth/TenantAwareUserStore.cs) in place of the default EF Core store.
 // ─────────────────────────────────────────────────────────────
 builder.Services
-    .AddIdentity<ApplicationUser, IdentityRole<Guid>>()
+    .AddIdentity<ApplicationUser, IdentityRole<Guid>>(options =>
+    {
+        // A staff account exists but can't sign in until its email is
+        // confirmed — SignInManager.PasswordSignInAsync returns
+        // SignInResult.NotAllowed for it automatically (PreSignInCheck),
+        // so AuthController.Login only needs to branch on that result, not
+        // re-check EmailConfirmed itself.
+        options.SignIn.RequireConfirmedEmail = true;
+    })
     .AddUserStore<TenantAwareUserStore>()
     .AddRoleStore<RoleStore<IdentityRole<Guid>, AppDbContext, Guid>>()
-    .AddClaimsPrincipalFactory<NivoraClaimsPrincipalFactory>();
+    .AddClaimsPrincipalFactory<NivoraClaimsPrincipalFactory>()
+    // Confirmed empirically, not assumed: AddIdentity does NOT register the
+    // default token providers on its own here — GenerateEmailConfirmationTokenAsync
+    // threw "No IUserTwoFactorTokenProvider<TUser> named 'Default' is registered"
+    // without this call.
+    .AddDefaultTokenProviders();
+
+// Resend (https://resend.com) — transactional email for the account
+// verification flow. FromEmail defaults to Resend's shared onboarding@resend.dev
+// sender (see ResendOptions); ApiKey is never in appsettings.json — set via
+// `dotnet user-secrets set "Resend:ApiKey" "re_..."` (Development) or the
+// hosting platform's configuration (production), same rule as the DB
+// connection string above.
+builder.Services.Configure<ResendOptions>(builder.Configuration.GetSection(ResendOptions.SectionName));
+builder.Services.AddHttpClient<IEmailSender, ResendEmailSender>(client =>
+{
+    client.BaseAddress = new Uri("https://api.resend.com/");
+
+    var resendApiKey = builder.Configuration["Resend:ApiKey"]
+        ?? throw new InvalidOperationException(
+            "Missing Resend:ApiKey. Set it via `dotnet user-secrets set \"Resend:ApiKey\" \"re_...\"` " +
+            "(Development) or the hosting platform's configuration (production) — never commit it.");
+    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", resendApiKey);
+});
 
 builder.Services.ConfigureApplicationCookie(options =>
 {
@@ -83,8 +116,15 @@ builder.Services.ConfigureApplicationCookie(options =>
     // naturally from that. Never SameSite=None here; that's reserved for
     // the widget's separate cross-site cookie, not this one.
     options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+    // Absolute, not sliding: a session expires exactly 8 hours after
+    // sign-in no matter how active the user is — activity must never
+    // silently extend it. The only way to get more time is the explicit
+    // POST /api/auth/extend-session (AuthController.ExtendSession), which
+    // re-issues the cookie with its own new absolute (+2h) expiry — also
+    // never sliding, since that's a property of this handler, not of any
+    // one ticket.
     options.ExpireTimeSpan = TimeSpan.FromHours(8);
-    options.SlidingExpiration = true;
+    options.SlidingExpiration = false;
 
     // This is a JSON API, not a Razor/MVC app — an unauthenticated or
     // forbidden request must get a real status code, not Identity's

@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import brand from "@/brand.json";
 import { CTA } from "../components/landing/CTA";
 import { IconCheck } from "../components/landing/icons";
 import { MarketingShell } from "../components/marketing/MarketingShell";
@@ -65,7 +66,7 @@ const faqs = [
   },
   {
     q: "Is my data hosted in the EU?",
-    a: "Yes — Nivora's infrastructure and customer data are EU-hosted by default, aligned with GDPR.",
+    a: `Yes — ${brand.name}'s infrastructure and customer data are EU-hosted by default, aligned with GDPR.`,
   },
   {
     q: "Can I cancel anytime?",
@@ -74,7 +75,7 @@ const faqs = [
 ];
 
 export const metadata: Metadata = {
-  title: "Pricing — Nivora",
+  title: `Pricing — ${brand.name}`,
   description:
     "Simple, conversation-based pricing. Start free, upgrade to automate refunds and cancellations, or talk to us about Enterprise.",
 };
@@ -102,31 +103,31 @@ export default function PricingPage() {
                 }`}
               >
                 {plan.highlighted && (
-                  <span className="mb-4 inline-flex w-fit items-center rounded-full bg-white/10 px-3 py-1 text-[11px] font-medium text-white">
+                  <span className="mb-4 inline-flex w-fit items-center rounded-full bg-background/10 px-3 py-1 text-[11px] font-medium text-background">
                     Most popular
                   </span>
                 )}
 
                 <h3
-                  className={`text-lg font-semibold tracking-tight ${plan.highlighted ? "text-white" : "text-foreground"}`}
+                  className={`text-lg font-semibold tracking-tight ${plan.highlighted ? "text-background" : "text-foreground"}`}
                 >
                   {plan.name}
                 </h3>
                 <p
-                  className={`mt-2 text-sm leading-relaxed ${plan.highlighted ? "text-white/70" : "text-muted-foreground"}`}
+                  className={`mt-2 text-sm leading-relaxed ${plan.highlighted ? "text-background/70" : "text-muted-foreground"}`}
                 >
                   {plan.description}
                 </p>
 
                 <div className="mt-6 flex items-baseline gap-1.5">
                   <span
-                    className={`text-4xl font-semibold tracking-tight ${plan.highlighted ? "text-white" : "text-foreground"}`}
+                    className={`text-4xl font-semibold tracking-tight ${plan.highlighted ? "text-background" : "text-foreground"}`}
                   >
                     {plan.price}
                   </span>
                   {plan.period && (
                     <span
-                      className={`text-sm ${plan.highlighted ? "text-white/60" : "text-muted-foreground"}`}
+                      className={`text-sm ${plan.highlighted ? "text-background/60" : "text-muted-foreground"}`}
                     >
                       {plan.period}
                     </span>
@@ -137,7 +138,7 @@ export default function PricingPage() {
                   href={plan.href}
                   className={`mt-7 inline-flex items-center justify-center rounded-full px-5 py-3 text-sm font-medium shadow-sm transition-opacity hover:opacity-90 ${
                     plan.highlighted
-                      ? "bg-white text-foreground"
+                      ? "bg-background text-foreground"
                       : "bg-primary text-primary-foreground"
                   }`}
                 >
@@ -149,13 +150,13 @@ export default function PricingPage() {
                     <li key={f} className="flex items-start gap-2.5">
                       <span
                         className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full ${
-                          plan.highlighted ? "bg-white/10 text-white" : "bg-accent-soft text-accent"
+                          plan.highlighted ? "bg-background/10 text-background" : "bg-accent-soft text-accent"
                         }`}
                       >
                         <IconCheck className="h-2.5 w-2.5" />
                       </span>
                       <span
-                        className={`text-[13.5px] leading-relaxed ${plan.highlighted ? "text-white/85" : "text-muted-foreground"}`}
+                        className={`text-[13.5px] leading-relaxed ${plan.highlighted ? "text-background/85" : "text-muted-foreground"}`}
                       >
                         {f}
                       </span>

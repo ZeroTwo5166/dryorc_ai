@@ -15,10 +15,51 @@ export class ApiError extends Error {
   }
 }
 
+// Backend error bodies aren't always plain text: AuthController.Register
+// returns a raw JSON array of IdentityResult error strings (e.g.
+// `["Passwords must have at least one non alphanumeric character."]`), and
+// [ApiController]'s built-in model-validation 400s return an ASP.NET
+// ProblemDetails object (`{ errors: { Field: ["msg", ...] } }`). Parse both
+// shapes into a plain, human-readable sentence instead of showing the raw body.
+function parseErrorBody(raw: string): string {
+  if (!raw) return "";
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return raw; // plain text body (e.g. BadRequest("some message")) — use as-is
+  }
+
+  if (Array.isArray(parsed)) {
+    return parsed.filter((v) => typeof v === "string").join(" ");
+  }
+  if (typeof parsed === "string") {
+    return parsed;
+  }
+  if (parsed && typeof parsed === "object") {
+    const obj = parsed as { errors?: Record<string, unknown>; title?: string };
+    if (obj.errors && typeof obj.errors === "object") {
+      return Object.values(obj.errors)
+        .flat()
+        .filter((v): v is string => typeof v === "string")
+        .join(" ");
+    }
+    if (typeof obj.title === "string") {
+      return obj.title;
+    }
+  }
+  return raw;
+}
+
 async function apiFetch(path: string, init?: RequestInit) {
   const res = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
     credentials: "include",
+    // Auth-check responses (/me in particular) must never be served from the
+    // browser's HTTP cache — the backend sends no Cache-Control on it either,
+    // so this closes that gap defensively rather than relying on that holding.
+    cache: "no-store",
     headers: {
       "Content-Type": "application/json",
       ...init?.headers,
@@ -26,18 +67,78 @@ async function apiFetch(path: string, init?: RequestInit) {
   });
 
   if (!res.ok) {
+    // No special-casing for 401 here, deliberately — this function is the
+    // shared primitive for both anonymous endpoints (login, register, ...)
+    // and, via api.get/api.post below, every authenticated one too, and a
+    // 401 means something different on each: "wrong password" on login,
+    // but "your session died" everywhere else. Login's own 401 message is
+    // set in login() below, where that distinction is actually knowable.
     const message =
-      res.status === 401
-        ? "Invalid email or password."
-        : res.status === 409
-          ? "An account with this email already exists."
-          : await res.text().catch(() => "") || `Request failed (${res.status}).`;
+      res.status === 409
+        ? "An account with this email already exists."
+        : parseErrorBody(await res.text().catch(() => "")) || `Request failed (${res.status}).`;
     throw new ApiError(res.status, message);
   }
 
   if (res.status === 204) return null;
   return res.json();
 }
+
+// Centralized 401 handling — registered once by AuthProvider (auth-context.tsx),
+// which is the only place with both the auth state to clear and a router to
+// redirect with. api.ts itself has neither, so it just calls whatever's
+// registered; nothing here does navigation or state directly.
+//
+// Deliberately global-callback-based rather than e.g. a React context: this
+// needs to be callable from apiFetch, a plain function with no component
+// tree to consume a context from, and reachable from api.get/api.post calls
+// made anywhere (inside or outside a component).
+type UnauthorizedHandler = () => void;
+let unauthorizedHandler: UnauthorizedHandler | null = null;
+
+export function setUnauthorizedHandler(handler: UnauthorizedHandler | null) {
+  unauthorizedHandler = handler;
+}
+
+// Wraps apiFetch for endpoints that require an existing session — every
+// authenticated endpoint, present and future, should go through this (via
+// the `api` object below) instead of calling apiFetch directly. A 401 here
+// always means the same thing: the session that got the caller into this
+// authenticated code path in the first place is no longer valid — so it's
+// handled once, centrally, instead of every call site needing its own
+// `if (status === 401)` branch.
+//
+// /api/auth/me is the one deliberate exception, staying on plain apiFetch
+// (see auth-context.tsx's fetchMe) — it's the *discovery* endpoint, callable
+// from public marketing pages where "not logged in" is an expected, normal
+// 401, not a session-died event, so it must never trigger this redirect.
+//
+// Never retries and never calls another authenticated endpoint itself —
+// both would risk a loop if the session is already dead (e.g.
+// extend-session's own 401 must not trigger another extend attempt).
+async function authedRequest(path: string, init?: RequestInit) {
+  try {
+    return await apiFetch(path, init);
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 401) {
+      unauthorizedHandler?.();
+    }
+    throw err;
+  }
+}
+
+// The authenticated API client — `api.get("/api/customers")`,
+// `api.post("/api/messages", data)`, etc. Every authenticated endpoint
+// should be called through this, not apiFetch directly, so its 401 handling
+// is automatic rather than something each caller re-implements.
+export const api = {
+  get: (path: string) => authedRequest(path),
+  post: (path: string, body?: unknown) =>
+    authedRequest(path, {
+      method: "POST",
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    }),
+};
 
 export type RegisterRequest = {
   businessName: string;
@@ -72,6 +173,10 @@ export type MeResponse = {
   businessName: string;
   planTier: string | null;
   roles: string[];
+  // Absolute expiry of the current session cookie, server-computed — the
+  // frontend's session-expiry warning schedules off this, never off its own
+  // guess. See AuthController.Me / ExtendSession.
+  expiresAtUtc: string;
 };
 
 export function register(body: RegisterRequest): Promise<RegisterResponse> {
@@ -81,17 +186,83 @@ export function register(body: RegisterRequest): Promise<RegisterResponse> {
   });
 }
 
-export function login(body: LoginRequest): Promise<LoginResponse> {
-  return apiFetch("/api/auth/login", {
+export async function login(body: LoginRequest): Promise<LoginResponse> {
+  try {
+    return await apiFetch("/api/auth/login", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    // AuthController.Login returns a bare 401 with no body for wrong
+    // credentials, so parseErrorBody has nothing to work with here — give
+    // it a real message instead of the generic "Request failed (401)."
+    // fallback. Scoped to this one call, not apiFetch's shared 401 handling,
+    // since login is the only place a 401 actually means "wrong password."
+    if (err instanceof ApiError && err.status === 401) {
+      throw new ApiError(401, "Invalid email or password.");
+    }
+    throw err;
+  }
+}
+
+export function logout(): Promise<null> {
+  return api.post("/api/auth/logout");
+}
+
+export function me(): Promise<MeResponse> {
+  return apiFetch("/api/auth/me");
+}
+
+export type ConfirmEmailRequest = {
+  userId: string;
+  token: string;
+};
+
+export function confirmEmail(body: ConfirmEmailRequest): Promise<null> {
+  return apiFetch("/api/auth/confirm-email", {
     method: "POST",
     body: JSON.stringify(body),
   });
 }
 
-export function logout(): Promise<null> {
-  return apiFetch("/api/auth/logout", { method: "POST" });
+export function resendVerificationEmail(email: string): Promise<null> {
+  return apiFetch("/api/auth/resend-verification", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
 }
 
-export function me(): Promise<MeResponse> {
-  return apiFetch("/api/auth/me");
+export function forgotPassword(email: string): Promise<null> {
+  return apiFetch("/api/auth/forgot-password", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+}
+
+export type ResetPasswordRequest = {
+  userId: string;
+  token: string;
+  newPassword: string;
+};
+
+export function resetPassword(body: ResetPasswordRequest): Promise<null> {
+  return apiFetch("/api/auth/reset-password", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export type ExtendSessionResponse = {
+  expiresAtUtc: string;
+};
+
+// Server-side session extension (AuthController.ExtendSession) — the server
+// re-issues the auth cookie with a new absolute (+2h) expiry and returns it
+// here so the frontend timer can reschedule off the real value, not a guess.
+// Goes through the authenticated client deliberately: if the session is
+// already gone, this 401s like any other authenticated call, and the
+// centralized handler above logs out — no separate handling needed here,
+// and no risk of retrying an extend on a session that's already dead.
+export function extendSession(): Promise<ExtendSessionResponse> {
+  return api.post("/api/auth/extend-session");
 }

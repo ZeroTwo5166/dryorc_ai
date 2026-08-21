@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, type FormEvent } from "react";
+import brand from "@/brand.json";
 import { FormField } from "../components/auth/FormField";
 import { IconMessageSquare, IconShieldCheck, IconWorkflow } from "../components/landing/icons";
 import { MarketingShell } from "../components/marketing/MarketingShell";
@@ -9,7 +10,7 @@ const channels = [
   {
     icon: IconMessageSquare,
     title: "Book a demo",
-    detail: "hello@nivora.app",
+    detail: brand.email,
   },
   {
     icon: IconWorkflow,
@@ -30,9 +31,9 @@ export default function ContactPage() {
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
-    const subject = encodeURIComponent(`Nivora inquiry from ${name || "website visitor"}`);
+    const subject = encodeURIComponent(`${brand.name} inquiry from ${name || "website visitor"}`);
     const body = encodeURIComponent(`${message}\n\n— ${name} (${email})`);
-    window.location.href = `mailto:hello@nivora.app?subject=${subject}&body=${body}`;
+    window.location.href = `mailto:${brand.email}?subject=${subject}&body=${body}`;
   }
 
   return (
@@ -46,7 +47,7 @@ export default function ContactPage() {
             </h1>
             <p className="mt-6 max-w-md text-lg leading-relaxed text-muted-foreground">
               Tell us a bit about your setup and we&apos;ll show you exactly
-              how Nivora handles your catalog, policies, and volume.
+              how {brand.name} handles your catalog, policies, and volume.
             </p>
 
             <div className="mt-10 flex flex-col gap-5">
@@ -108,12 +109,12 @@ export default function ContactPage() {
 
             <button
               type="submit"
-              className="inline-flex w-full items-center justify-center gap-2 rounded-full bg-primary px-5 py-3 text-sm font-medium text-primary-foreground shadow-sm transition-opacity hover:opacity-90"
+              className="inline-flex w-full cursor-pointer items-center justify-center gap-2 rounded-full bg-primary px-5 py-3 text-sm font-medium text-primary-foreground shadow-sm transition-opacity hover:opacity-90"
             >
               Send message &rarr;
             </button>
             <p className="text-center text-[12.5px] text-muted-foreground">
-              Opens your email client, addressed to hello@nivora.app.
+              Opens your email client, addressed to {brand.email}.
             </p>
           </form>
         </div>

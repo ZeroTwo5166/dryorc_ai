@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
-import { Footer } from "../landing/Footer";
-import { Navbar } from "../landing/Navbar";
+import { Footer } from "../layout/Footer";
+import { Navbar } from "../layout/Navbar";
 
 export function MarketingShell({ children }: { children: ReactNode }) {
   return (

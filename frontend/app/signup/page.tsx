@@ -2,8 +2,10 @@
 
 import { useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
+import brand from "@/brand.json";
 import { AuthShell } from "../components/auth/AuthShell";
 import { FormError, FormField, SubmitButton } from "../components/auth/FormField";
+import { IconUserCheck } from "../components/landing/icons";
 import { ApiError, register } from "../lib/api";
 
 const timeZones = [
@@ -56,7 +58,7 @@ export default function SignupPage() {
     setLoading(true);
     try {
       await register({ businessName, timeZone, email, password });
-      router.push("/login?registered=1");
+      router.push(`/verify-email?email=${encodeURIComponent(email)}`);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Something went wrong. Please try again.");
     } finally {
@@ -69,6 +71,9 @@ export default function SignupPage() {
       eyebrow="Get started"
       title="Create your business account"
       subtitle="You'll be the Owner — invite Admins and Agents once you're in."
+      icon={IconUserCheck}
+      switchLabel="Sign in"
+      switchHref="/login"
     >
       <form onSubmit={handleSubmit} className="flex flex-col gap-5">
         <FormField
@@ -91,10 +96,10 @@ export default function SignupPage() {
             required
             value={timeZone}
             onChange={(e) => setTimeZone(e.target.value)}
-            className="w-full rounded-xl border border-border bg-card px-3.5 py-2.5 text-sm text-foreground shadow-sm outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-accent/20"
+            className="w-full cursor-pointer rounded-xl border border-border bg-card px-3.5 py-2.5 text-sm text-foreground shadow-sm outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-accent/20"
           >
             {timeZones.map((tz) => (
-              <option key={tz} value={tz}>
+              <option  key={tz} value={tz}>
                 {tz}
               </option>
             ))}
@@ -139,7 +144,7 @@ export default function SignupPage() {
         <SubmitButton loading={loading}>Create account</SubmitButton>
 
         <p className="text-center text-[12.5px] leading-relaxed text-muted-foreground">
-          By continuing you agree to Nivora&apos;s{" "}
+          By continuing you agree to {brand.name}&apos;s{" "}
           <a href="/terms" className="font-medium text-foreground hover:text-accent">
             Terms
           </a>{" "}
@@ -150,13 +155,6 @@ export default function SignupPage() {
           .
         </p>
       </form>
-
-      <p className="mt-8 text-center text-sm text-muted-foreground">
-        Already have an account?{" "}
-        <a href="/login" className="font-medium text-foreground hover:text-accent">
-          Sign in
-        </a>
-      </p>
     </AuthShell>
   );
 }

@@ -1,4 +1,5 @@
 import Link from "next/link";
+import brand from "@/brand.json";
 import FuzzyText from "./components/FuzzyText";
 
 export default function NotFound() {
@@ -81,7 +82,7 @@ export default function NotFound() {
             href="/product"
             className="inline-flex h-11 items-center rounded-full border border-white/15 px-6 text-sm font-medium text-white/70 transition-colors hover:border-white/30 hover:bg-white/5 hover:text-white"
           >
-            Explore Nivora
+            Explore {brand.name}
           </Link>
         </div>
       </div>

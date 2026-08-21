@@ -1,3 +1,5 @@
+import brand from "@/brand.json";
+
 export function CTA() {
   return (
     <section className="border-b border-border">
@@ -6,7 +8,7 @@ export function CTA() {
           <div className="max-w-xl">
             <p className="text-sm font-medium text-white/80">Get started</p>
             <h2 className="mt-3 text-2xl font-semibold tracking-tight text-white sm:text-3xl">
-              See Nivora on your own storefront.
+              See {brand.name} on your own storefront.
             </h2>
             <p className="mt-4 text-base leading-relaxed text-white/80">
               We&apos;re onboarding early Shopify partners in the EU. Book a
@@ -16,8 +18,8 @@ export function CTA() {
           </div>
 
           <a
-            href="mailto:hello@nivora.app"
-            className="inline-flex shrink-0 items-center gap-2 rounded-full bg-white px-7 py-3.5 text-sm font-medium text-foreground shadow-sm transition-opacity hover:opacity-90"
+            href={`mailto:${brand.email}`}
+            className="inline-flex shrink-0 items-center gap-2 rounded-full bg-white px-7 py-3.5 text-sm font-medium text-slate-900 shadow-sm transition-opacity hover:opacity-90"
           >
             Book a demo &rarr;
           </a>

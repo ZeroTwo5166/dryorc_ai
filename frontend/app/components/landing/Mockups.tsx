@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import brand from "@/brand.json";
 import { IconStore } from "./icons";
 
 type Tone = "accent" | "success" | "purple" | "orange" | "pink" | "muted" | "destructive";
@@ -184,7 +185,7 @@ export function RefundApprovalPanel() {
           <button
             type="button"
             onClick={() => handleAction("approved")}
-            className="flex-1 cursor-pointer rounded-full bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90"
+            className="flex-1 cursor-pointer rounded-full bg-success px-4 py-2.5 text-sm font-medium text-success-foreground transition-opacity hover:opacity-90"
           >
             Approve
           </button>
@@ -192,7 +193,7 @@ export function RefundApprovalPanel() {
           <button
             type="button"
             onClick={() => handleAction("declined")}
-            className="flex-1 cursor-pointer rounded-full border border-border px-4 py-2.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            className="flex-1 cursor-pointer rounded-full border border-destructive px-4 py-2.5 text-sm font-medium text-destructive transition-colors hover:bg-destructive hover:text-destructive-foreground"
           >
             Decline
           </button>
@@ -274,7 +275,7 @@ export function ChatWidgetPanel() {
       <div className="flex items-center justify-between border-b border-border px-5 py-4">
         <span className="flex items-center gap-2 text-sm font-semibold text-foreground">
           <span className="h-2 w-2 rounded-full bg-success" />
-          Nivora widget
+          {brand.name} widget
         </span>
         <span className="text-xs text-muted-foreground">Website</span>
       </div>

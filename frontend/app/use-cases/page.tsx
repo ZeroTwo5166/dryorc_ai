@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import brand from "@/brand.json";
 import { CTA } from "../components/landing/CTA";
 import {
   IconLayers,
@@ -88,9 +89,9 @@ const toneBg: Record<string, string> = {
 };
 
 export const metadata: Metadata = {
-  title: "Use cases — Nivora",
+  title: `Use cases — ${brand.name}`,
   description:
-    "Order status, returns and refunds, product questions, account changes, proactive detection, and human escalation — see how Nivora handles each.",
+    `Order status, returns and refunds, product questions, account changes, proactive detection, and human escalation — see how ${brand.name} handles each.`,
 };
 
 export default function UseCasesPage() {
@@ -100,7 +101,7 @@ export default function UseCasesPage() {
         eyebrow="Use cases"
         tone="purple"
         title="Built for the tickets that actually fill your inbox."
-        subtitle="From a tracking question to a refund dispute, here's how Nivora handles the volume — and where it hands off to your team."
+        subtitle={`From a tracking question to a refund dispute, here's how ${brand.name} handles the volume — and where it hands off to your team.`}
       />
 
       <section className="border-b border-border">
@@ -131,7 +132,7 @@ export default function UseCasesPage() {
                       {c.example.q}
                     </p>
                     <p className="text-foreground">
-                      <span className="font-medium text-accent">Nivora </span>
+                      <span className="font-medium text-accent">{brand.name} </span>
                       {c.example.a}
                     </p>
                   </div>

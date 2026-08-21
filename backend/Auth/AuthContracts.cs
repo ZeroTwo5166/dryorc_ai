@@ -21,4 +21,20 @@ public record MeResponse(
     string Email,
     string BusinessName,
     string? PlanTier,
-    IReadOnlyList<string> Roles);
+    IReadOnlyList<string> Roles,
+    DateTimeOffset ExpiresAtUtc);
+
+public record ConfirmEmailRequest(Guid UserId, string Token);
+
+public record ResendVerificationRequest(string Email);
+
+public record ForgotPasswordRequest(string Email);
+
+public record ResetPasswordRequest(Guid UserId, string Token, string NewPassword);
+
+/// <summary>
+/// Response to POST /api/auth/extend-session — the new absolute expiry the
+/// server just committed to the re-issued cookie, so the frontend never has
+/// to guess/derive it locally. See AuthController.ExtendSession.
+/// </summary>
+public record ExtendSessionResponse(DateTimeOffset ExpiresAtUtc);

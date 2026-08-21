@@ -60,6 +60,28 @@ public class CrossTenantIsolationTests : IAsyncLifetime
         return (response, body);
     }
 
+    /// <summary>
+    /// Confirms a just-registered user's email via the real HTTP endpoint,
+    /// same as a real user clicking the emailed link — RequireConfirmedEmail
+    /// (Program.cs) blocks PasswordSignInAsync otherwise. The token itself is
+    /// generated through UserManager directly (the one piece an HTTP call
+    /// can't produce, since AuthController never returns it), not skipped.
+    /// </summary>
+    private async Task ConfirmEmailAsync(HttpClient client, Guid userId)
+    {
+        string token;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var userManager = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+            var user = await userManager.FindByIdAsync(userId.ToString());
+            Assert.NotNull(user);
+            token = await userManager.GenerateEmailConfirmationTokenAsync(user!);
+        }
+
+        var response = await client.PostAsJsonAsync("/api/auth/confirm-email", new ConfirmEmailRequest(userId, token));
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+    }
+
     /// <summary>Logs in and returns the raw Set-Cookie value to attach to later requests — WebApplicationFactory's HttpClient does not auto-manage cookies.</summary>
     private static async Task<(HttpResponseMessage Response, LoginResponse? Body, string? Cookie)> LoginAsync(
         HttpClient client, string email, string password = "Passw0rd!!")
@@ -108,6 +130,9 @@ public class CrossTenantIsolationTests : IAsyncLifetime
         // ---- "User A can authenticate." / "User B can authenticate." ----
         using var clientA = NewClient();
         using var clientB = NewClient();
+
+        await ConfirmEmailAsync(anonClient, registerABody.UserId);
+        await ConfirmEmailAsync(anonClient, registerBBody.UserId);
 
         var (loginAResponse, loginABody, cookieA) = await LoginAsync(clientA, emailA);
         Assert.Equal(HttpStatusCode.OK, loginAResponse.StatusCode);

@@ -1,3 +1,4 @@
+import brand from "@/brand.json";
 import {
   ChatWidgetPanel,
   IntegrationPanel,
@@ -26,7 +27,7 @@ const steps = [
     tone: "purple",
     title: "Train it on your knowledge",
     description:
-      "Import your docs and policies. Nivora indexes them so answers stay grounded in what you wrote.",
+      `Import your docs and policies. ${brand.name} indexes them so answers stay grounded in what you wrote.`,
     panel: <KnowledgeBasePanel />,
   },
   {

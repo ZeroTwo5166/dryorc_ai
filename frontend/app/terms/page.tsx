@@ -1,10 +1,11 @@
 import type { Metadata } from "next";
+import brand from "@/brand.json";
 import { LegalDocument } from "../components/marketing/LegalDocument";
 import { MarketingShell } from "../components/marketing/MarketingShell";
 
 export const metadata: Metadata = {
-  title: "Terms of Service — Nivora",
-  description: "The agreement covering a business's use of Nivora's platform and widget.",
+  title: `Terms of Service — ${brand.name}`,
+  description: `The agreement covering a business's use of ${brand.name}'s platform and widget.`,
 };
 
 export default function TermsPage() {
@@ -14,12 +15,12 @@ export default function TermsPage() {
         eyebrow="Legal"
         title="Terms of Service"
         updated="August 2026"
-        intro="These terms govern a business's use of the Nivora platform, dashboard, and widget. By creating an account, you agree to them on behalf of your business."
+        intro={`These terms govern a business's use of the ${brand.name} platform, dashboard, and widget. By creating an account, you agree to them on behalf of your business.`}
         sections={[
           {
             heading: "1. The service",
             body: [
-              "Nivora provides an AI-assisted customer support platform: a widget for your storefront, a dashboard for your team, and integrations with your commerce platform. Some capabilities may be limited or unavailable depending on your plan.",
+              `${brand.name} provides an AI-assisted customer support platform: a widget for your storefront, a dashboard for your team, and integrations with your commerce platform. Some capabilities may be limited or unavailable depending on your plan.`,
             ],
           },
           {
@@ -31,7 +32,7 @@ export default function TermsPage() {
           {
             heading: "3. AI-proposed actions",
             body: [
-              "Nivora's AI can propose actions such as refunds or order cancellations. Nivora's systems — not the AI model itself — execute those actions, and only within the limits and approval rules you configure. You remain responsible for the limits you set.",
+              `${brand.name}'s AI can propose actions such as refunds or order cancellations. ${brand.name}'s systems — not the AI model itself — execute those actions, and only within the limits and approval rules you configure. You remain responsible for the limits you set.`,
             ],
           },
           {
@@ -55,7 +56,7 @@ export default function TermsPage() {
           {
             heading: "7. Liability",
             body: [
-              "Nivora is provided on an \"as is\" basis. To the extent permitted by law, our liability is limited to the fees paid for the service in the twelve months preceding a claim.",
+              `${brand.name} is provided on an "as is" basis. To the extent permitted by law, our liability is limited to the fees paid for the service in the twelve months preceding a claim.`,
             ],
           },
           {

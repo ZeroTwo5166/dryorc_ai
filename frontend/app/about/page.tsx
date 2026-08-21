@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import brand from "@/brand.json";
 import { IconLayers, IconScale, IconShieldCheck } from "../components/landing/icons";
 import { MarketingShell } from "../components/marketing/MarketingShell";
 import { PageHero } from "../components/marketing/PageHero";
@@ -16,21 +17,21 @@ const values = [
     tone: "accent",
     title: "Grounded, not generative fiction",
     description:
-      "Every answer traces back to something you actually wrote. If it's not in your docs, Nivora says so.",
+      `Every answer traces back to something you actually wrote. If it's not in your docs, ${brand.name} says so.`,
   },
   {
     icon: IconScale,
     tone: "purple",
     title: "Compliant by default, not by request",
     description:
-      "EU hosting, GDPR-aligned retention, and AI Act disclosure aren't add-ons — they're the default for every business on Nivora.",
+      `EU hosting, GDPR-aligned retention, and AI Act disclosure aren't add-ons — they're the default for every business on ${brand.name}.`,
   },
 ];
 
 export const metadata: Metadata = {
-  title: "About — Nivora",
+  title: `About — ${brand.name}`,
   description:
-    "Nivora builds AI customer support for e-commerce that's grounded in your knowledge and safe enough to actually act.",
+    `${brand.name} builds AI customer support for e-commerce that's grounded in your knowledge and safe enough to actually act.`,
 };
 
 export default function AboutPage() {
@@ -39,7 +40,7 @@ export default function AboutPage() {
       <PageHero
         eyebrow="About"
         title="We think support automation should be trustworthy first."
-        subtitle="Nivora started from a simple frustration: most AI support tools either can't do anything useful, or do too much without asking. We built the middle path."
+        subtitle={`${brand.name} started from a simple frustration: most AI support tools either can't do anything useful, or do too much without asking. We built the middle path.`}
       />
 
       <section className="border-b border-border">
@@ -57,7 +58,7 @@ export default function AboutPage() {
                 your actual limits instead of guessing at them.
               </p>
               <p className="mt-4 text-sm leading-relaxed text-muted-foreground">
-                Nivora is still early. We&apos;d rather ship something narrow that
+                {brand.name} is still early. We&apos;d rather ship something narrow that
                 works exactly as promised than something broad that almost
                 does.
               </p>
@@ -105,7 +106,7 @@ export default function AboutPage() {
             </h2>
             <a
               href="/contact"
-              className="mt-7 inline-flex items-center gap-2 rounded-full bg-white px-7 py-3.5 text-sm font-medium text-foreground shadow-sm transition-opacity hover:opacity-90"
+              className="mt-7 inline-flex items-center gap-2 rounded-full bg-white px-7 py-3.5 text-sm font-medium text-slate-900 shadow-sm transition-opacity hover:opacity-90"
             >
               Get in touch &rarr;
             </a>

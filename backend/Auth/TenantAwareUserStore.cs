@@ -59,4 +59,25 @@ public class TenantAwareUserStore(AppDbContext context, IdentityErrorDescriber? 
             .IgnoreQueryFilters()
             .FirstOrDefaultAsync(u => u.NormalizedUserName == normalizedUserName, cancellationToken);
     }
+
+    /// <summary>
+    /// Same chicken-and-egg exception as <see cref="FindByNameAsync"/> above,
+    /// for the same reason: <c>AuthController.ConfirmEmail</c> is
+    /// <c>[AllowAnonymous]</c> (a user clicking an emailed link has no
+    /// session/tenant cookie yet), so the normal tenant-filtered lookup would
+    /// fail closed and no one could ever confirm their email. The token
+    /// itself — not tenant context — is what proves the caller is entitled to
+    /// touch this row.
+    /// </summary>
+    public override Task<ApplicationUser?> FindByIdAsync(string userId, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!Guid.TryParse(userId, out var id))
+        {
+            return Task.FromResult<ApplicationUser?>(null);
+        }
+        return Context.Users
+            .IgnoreQueryFilters()
+            .FirstOrDefaultAsync(u => u.Id == id, cancellationToken);
+    }
 }

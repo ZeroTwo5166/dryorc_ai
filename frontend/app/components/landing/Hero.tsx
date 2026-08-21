@@ -1,3 +1,4 @@
+import brand from "@/brand.json";
 import { StatusPill } from "./Mockups";
 
 export function Hero() {
@@ -8,10 +9,10 @@ export function Hero() {
     >
       <div className="mx-auto grid max-w-[1440px] gap-16 px-6 py-20 sm:px-10 lg:grid-cols-2 lg:items-center lg:px-14 lg:py-28">
         <div>
-          <span className="inline-flex items-center gap-2 rounded-full border border-border bg-card px-4 py-1.5 text-xs font-medium text-black/70 shadow-sm">
+          <span className="inline-flex items-center gap-2 rounded-full border border-border bg-card px-4 py-1.5 text-xs font-medium text-muted-foreground shadow-sm">
             AI customer support
-            <span className="text-black">·</span>
-            <span className="font-semibold text-emerald-400">EU-hosted</span>
+            <span className="text-muted-foreground">·</span>
+            <span className="font-semibold text-success">EU-hosted</span>
           </span>
 
           <h1 className="mt-8 max-w-xl text-4xl font-semibold leading-[1.1] tracking-tight text-foreground sm:text-5xl lg:text-6xl">
@@ -22,14 +23,14 @@ export function Hero() {
           </h1>
 
           <p className="mt-6 max-w-md text-lg leading-relaxed text-muted-foreground">
-            Nivora answers from your own knowledge base, verifies who
+            {brand.name} answers from your own knowledge base, verifies who
             it&apos;s talking to, and takes real action on orders and
             refunds — with a human in the loop for anything risky.
           </p>
 
           <div className="mt-10 flex flex-wrap items-center gap-4">
             <a
-              href="mailto:hello@nivora.app"
+              href={`mailto:${brand.email}`}
               className="inline-flex items-center gap-2 rounded-full bg-primary px-7 py-3.5 text-sm font-medium text-primary-foreground shadow-sm transition-opacity hover:opacity-90"
             >
               Book a demo &rarr;

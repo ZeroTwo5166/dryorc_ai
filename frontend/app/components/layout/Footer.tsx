@@ -1,4 +1,8 @@
+"use client";
+
 import Link from "next/link";
+import brand from "@/brand.json";
+import { useAuth } from "../../lib/auth-context";
 
 const productLinks = [
   { href: "/product", label: "Product" },
@@ -19,6 +23,7 @@ const legalLinks = [
 
 export function Footer() {
   const year = new Date().getFullYear();
+  const { user } = useAuth();
 
   return (
     <footer className="border-t border-border bg-background">
@@ -27,7 +32,7 @@ export function Footer() {
           {/* Brand */}
           <div>
             <Link
-              href="/"
+              href={user ? "/home" : "/"}
               className="inline-flex items-center gap-2.5 text-sm font-semibold tracking-tight text-foreground transition-opacity hover:opacity-70"
             >
               <span
@@ -37,7 +42,7 @@ export function Footer() {
                 N
               </span>
 
-              <span className="tracking-[0.12em]">NIVORA</span>
+              <span className="tracking-[0.12em]">{brand.name.toUpperCase()}</span>
             </Link>
 
             <p className="mt-5 max-w-sm text-sm leading-6 text-muted-foreground">
@@ -47,10 +52,10 @@ export function Footer() {
             </p>
 
             <a
-              href="mailto:kontakt@nivora.com"
+              href={`mailto:${brand.email}`}
               className="mt-5 inline-block text-sm font-medium text-foreground transition-colors hover:text-accent"
             >
-              hello@nivora.app
+              {brand.email}
             </a>
           </div>
 
@@ -116,7 +121,7 @@ export function Footer() {
       {/* Bottom bar */}
       <div className="border-t border-border">
         <div className="mx-auto flex max-w-[1440px] flex-col gap-3 px-6 py-6 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between sm:px-10 lg:px-14">
-          <p>&copy; {year} Nivora. All rights reserved.</p>
+          <p>&copy; {year} {brand.name}. All rights reserved.</p>
 
           <div className="flex items-center gap-2">
             <span className="h-1.5 w-1.5 rounded-full bg-[#39FF88]" />

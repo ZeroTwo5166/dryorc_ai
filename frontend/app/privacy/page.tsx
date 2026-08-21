@@ -1,10 +1,11 @@
 import type { Metadata } from "next";
+import brand from "@/brand.json";
 import { LegalDocument } from "../components/marketing/LegalDocument";
 import { MarketingShell } from "../components/marketing/MarketingShell";
 
 export const metadata: Metadata = {
-  title: "Privacy Policy — Nivora",
-  description: "How Nivora collects, uses, and retains data, and your rights under GDPR.",
+  title: `Privacy Policy — ${brand.name}`,
+  description: `How ${brand.name} collects, uses, and retains data, and your rights under GDPR.`,
 };
 
 export default function PrivacyPage() {
@@ -14,12 +15,12 @@ export default function PrivacyPage() {
         eyebrow="Legal"
         title="Privacy Policy"
         updated="August 2026"
-        intro="This policy explains what Nivora collects when a business uses our platform, and when that business's customers interact with the AI widget — and how you can exercise your rights over it."
+        intro={`This policy explains what ${brand.name} collects when a business uses our platform, and when that business's customers interact with the AI widget — and how you can exercise your rights over it.`}
         sections={[
           {
             heading: "1. Who this applies to",
             body: [
-              "This policy covers two groups: the staff of a business using Nivora's dashboard (\"Staff\"), and that business's own customers who interact with the AI widget (\"End Customers\"). Each business remains the data controller for its End Customers; Nivora acts as a processor for that data.",
+              `This policy covers two groups: the staff of a business using ${brand.name}'s dashboard ("Staff"), and that business's own customers who interact with the AI widget ("End Customers"). Each business remains the data controller for its End Customers; ${brand.name} acts as a processor for that data.`,
             ],
           },
           {
@@ -27,7 +28,7 @@ export default function PrivacyPage() {
             body: [
               "Staff accounts: name, work email, and authentication data needed to sign in.",
               "End Customer conversations: messages sent to the widget, verified identity signals (such as a one-time code confirmation), and metadata needed to resolve a request — for example, an order number referenced in a message.",
-              "We do not collect payment card data. Refunds and order actions are executed through your connected commerce platform, not stored by Nivora as card data.",
+              `We do not collect payment card data. Refunds and order actions are executed through your connected commerce platform, not stored by ${brand.name} as card data.`,
             ],
           },
           {
@@ -45,13 +46,13 @@ export default function PrivacyPage() {
           {
             heading: "5. Where data is hosted",
             body: [
-              "Nivora's infrastructure and customer data are hosted within the EU by default, aligned with GDPR data-residency expectations.",
+              `${brand.name}'s infrastructure and customer data are hosted within the EU by default, aligned with GDPR data-residency expectations.`,
             ],
           },
           {
             heading: "6. Your rights",
             body: [
-              "Depending on your role and jurisdiction, you may have the right to access, correct, export, or delete your data. End Customers should start with the business they contacted; Staff can reach us directly at hello@nivora.app.",
+              `Depending on your role and jurisdiction, you may have the right to access, correct, export, or delete your data. End Customers should start with the business they contacted; Staff can reach us directly at ${brand.email}.`,
             ],
           },
           {

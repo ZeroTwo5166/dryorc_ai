@@ -1,3 +1,4 @@
+import brand from "@/brand.json";
 import {
   CitationPanel,
   IdentityVerificationPanel,
@@ -18,7 +19,7 @@ const features = [
     eyebrow: "Grounded, not guessed",
     title: "Every answer cites its source.",
     description:
-      "Nivora answers from your own docs and policies, and shows exactly which chunk it pulled from — so a disputed answer can always be traced back.",
+      `${brand.name} answers from your own docs and policies, and shows exactly which chunk it pulled from — so a disputed answer can always be traced back.`,
     panel: <CitationPanel />,
   },
   {
