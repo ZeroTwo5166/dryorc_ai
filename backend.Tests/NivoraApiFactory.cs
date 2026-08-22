@@ -1,5 +1,8 @@
+using Anthropic.Services;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace backend.Tests;
 
@@ -12,11 +15,23 @@ namespace backend.Tests;
 /// suite is proving the real EF Core global query filter + real Postgres
 /// unique constraints + real cookie auth actually enforce tenant isolation,
 /// not that a mock does.
+///
+/// IMessageService IS swapped, though — to a FakeMessageService, always,
+/// regardless of whether Anthropic:ApiKey happens to be configured in this
+/// environment. Every test using this factory predates Step 8 (or doesn't
+/// care about Claude specifically) and must never incur a real, billed
+/// Anthropic call just because it happens to POST a widget message. Tests
+/// that genuinely want the real Claude integration use
+/// LiveClaudeApiFactory instead, never this one.
 /// </summary>
 public class NivoraApiFactory : WebApplicationFactory<Program>
 {
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
+        builder.ConfigureTestServices(services =>
+        {
+            services.AddSingleton<IMessageService, FakeMessageService>();
+        });
     }
 }

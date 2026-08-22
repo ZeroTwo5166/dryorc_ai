@@ -136,7 +136,7 @@ public class WidgetConcurrencyAndIsolationTests : IAsyncLifetime
             .Where(m => m.ConversationId == conversation.Id)
             .OrderBy(m => m.CreatedAt)
             .ToListAsync();
-        Assert.Equal(2, messages.Count);
+        Assert.Equal(2, messages.Count(m => m.Role == MessageRole.Customer));
         Assert.Contains(messages, m => m.Content == "Concurrent message 1");
         Assert.Contains(messages, m => m.Content == "Concurrent message 2");
 
@@ -218,15 +218,17 @@ public class WidgetConcurrencyAndIsolationTests : IAsyncLifetime
         // into the other's tenant scope.
         var conversationA = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.BusinessId == businessA.Id);
         var messagesA = await db.Messages.IgnoreQueryFilters().Where(m => m.ConversationId == conversationA.Id).ToListAsync();
-        Assert.Single(messagesA);
-        Assert.Equal("From widget A", messagesA[0].Content);
-        Assert.Equal(businessA.Id, messagesA[0].BusinessId);
+        Assert.Single(messagesA.Where(m => m.Role == MessageRole.Customer));
+        var customerMessageA = messagesA.Single(m => m.Role == MessageRole.Customer);
+        Assert.Equal("From widget A", customerMessageA.Content);
+        Assert.Equal(businessA.Id, customerMessageA.BusinessId);
 
         var conversationB = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.BusinessId == businessB.Id);
         var messagesB = await db.Messages.IgnoreQueryFilters().Where(m => m.ConversationId == conversationB.Id).ToListAsync();
-        Assert.Single(messagesB);
-        Assert.Equal("From widget B", messagesB[0].Content);
-        Assert.Equal(businessB.Id, messagesB[0].BusinessId);
+        Assert.Single(messagesB.Where(m => m.Role == MessageRole.Customer));
+        var customerMessageB = messagesB.Single(m => m.Role == MessageRole.Customer);
+        Assert.Equal("From widget B", customerMessageB.Content);
+        Assert.Equal(businessB.Id, customerMessageB.BusinessId);
     }
 
     // ── Rate limiting ────────────────────────────────────────────────

@@ -1,6 +1,9 @@
 using System.Net.Http.Headers;
 using System.Text;
 using System.Threading.RateLimiting;
+using Anthropic;
+using Anthropic.Models.Messages;
+using Anthropic.Services;
 using Microsoft.Extensions.Options;
 using backend.Auth;
 using backend.Data;
@@ -109,6 +112,31 @@ var widgetTokenSigningKey = builder.Configuration["WidgetToken:SigningKey"]
 builder.Services.AddSingleton(Options.Create(new WidgetTokenOptions { SigningKey = widgetTokenSigningKey }));
 builder.Services.AddScoped<IWidgetTokenService, WidgetTokenService>();
 builder.Services.AddScoped<IWidgetConversationService, WidgetConversationService>();
+
+// Step 8: Claude integration (non-streaming, conversation-only — no tools,
+// no RAG/knowledge-base grounding yet, both later steps). Model is
+// claude-sonnet-5 per NIVORA_DEVELOPMENT_PLAN_V2.md's own recorded stack
+// decision — see Services/ClaudeReplyService.cs.
+//
+// Deliberately lazy: startup must succeed whether or not Anthropic:ApiKey
+// is configured (Claude is one feature, not a hard dependency of the whole
+// app) — IClaudeReplyService is always registered and resolvable either
+// way. When the key is absent, IMessageService is backed by
+// MissingAnthropicApiKeyMessageService, which throws a distinct,
+// impossible-to-swallow AnthropicNotConfiguredException the moment Claude
+// is actually invoked, not at startup, and never a real client constructed
+// with an empty key.
+var anthropicApiKey = builder.Configuration["Anthropic:ApiKey"];
+if (!string.IsNullOrWhiteSpace(anthropicApiKey))
+{
+    builder.Services.AddSingleton(new AnthropicClient { ApiKey = anthropicApiKey });
+    builder.Services.AddScoped<IMessageService>(sp => sp.GetRequiredService<AnthropicClient>().Messages);
+}
+else
+{
+    builder.Services.AddScoped<IMessageService, MissingAnthropicApiKeyMessageService>();
+}
+builder.Services.AddScoped<IClaudeReplyService, ClaudeReplyService>();
 
 // ─────────────────────────────────────────────────────────────
 // Identity — cookie-based auth for staff/dashboard users.

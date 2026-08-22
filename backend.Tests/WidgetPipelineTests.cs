@@ -244,7 +244,6 @@ public class WidgetPipelineTests : IAsyncLifetime
         var second = await client.SendAsync(WithJsonBody(
             Bearer(HttpMethod.Post, "/api/widget/messages", initBody.Token), new PostWidgetMessageRequest("Second message")));
         Assert.Equal(HttpStatusCode.OK, second.StatusCode);
-        var secondBody = await second.Content.ReadFromJsonAsync<WidgetMessageResponse>();
 
         await using var scope = _factory.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -253,9 +252,16 @@ public class WidgetPipelineTests : IAsyncLifetime
         Assert.Equal(1, conversationCount); // reused, not a second Conversation
 
         var conversation = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.BusinessId == business.Id);
-        var messageCount = await db.Messages.IgnoreQueryFilters().CountAsync(m => m.ConversationId == conversation.Id);
-        Assert.Equal(2, messageCount);
-        Assert.Equal(TruncateToMicroseconds(secondBody!.CreatedAt), conversation.LastMessageAt);
+        var customerMessageCount = await db.Messages.IgnoreQueryFilters()
+            .CountAsync(m => m.ConversationId == conversation.Id && m.Role == MessageRole.Customer);
+        Assert.Equal(2, customerMessageCount);
+        // LastMessageAt-equals-second-customer-message-timestamp is no
+        // longer assertable at this (full HTTP pipeline) layer now that
+        // Step 8's ClaudeReplyService deterministically writes again,
+        // synchronously, before this response returns — see
+        // WidgetConversationServiceTests for the original Steps 6-7
+        // guarantee, tested directly against WidgetConversationService
+        // where that write is still the last one and observable.
     }
 
     [Fact]
@@ -352,7 +358,7 @@ public class WidgetPipelineTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.OK, messagesResponse.StatusCode);
         var messages = await messagesResponse.Content.ReadFromJsonAsync<List<ConversationMessageResponse>>();
         Assert.NotNull(messages);
-        Assert.Single(messages!);
+        Assert.Single(messages!.Where(m => m.Role == MessageRole.Customer.ToString()));
         Assert.Equal("Read via staff API", messages![0].Content);
         Assert.Equal("Customer", messages[0].Role);
     }

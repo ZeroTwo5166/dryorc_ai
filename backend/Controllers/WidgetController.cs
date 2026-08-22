@@ -17,7 +17,7 @@ public record WidgetInitResponse(string VisitorSessionId, string Token);
 
 public record PostWidgetMessageRequest(string Content);
 
-public record WidgetMessageResponse(Guid Id, DateTimeOffset CreatedAt);
+public record WidgetMessageResponse(Guid Id, DateTimeOffset CreatedAt, string? AiReply);
 
 /// <summary>
 /// Public, widget-facing endpoints — no staff cookie involved anywhere
@@ -101,7 +101,9 @@ public class WidgetController(AppDbContext db, IWidgetTokenService tokenService)
     [Authorize(Policy = NivoraPolicies.Widget)]
     [EnableRateLimiting("WidgetMessages")]
     public async Task<IActionResult> PostMessage(
-        [FromBody] PostWidgetMessageRequest request, [FromServices] IWidgetConversationService conversationService)
+        [FromBody] PostWidgetMessageRequest request,
+        [FromServices] IWidgetConversationService conversationService,
+        [FromServices] IClaudeReplyService replyService)
     {
         if (string.IsNullOrWhiteSpace(request.Content))
         {
@@ -118,7 +120,13 @@ public class WidgetController(AppDbContext db, IWidgetTokenService tokenService)
 
         var message = await conversationService.PostMessageAsync(businessId, widgetId, visitorSessionId, request.Content);
 
-        return Ok(new WidgetMessageResponse(message.Id, message.CreatedAt));
+        // Deliberately called after the above has already committed — see
+        // ClaudeReplyService's own doc comment for why. A null reply here
+        // (Claude call failed) is a normal, non-error outcome: the
+        // customer's message is already safely persisted regardless.
+        var aiReply = await replyService.GenerateReplyAsync(businessId, message.ConversationId);
+
+        return Ok(new WidgetMessageResponse(message.Id, message.CreatedAt, aiReply));
     }
 
     private static bool OriginIsAllowed(string origin, List<string> allowedDomains)
