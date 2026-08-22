@@ -266,3 +266,62 @@ export type ExtendSessionResponse = {
 export function extendSession(): Promise<ExtendSessionResponse> {
   return api.post("/api/auth/extend-session");
 }
+
+// Talks to backend/Controllers/NotificationsController.cs.
+
+export type NotificationItem = {
+  id: string; // NotificationRecipient.Id — the value mark-read/read-all expect, never Notification.Id.
+  category: "Team" | "Customer" | "System";
+  type: string;
+  title: string;
+  link: string | null;
+  isRead: boolean;
+  createdAt: string;
+};
+
+// Compound (CreatedAt, Id) cursor — both fields are required together for
+// correct keyset pagination and for read-all's tie-break; never reduce this
+// to just the timestamp.
+export type NotificationCursor = {
+  createdAt: string;
+  id: string;
+};
+
+export type NotificationListResponse = {
+  notifications: NotificationItem[];
+  nextCursor: NotificationCursor | null;
+  readAllUpTo: NotificationCursor | null;
+};
+
+export type UnreadCountResponse = {
+  count: number;
+};
+
+export function listNotifications(params?: {
+  take?: number;
+  before?: NotificationCursor;
+}): Promise<NotificationListResponse> {
+  const query = new URLSearchParams();
+  if (params?.take) query.set("take", String(params.take));
+  if (params?.before) {
+    query.set("beforeCreatedAt", params.before.createdAt);
+    query.set("beforeId", params.before.id);
+  }
+  const qs = query.toString();
+  return api.get(`/api/notifications${qs ? `?${qs}` : ""}`);
+}
+
+export function getUnreadNotificationCount(): Promise<UnreadCountResponse> {
+  return api.get("/api/notifications/unread-count");
+}
+
+export function markNotificationRead(id: string): Promise<null> {
+  return api.post(`/api/notifications/${id}/read`);
+}
+
+// cursor must be the readAllUpTo value returned by listNotifications() —
+// never constructed client-side, and never timestamp-only (see
+// NotificationCursor above).
+export function markAllNotificationsRead(cursor: NotificationCursor): Promise<null> {
+  return api.post("/api/notifications/read-all", cursor);
+}

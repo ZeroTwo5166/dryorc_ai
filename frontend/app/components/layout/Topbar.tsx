@@ -2,10 +2,16 @@
 
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
+import {
+  getUnreadNotificationCount,
+  listNotifications,
+  markNotificationRead,
+  type NotificationItem,
+} from "../../lib/api";
 import { useAuth } from "../../lib/auth-context";
 import { useTheme } from "../../lib/theme-context";
+import { formatRelativeTime } from "../../lib/relative-time";
 import { IconBell, IconSearch } from "../landing/icons";
-import { mockNotifications } from "./notifications-data";
 
 // Sits above the dashboard content, to the right of Sidebar — not a
 // full-width bar like the marketing Navbar, since Sidebar already owns the
@@ -22,6 +28,47 @@ export function Topbar() {
   const [query, setQuery] = useState("");
   const [notifOpen, setNotifOpen] = useState(false);
   const notifRef = useRef<HTMLDivElement>(null);
+
+  const [latestNotifications, setLatestNotifications] = useState<NotificationItem[]>([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [notifLoading, setNotifLoading] = useState(true);
+  const [notifError, setNotifError] = useState(false);
+
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+
+    Promise.all([listNotifications({ take: 5 }), getUnreadNotificationCount()])
+      .then(([list, unread]) => {
+        if (cancelled) return;
+        setLatestNotifications(list.notifications);
+        setUnreadCount(unread.count);
+        setNotifError(false);
+      })
+      .catch(() => {
+        if (!cancelled) setNotifError(true);
+      })
+      .finally(() => {
+        if (!cancelled) setNotifLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user]);
+
+  async function handleNotificationClick(notification: NotificationItem) {
+    if (notification.isRead) return;
+    try {
+      await markNotificationRead(notification.id);
+      setLatestNotifications((items) =>
+        items.map((n) => (n.id === notification.id ? { ...n, isRead: true } : n)),
+      );
+      setUnreadCount((count) => Math.max(0, count - 1));
+    } catch {
+      // Best-effort — navigation (if any) still proceeds via the Link itself.
+    }
+  }
 
   useEffect(() => {
     if (!notifOpen) return;
@@ -48,7 +95,6 @@ export function Topbar() {
   // current subscription tier as a plain, non-interactive readout, same
   // source (user.planTier) the home page dashboard already reads from.
   const planLabel = (user?.planTier ?? "trial").replace(/^\w/, (c) => c.toUpperCase());
-  const latestNotifications = mockNotifications.slice(0, 5);
 
   return (
     <header
@@ -108,7 +154,9 @@ export function Topbar() {
             }`}
           >
             <IconBell className="h-[18px] w-[18px]" />
-            <span className="absolute right-2 top-2 h-1.5 w-1.5 rounded-full bg-accent" />
+            {unreadCount > 0 && (
+              <span className="absolute right-2 top-2 h-1.5 w-1.5 rounded-full bg-accent" />
+            )}
           </button>
 
           {notifOpen && (
@@ -126,19 +174,53 @@ export function Topbar() {
               </p>
 
               <ul className="max-h-80 overflow-y-auto">
-                {latestNotifications.map((n) => (
-                  <li
-                    key={n.id}
-                    className={`border-b px-4 py-3 last:border-b-0 ${nivora ? "border-white/5" : "border-border/60"}`}
-                  >
-                    <p className={`text-[13px] font-medium ${nivora ? "text-white/90" : "text-foreground"}`}>
-                      {n.title}
-                    </p>
-                    <p className={`mt-0.5 text-[11.5px] ${nivora ? "text-white/40" : "text-muted-foreground"}`}>
-                      {n.time}
-                    </p>
+                {notifLoading ? (
+                  <li className={`px-4 py-3 text-[13px] ${nivora ? "text-white/40" : "text-muted-foreground"}`}>
+                    Loading…
                   </li>
-                ))}
+                ) : notifError ? (
+                  <li className={`px-4 py-3 text-[13px] ${nivora ? "text-white/40" : "text-muted-foreground"}`}>
+                    Couldn&apos;t load notifications.
+                  </li>
+                ) : latestNotifications.length === 0 ? (
+                  <li className={`px-4 py-3 text-[13px] ${nivora ? "text-white/40" : "text-muted-foreground"}`}>
+                    No notifications yet.
+                  </li>
+                ) : (
+                  latestNotifications.map((n) => {
+                    const rowClassName = `block border-b px-4 py-3 text-left last:border-b-0 ${
+                      nivora ? "border-white/5" : "border-border/60"
+                    } ${n.isRead ? "" : nivora ? "bg-white/5" : "bg-accent-soft/40"}`;
+                    const content = (
+                      <>
+                        <p className={`text-[13px] font-medium ${nivora ? "text-white/90" : "text-foreground"}`}>
+                          {n.title}
+                        </p>
+                        <p className={`mt-0.5 text-[11.5px] ${nivora ? "text-white/40" : "text-muted-foreground"}`}>
+                          {formatRelativeTime(n.createdAt)}
+                        </p>
+                      </>
+                    );
+                    return (
+                      <li key={n.id}>
+                        {n.link ? (
+                          <Link
+                            href={n.link}
+                            onClick={() => {
+                              setNotifOpen(false);
+                              void handleNotificationClick(n);
+                            }}
+                            className={rowClassName}
+                          >
+                            {content}
+                          </Link>
+                        ) : (
+                          <div className={rowClassName}>{content}</div>
+                        )}
+                      </li>
+                    );
+                  })
+                )}
               </ul>
 
               <Link
