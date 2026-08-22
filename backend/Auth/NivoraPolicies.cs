@@ -36,4 +36,13 @@ public static class NivoraPolicies
     /// specific entity instance ahead of the action running.
     /// </summary>
     public const string SameTenant = "SameTenant";
+
+    /// <summary>
+    /// Widget-facing endpoints only. Explicitly bound to
+    /// NivoraAuthSchemes.WidgetBearer at registration (Program.cs) — never
+    /// the default (staff cookie) scheme — so a future endpoint using this
+    /// policy can't accidentally end up authenticated by the wrong scheme
+    /// just by forgetting an attribute.
+    /// </summary>
+    public const string Widget = "Widget";
 }

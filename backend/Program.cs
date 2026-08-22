@@ -1,4 +1,7 @@
 using System.Net.Http.Headers;
+using System.Text;
+using System.Threading.RateLimiting;
+using Microsoft.Extensions.Options;
 using backend.Auth;
 using backend.Data;
 using backend.Email;
@@ -6,11 +9,14 @@ using backend.Interfaces;
 using backend.Models;
 using backend.Services;
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -27,20 +33,39 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 
 builder.Services.AddHttpContextAccessor();
 
-// Dev-only: lets the Next.js dashboard (a different origin even on the same
-// scheme/host — different port) call this API with cookies attached.
-// AllowCredentials requires an explicit origin list, never AllowAnyOrigin.
-if (builder.Environment.IsDevelopment())
+// AddCors itself is NOT dev-only (the "Widget" policy below must exist in
+// every environment — a widget embed happens in production too) — only the
+// "DashboardDev" policy's own registration stays conditional, unchanged
+// from before.
+builder.Services.AddCors(options =>
 {
-    builder.Services.AddCors(options =>
+    // Dev-only: lets the Next.js dashboard (a different origin even on the
+    // same scheme/host — different port) call this API with cookies
+    // attached. AllowCredentials requires an explicit origin list, never
+    // AllowAnyOrigin.
+    if (builder.Environment.IsDevelopment())
     {
         options.AddPolicy("DashboardDev", policy => policy
             .WithOrigins("http://localhost:3000")
             .AllowAnyHeader()
             .AllowAnyMethod()
             .AllowCredentials());
-    });
-}
+    }
+
+    // Widget endpoints are embedded on arbitrary third-party storefronts,
+    // unknown ahead of time — real per-business origin restriction is the
+    // application-level Widget.AllowedDomains check inside
+    // WidgetController.Init, not CORS. Auth here is a bearer token in the
+    // Authorization header, never a cookie, so AllowCredentials is never
+    // needed — which is exactly what makes AllowAnyOrigin safe to use (the
+    // two cannot be combined in any case). Applied via [EnableCors("Widget")]
+    // on WidgetController specifically, not via app.UseCors() globally, so
+    // the existing "DashboardDev" policy's own behavior is untouched.
+    options.AddPolicy("Widget", policy => policy
+        .AllowAnyOrigin()
+        .AllowAnyHeader()
+        .AllowAnyMethod());
+});
 
 // Real as of Step 4 — resolves BusinessId from the authenticated user's
 // claims (see Auth/ClaimsCurrentTenantAccessor.cs). Fail-closed: null
@@ -65,6 +90,25 @@ builder.Services.AddHostedService<DataLifecycleBackgroundService>();
 // Notification system — no live caller yet, registered as ready-to-call
 // infrastructure. See Services/NotificationService.cs.
 builder.Services.AddScoped<INotificationService, NotificationService>();
+
+// ─────────────────────────────────────────────────────────────
+// Widget (Steps 6-7): chat widget init + message posting. No AI reply yet
+// (Step 8) and no dashboard inbox UI yet (Step 9) — see Widget/ and
+// Controllers/WidgetController.cs.
+//
+// Read once, here, and reused for both issuing (WidgetTokenService) and
+// validating (AddJwtBearer below) tokens — same fail-fast-at-startup
+// pattern as ConnectionStrings:DefaultConnection/Resend:ApiKey above, and
+// avoids the two call sites drifting to different keys.
+var widgetTokenSigningKey = builder.Configuration["WidgetToken:SigningKey"]
+    ?? throw new InvalidOperationException(
+        "Missing WidgetToken:SigningKey. Set it via `dotnet user-secrets set " +
+        "\"WidgetToken:SigningKey\" \"<random-secret-at-least-32-chars>\"` (Development) or the " +
+        "hosting platform's configuration (production) — never commit it to appsettings.json.");
+
+builder.Services.AddSingleton(Options.Create(new WidgetTokenOptions { SigningKey = widgetTokenSigningKey }));
+builder.Services.AddScoped<IWidgetTokenService, WidgetTokenService>();
+builder.Services.AddScoped<IWidgetConversationService, WidgetConversationService>();
 
 // ─────────────────────────────────────────────────────────────
 // Identity — cookie-based auth for staff/dashboard users.
@@ -102,6 +146,77 @@ builder.Services
     // threw "No IUserTwoFactorTokenProvider<TUser> named 'Default' is registered"
     // without this call.
     .AddDefaultTokenProviders();
+
+// ─────────────────────────────────────────────────────────────
+// Widget JWT bearer scheme — a second, independent authentication scheme
+// alongside the staff cookie above, not a replacement for it.
+//
+// Deliberately `.AddAuthentication()` with NO arguments here, not a second
+// `.AddAuthentication(someDefaultScheme)` call — AddIdentity above already
+// called the argument-taking overload once (internally, via
+// AddAuthentication(o => { o.DefaultAuthenticateScheme = ...ApplicationScheme; ... })),
+// which set DefaultAuthenticateScheme/DefaultChallengeScheme/DefaultSignInScheme
+// to the staff cookie scheme. Calling that overload again here would very
+// likely stomp those defaults. The parameterless overload just returns the
+// existing AuthenticationBuilder without touching DefaultScheme at all —
+// safe to call repeatedly to register additional schemes.
+builder.Services.AddAuthentication().AddJwtBearer(NivoraAuthSchemes.WidgetBearer, options =>
+{
+    options.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateIssuer = true,
+        ValidIssuer = WidgetTokenService.Issuer,
+        ValidateAudience = true,
+        ValidAudience = WidgetTokenService.Audience,
+        ValidateLifetime = true,
+        ValidateIssuerSigningKey = true,
+        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(widgetTokenSigningKey)),
+        ClockSkew = TimeSpan.FromMinutes(1),
+    };
+
+    // Same reasoning as the staff cookie's OnRedirectToLogin/AccessDenied
+    // below — this is a JSON API, never redirect to a page that doesn't exist.
+    options.Events = new JwtBearerEvents
+    {
+        OnChallenge = ctx =>
+        {
+            ctx.HandleResponse();
+            ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            return Task.CompletedTask;
+        },
+    };
+});
+
+// ─────────────────────────────────────────────────────────────
+// Rate limiting — built into the ASP.NET Core shared framework, no
+// external package. Both limits are conservative placeholders, not tuned
+// production values — expected to be revisited once real widget traffic/
+// observability exists.
+// ─────────────────────────────────────────────────────────────
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    options.AddPolicy("WidgetInit", httpContext => RateLimitPartition.GetFixedWindowLimiter(
+        partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        factory: _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 30,
+            Window = TimeSpan.FromMinutes(1),
+        }));
+
+    // Partitioned by the authenticated widget JWT's VisitorSessionId claim
+    // — never an arbitrary request-body visitor id, which would let one
+    // visitor exhaust another's limit (or dodge their own) just by lying
+    // about who they are.
+    options.AddPolicy("WidgetMessages", httpContext => RateLimitPartition.GetFixedWindowLimiter(
+        partitionKey: httpContext.User.FindFirst(NivoraClaimTypes.VisitorSessionId)?.Value ?? "unauthenticated",
+        factory: _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 20,
+            Window = TimeSpan.FromMinutes(1),
+        }));
+});
 
 // Resend (https://resend.com) — transactional email for the account
 // verification flow. FromEmail defaults to Resend's shared onboarding@resend.dev
@@ -170,7 +285,14 @@ builder.Services.AddAuthorizationBuilder()
     .AddPolicy(NivoraPolicies.AnyStaff, p => p.RequireAuthenticatedUser())
     .AddPolicy(NivoraPolicies.OwnerOrAdmin, p => p.RequireRole(RoleNames.Owner, RoleNames.Admin))
     .AddPolicy(NivoraPolicies.OwnerOnly, p => p.RequireRole(RoleNames.Owner))
-    .AddPolicy(NivoraPolicies.SameTenant, p => p.Requirements.Add(new SameTenantRequirement()));
+    .AddPolicy(NivoraPolicies.SameTenant, p => p.Requirements.Add(new SameTenantRequirement()))
+    // Explicitly bound to WidgetBearer — not the default (staff cookie)
+    // scheme. This binding lives here, once, rather than depending on every
+    // future widget endpoint remembering to add
+    // [Authorize(AuthenticationSchemes = ...)] itself.
+    .AddPolicy(NivoraPolicies.Widget, p => p
+        .AddAuthenticationSchemes(NivoraAuthSchemes.WidgetBearer)
+        .RequireAuthenticatedUser());
 
 builder.Services.AddScoped<IAuthorizationHandler, SameTenantAuthorizationHandler>();
 
@@ -200,6 +322,13 @@ if (app.Environment.IsDevelopment())
 
 app.UseAuthentication();
 app.UseAuthorization();
+
+// After UseAuthorization(), deliberately: the "WidgetMessages" rate-limit
+// policy partitions by the authenticated widget JWT's VisitorSessionId
+// claim, which is only present on HttpContext.User once policy evaluation
+// (a non-default scheme) has run — placing this any earlier would see an
+// unauthenticated principal for every widget request.
+app.UseRateLimiter();
 
 app.MapControllers();
 
