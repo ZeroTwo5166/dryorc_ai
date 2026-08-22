@@ -34,14 +34,13 @@ public interface IConversationPurgeService
 /// TicketService's absence), so there is nothing populated to purge. This
 /// needs revisiting once Ticket creation actually exists.
 ///
-/// CustomerNotification is NOT handled here because it doesn't exist yet
-/// (notifications are a separate, later pass by explicit instruction).
-/// When it's built, its FK to Conversation must be Cascade — deleting a
-/// purged conversation's notifications is part of this same lifecycle, not
-/// a separate retention clock, and it must never store a message-preview
-/// snapshot (previews are fetched live from Message while the conversation
-/// still has messages; once purged, there's nothing left to preview,
-/// correctly).
+/// Notification rows referencing this conversation are explicitly deleted
+/// below (ExecuteDeleteAsync, same shape as Messages) — their FK to
+/// Conversation is SetNull, not Cascade, because this Conversation row is
+/// never actually deleted, only anonymized in place; a Cascade FK would
+/// never fire, so the app-level delete is the real, load-bearing mechanism.
+/// NotificationRecipient rows go with them via the Notification ->
+/// NotificationRecipient Cascade FK — never deleted directly here.
 /// </summary>
 public class ConversationPurgeService(AppDbContext db, IPurgeFailurePoint failurePoint) : IConversationPurgeService
 {
@@ -72,6 +71,18 @@ public class ConversationPurgeService(AppDbContext db, IPurgeFailurePoint failur
             await db.Messages
                 .IgnoreQueryFilters()
                 .Where(m => m.BusinessId == businessId && m.ConversationId == conversationId)
+                .ExecuteDeleteAsync(cancellationToken);
+
+            // Same reasoning as Messages above: Notification.ConversationId
+            // is SetNull, not Cascade, because this Conversation row is
+            // never actually deleted (only anonymized below) — a Cascade
+            // FK would never fire. This explicit delete is the real
+            // mechanism. NotificationRecipient rows go with it via the
+            // Notification -> NotificationRecipient Cascade FK; never
+            // deleted directly here.
+            await db.Notifications
+                .IgnoreQueryFilters()
+                .Where(n => n.BusinessId == businessId && n.ConversationId == conversationId)
                 .ExecuteDeleteAsync(cancellationToken);
 
             failurePoint.MaybeFail("after-message-delete");

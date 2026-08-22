@@ -977,6 +977,116 @@ namespace backend.Migrations
                     b.ToTable("MessageKnowledgeSources");
                 });
 
+            modelBuilder.Entity("backend.Models.Notification", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("ActorType")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<Guid?>("ActorUserId")
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid>("BusinessId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Category")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<Guid?>("ConversationId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("IdempotencyKey")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.Property<Guid?>("TicketId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Title")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("Type")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ActorUserId");
+
+                    b.HasIndex("ConversationId");
+
+                    b.HasIndex("TicketId");
+
+                    b.HasIndex("BusinessId", "ConversationId")
+                        .HasFilter("\"ConversationId\" IS NOT NULL");
+
+                    b.HasIndex("BusinessId", "IdempotencyKey")
+                        .IsUnique()
+                        .HasFilter("\"IdempotencyKey\" IS NOT NULL");
+
+                    b.HasIndex("BusinessId", "Category", "CreatedAt");
+
+                    b.ToTable("Notifications", t =>
+                        {
+                            t.HasCheckConstraint("CK_Notifications_Actor", "(\"ActorType\" = 'NivoraBusinessStaff' AND \"ActorUserId\" IS NOT NULL)\r\nOR\r\n(\"ActorType\" <> 'NivoraBusinessStaff' AND \"ActorUserId\" IS NULL)");
+
+                            t.HasCheckConstraint("CK_Notifications_CategoryRefs", "\"Category\" <> 'Team'\r\nOR\r\n(\"ConversationId\" IS NULL AND \"TicketId\" IS NULL)");
+
+                            t.HasCheckConstraint("CK_Notifications_CategoryTypeConsistency", "(\"Category\" = 'Team' AND \"Type\" IN ('TeamMemberJoined', 'StaffRoleChanged', 'StaffAccessRevoked'))\r\nOR\r\n(\"Category\" = 'Customer' AND \"Type\" IN ('ConversationAssigned', 'TicketSlaWarning', 'CustomerReplied', 'NewConversation', 'ConversationEscalated'))\r\nOR\r\n(\"Category\" = 'System' AND \"Type\" IN ('KnowledgeImportCompleted', 'IntegrationSyncCompleted'))");
+                        });
+                });
+
+            modelBuilder.Entity("backend.Models.NotificationRecipient", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid>("BusinessId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<bool>("IsRead")
+                        .HasColumnType("boolean");
+
+                    b.Property<Guid>("NotificationId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTimeOffset?>("ReadAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<Guid>("UserId")
+                        .HasColumnType("uuid");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("UserId");
+
+                    b.HasIndex("BusinessId", "UserId")
+                        .HasFilter("\"IsRead\" = false");
+
+                    b.HasIndex("NotificationId", "UserId")
+                        .IsUnique();
+
+                    b.HasIndex("BusinessId", "UserId", "CreatedAt", "Id");
+
+                    b.ToTable("NotificationRecipients");
+                });
+
             modelBuilder.Entity("backend.Models.OrderCancellation", b =>
                 {
                     b.Property<Guid>("Id")
@@ -1725,6 +1835,51 @@ namespace backend.Migrations
                         .WithMany()
                         .HasForeignKey("MessageId")
                         .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("backend.Models.Notification", b =>
+                {
+                    b.HasOne("backend.Models.ApplicationUser", null)
+                        .WithMany()
+                        .HasForeignKey("ActorUserId")
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    b.HasOne("backend.Models.Business", null)
+                        .WithMany()
+                        .HasForeignKey("BusinessId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.HasOne("backend.Models.Conversation", null)
+                        .WithMany()
+                        .HasForeignKey("ConversationId")
+                        .OnDelete(DeleteBehavior.SetNull);
+
+                    b.HasOne("backend.Models.Ticket", null)
+                        .WithMany()
+                        .HasForeignKey("TicketId")
+                        .OnDelete(DeleteBehavior.SetNull);
+                });
+
+            modelBuilder.Entity("backend.Models.NotificationRecipient", b =>
+                {
+                    b.HasOne("backend.Models.Business", null)
+                        .WithMany()
+                        .HasForeignKey("BusinessId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.HasOne("backend.Models.Notification", null)
+                        .WithMany()
+                        .HasForeignKey("NotificationId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+
+                    b.HasOne("backend.Models.ApplicationUser", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Restrict)
                         .IsRequired();
                 });
 

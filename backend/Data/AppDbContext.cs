@@ -59,6 +59,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
     public DbSet<Refund> Refunds => Set<Refund>();
     public DbSet<RefundItem> RefundItems => Set<RefundItem>();
     public DbSet<ConversationHandoff> ConversationHandoffs => Set<ConversationHandoff>();
+    public DbSet<Notification> Notifications => Set<Notification>();
+    public DbSet<NotificationRecipient> NotificationRecipients => Set<NotificationRecipient>();
 
     protected override void OnModelCreating(ModelBuilder builder)
     {
@@ -676,6 +678,122 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
             ch.HasOne<ApplicationUser>().WithMany()
                 .HasForeignKey(x => x.ActorId)
                 .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        // ─────────────────────────────────────────────────────────────
+        // Notification
+        // ─────────────────────────────────────────────────────────────
+        builder.Entity<Notification>(n =>
+        {
+            n.Property(x => x.Category).HasConversion<string>().HasMaxLength(32);
+            n.Property(x => x.Type).HasMaxLength(64);
+            n.Property(x => x.ActorType).HasConversion<string>().HasMaxLength(32);
+            n.Property(x => x.IdempotencyKey).HasMaxLength(256);
+
+            n.HasIndex(x => new { x.BusinessId, x.Category, x.CreatedAt });
+
+            // Composite, not a bare ConversationId index — every other
+            // index in this schema leads with BusinessId (Section 11: a
+            // standalone trailing-field index is redundant once a
+            // BusinessId-led composite exists), and the purge sweep's own
+            // delete filters on exactly (BusinessId, ConversationId), same
+            // shape as ConversationPurgeService's existing Messages delete.
+            n.HasIndex(x => new { x.BusinessId, x.ConversationId })
+                .HasFilter("\"ConversationId\" IS NOT NULL");
+
+            n.HasIndex(x => new { x.BusinessId, x.IdempotencyKey })
+                .IsUnique()
+                .HasFilter("\"IdempotencyKey\" IS NOT NULL");
+
+            n.ToTable(t =>
+            {
+                t.HasCheckConstraint(
+                    "CK_Notifications_Actor",
+                    """
+                    ("ActorType" = 'NivoraBusinessStaff' AND "ActorUserId" IS NOT NULL)
+                    OR
+                    ("ActorType" <> 'NivoraBusinessStaff' AND "ActorUserId" IS NULL)
+                    """);
+
+                t.HasCheckConstraint(
+                    "CK_Notifications_CategoryRefs",
+                    """
+                    "Category" <> 'Team'
+                    OR
+                    ("ConversationId" IS NULL AND "TicketId" IS NULL)
+                    """);
+
+                // Must stay synchronized with NotificationTypes and
+                // NotificationCategoryMap — see NotificationCategoryMap's
+                // doc comment for why all three exist together.
+                t.HasCheckConstraint(
+                    "CK_Notifications_CategoryTypeConsistency",
+                    """
+                    ("Category" = 'Team' AND "Type" IN ('TeamMemberJoined', 'StaffRoleChanged', 'StaffAccessRevoked'))
+                    OR
+                    ("Category" = 'Customer' AND "Type" IN ('ConversationAssigned', 'TicketSlaWarning', 'CustomerReplied', 'NewConversation', 'ConversationEscalated'))
+                    OR
+                    ("Category" = 'System' AND "Type" IN ('KnowledgeImportCompleted', 'IntegrationSyncCompleted'))
+                    """);
+            });
+
+            n.HasOne<Business>().WithMany()
+                .HasForeignKey(x => x.BusinessId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            // SetNull, not Cascade — Conversation rows are never actually
+            // deleted (ConversationPurgeService anonymizes them in place),
+            // so this FK's Cascade would never fire; ConversationPurgeService
+            // explicitly deletes matching Notification rows itself, in the
+            // same transaction as its Messages delete, before anonymizing
+            // the Conversation. This FK is only a safety net for a
+            // Conversation-row deletion no current code path performs.
+            n.HasOne<Conversation>().WithMany()
+                .HasForeignKey(x => x.ConversationId)
+                .OnDelete(DeleteBehavior.SetNull);
+
+            n.HasOne<Ticket>().WithMany()
+                .HasForeignKey(x => x.TicketId)
+                .OnDelete(DeleteBehavior.SetNull);
+
+            n.HasOne<ApplicationUser>().WithMany()
+                .HasForeignKey(x => x.ActorUserId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        // ─────────────────────────────────────────────────────────────
+        // NotificationRecipient
+        // ─────────────────────────────────────────────────────────────
+        builder.Entity<NotificationRecipient>(r =>
+        {
+            r.HasIndex(x => new { x.NotificationId, x.UserId }).IsUnique();
+
+            // Trailing Id is mandatory — the feed paginates on
+            // (CreatedAt, Id) keyset, and a fan-out batch shares one
+            // CreatedAt value across every recipient row, so ties are
+            // real, not a theoretical edge case.
+            r.HasIndex(x => new { x.BusinessId, x.UserId, x.CreatedAt, x.Id });
+
+            r.HasIndex(x => new { x.BusinessId, x.UserId })
+                .HasFilter("\"IsRead\" = false");
+
+            r.HasOne<Business>().WithMany()
+                .HasForeignKey(x => x.BusinessId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            // Cascade — unlike Conversation, a Notification row really is
+            // deleted (both by ConversationPurgeService and, in principle,
+            // any future direct delete), so this FK's Cascade genuinely
+            // fires and is the correct mechanism for removing the fan-out
+            // rows with it. Never delete NotificationRecipient rows
+            // manually — this FK is the single removal path.
+            r.HasOne<Notification>().WithMany()
+                .HasForeignKey(x => x.NotificationId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            r.HasOne<ApplicationUser>().WithMany()
+                .HasForeignKey(x => x.UserId)
+                .OnDelete(DeleteBehavior.Restrict);
         });
 
         // ─────────────────────────────────────────────────────────────

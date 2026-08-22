@@ -62,6 +62,10 @@ builder.Services.AddScoped<IRetentionEnforcementService, RetentionEnforcementSer
 builder.Services.AddScoped<IVerificationCodeCleanupService, VerificationCodeCleanupService>();
 builder.Services.AddHostedService<DataLifecycleBackgroundService>();
 
+// Notification system — no live caller yet, registered as ready-to-call
+// infrastructure. See Services/NotificationService.cs.
+builder.Services.AddScoped<INotificationService, NotificationService>();
+
 // ─────────────────────────────────────────────────────────────
 // Identity — cookie-based auth for staff/dashboard users.
 //
