@@ -52,7 +52,7 @@ const navSections: NavSection[] = [
     label: "Main",
     items: [
       { label: "Overview", icon: IconMonitor, href: "/home" },
-      { label: "Inbox", icon: IconMail, soon: true },
+      { label: "Inbox", icon: IconMail, href: "/conversations" },
       { label: "Customers", icon: IconUserCheck, soon: true },
       { label: "Knowledge base", icon: IconWorkflow, soon: true },
       { label: "Tickets", icon: IconMessageSquare, soon: true },

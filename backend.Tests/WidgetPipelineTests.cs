@@ -347,11 +347,10 @@ public class WidgetPipelineTests : IAsyncLifetime
         listRequest.Headers.Add("Cookie", cookie!);
         var listResponse = await staffClient.SendAsync(listRequest);
         Assert.Equal(HttpStatusCode.OK, listResponse.StatusCode);
-        var conversations = await listResponse.Content.ReadFromJsonAsync<List<ConversationSummaryResponse>>();
-        Assert.NotNull(conversations);
-        Assert.Single(conversations!);
-
-        var conversationId = conversations![0].Id;
+        var payload = await listResponse.Content.ReadFromJsonAsync<ConversationListResponse>();
+        Assert.NotNull(payload);
+        Assert.Single(payload!.Conversations);
+        var conversationId = payload.Conversations[0].Id;
         var messagesRequest = new HttpRequestMessage(HttpMethod.Get, $"/api/conversations/{conversationId}/messages");
         messagesRequest.Headers.Add("Cookie", cookie!);
         var messagesResponse = await staffClient.SendAsync(messagesRequest);

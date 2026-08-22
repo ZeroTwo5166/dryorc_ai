@@ -325,3 +325,56 @@ export function markNotificationRead(id: string): Promise<null> {
 export function markAllNotificationsRead(cursor: NotificationCursor): Promise<null> {
   return api.post("/api/notifications/read-all", cursor);
 }
+
+// Talks to backend/Controllers/ConversationsController.cs.
+
+export type ConversationSummary = {
+  id: string;
+  channel: string;
+  status: string;
+  handledBy: "Ai" | "Human";
+  lastMessagePreview: string | null;
+  lastMessageAt: string | null;
+  createdAt: string;
+};
+
+// Compound keyset cursor, structurally similar to NotificationCursor but
+// deliberately NOT named createdAt: activityAt is (lastMessageAt ??
+// createdAt), the list's actual sort/filter key. Conversation.lastMessageAt
+// is mutable (unlike NotificationRecipient.createdAt, set once and never
+// updated) — see ConversationsController.List's doc comment for the one
+// pagination consequence that has. Never reduce this to just the timestamp.
+export type ConversationCursor = {
+  activityAt: string;
+  id: string;
+};
+
+export type ConversationListResponse = {
+  conversations: ConversationSummary[];
+  nextCursor: ConversationCursor | null;
+};
+
+export type ConversationMessage = {
+  id: string;
+  role: "Customer" | "Ai" | "Agent";
+  content: string;
+  createdAt: string;
+};
+
+export function listConversations(params?: {
+  take?: number;
+  before?: ConversationCursor;
+}): Promise<ConversationListResponse> {
+  const query = new URLSearchParams();
+  if (params?.take) query.set("take", String(params.take));
+  if (params?.before) {
+    query.set("beforeActivityAt", params.before.activityAt);
+    query.set("beforeId", params.before.id);
+  }
+  const qs = query.toString();
+  return api.get(`/api/conversations${qs ? `?${qs}` : ""}`);
+}
+
+export function getConversationMessages(id: string): Promise<ConversationMessage[]> {
+  return api.get(`/api/conversations/${id}/messages`);
+}
