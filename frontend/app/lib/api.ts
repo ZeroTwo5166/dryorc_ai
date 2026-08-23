@@ -138,6 +138,12 @@ export const api = {
       method: "POST",
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
     }),
+  put: (path: string, body?: unknown) =>
+    authedRequest(path, {
+      method: "PUT",
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    }),
+  delete: (path: string) => authedRequest(path, { method: "DELETE" }),
 };
 
 export type RegisterRequest = {
@@ -377,4 +383,54 @@ export function listConversations(params?: {
 
 export function getConversationMessages(id: string): Promise<ConversationMessage[]> {
   return api.get(`/api/conversations/${id}/messages`);
+}
+
+// Talks to backend/Controllers/KnowledgeDocumentsController.cs.
+
+export type KnowledgeDocumentType = "Faq" | "Policy" | "Product" | "Document";
+
+export type KnowledgeDocument = {
+  id: string;
+  type: KnowledgeDocumentType;
+  title: string;
+  content: string;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CreateKnowledgeDocumentRequest = {
+  type: KnowledgeDocumentType;
+  title: string;
+  content: string;
+};
+
+export type UpdateKnowledgeDocumentRequest = {
+  type: KnowledgeDocumentType;
+  title: string;
+  content: string;
+  isActive: boolean;
+};
+
+export function listKnowledgeDocuments(): Promise<KnowledgeDocument[]> {
+  return api.get("/api/knowledge");
+}
+
+export function getKnowledgeDocument(id: string): Promise<KnowledgeDocument> {
+  return api.get(`/api/knowledge/${id}`);
+}
+
+export function createKnowledgeDocument(body: CreateKnowledgeDocumentRequest): Promise<KnowledgeDocument> {
+  return api.post("/api/knowledge", body);
+}
+
+export function updateKnowledgeDocument(id: string, body: UpdateKnowledgeDocumentRequest): Promise<KnowledgeDocument> {
+  return api.put(`/api/knowledge/${id}`, body);
+}
+
+// Soft-delete only (server sets IsActive = false, never a physical delete —
+// see KnowledgeDocumentsController.Deactivate). To reactivate, call
+// updateKnowledgeDocument with isActive: true.
+export function deactivateKnowledgeDocument(id: string): Promise<null> {
+  return api.delete(`/api/knowledge/${id}`);
 }
