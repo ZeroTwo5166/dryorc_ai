@@ -12,20 +12,22 @@
 
 ## Phase 2 — Auth & Dashboard
 - [x] **Step 4 — Auth & Authorization** — complete, tested, committed (`ef49a48`, `feat(auth): complete Step 4 authentication and authorization`). `AddIdentity` (not `AddIdentityCore`), Owner/Admin/Agent roles seeded, `TenantAwareUserStore` (`FindByNameAsync`-only `IgnoreQueryFilters()` exception), `ClaimsCurrentTenantAccessor`, `SameTenant` resource-based policy + role policies, register/login/logout endpoints. Real `AppDbContext` tenant-filter bug found and fixed during this step (constructor-snapshotted `BusinessId` → read live instead), with a deterministic regression test.
-- [ ] Step 5 — Next.js Dashboard (basic) — **not started**. Before building, check `Nivora old` for existing dashboard/login UI worth porting (see loose ends).
+- [x] Step 5 — Next.js Dashboard (basic) — complete, tested, committed (`9940ee6`, "Checkpoint: auth flows, theming, dashboard shell, notifications UI"): `DashboardShell`/`Sidebar`/`Topbar`, `auth-context` session gating (bfcache/prerender-aware), `/home`, `/conversations`, `/knowledge`, `/notifications` all live behind auth. Frontend test suite: 30/30 passing.
 
 ## Phase 3 — Core Product (MVP)
 - [ ] Step 6 — Chat Widget (`Widget` table ready — `PublicKey`, `AllowedDomains`, cryptographically-random key generation still needs implementing)
-- [ ] Step 7 — Conversation API + baseline rate limiting (`Conversation`/`Message` tables ready — `LastMessageAt` transactional-update requirement, `Channel` required-with-no-default requirement both apply)
-- [ ] Step 8 — Connect Claude (non-streaming)
-- [ ] Step 9 — Business Inbox
+- [ ] Step 6B — Embeddable Widget Client — the customer-facing widget a business embeds on its own website, distinct from Step 6 (which covers only the backend: `Widget` persistence/provisioning, `PublicKey` generation, `AllowedDomains`, authentication/authorization, the `WidgetController` Init/Messages infrastructure). Step 6B is the actual browser-side client that talks to that backend: embeddable script/client, floating chat UI (open/close), message display, visitor message input/send, communication with the existing Init/Messages endpoints, basic loading/error states, conversation/session continuity, safe embedding on third-party sites. Not started — no implementation commit. Initial scope explicitly excludes advanced widget customization, full widget settings management, analytics, file uploads, voice, human handoff, ticket UI, visitor authentication, advanced theming, and complex framework architecture.
+- [x] Step 7 — Conversation API + baseline rate limiting — complete, tested, committed (`6388a3e`): `LastMessageAt` updated in the same `SaveChangesAsync` as the Message insert (transactional, never a separate write), `Channel` set explicitly with no implicit default, `WidgetInit`/`WidgetMessages` rate-limit policies wired and enforced.
+- [x] Step 8 — Connect Claude (non-streaming) — complete, tested, committed (`87e9291`): real Anthropic SDK call via `ClaudeReplyService`, typed exception handling (rate-limit/5xx/API/network) degrades to a null reply without breaking the already-persisted customer message, AI reply persisted with `LastMessageAt` updated transactionally. Live-Claude test (`ClaudeReplyServiceTests.GenerateReplyAsync_RealApiCall_...`) remains gated behind `[LiveClaudeFact]`, skipped by default.
+- [ ] Step 9 (partial) — Business Inbox — conversation list (paginated) + read-only conversation detail/messages implemented and tested (`848a78d`); (read-only; staff reply/composer intentionally deferred — no Agent-message creation flow exists yet)
 - Streaming (deferred, needs own protocol spec — unchanged from v1)
 
 ## Phase 4 — AI Knowledge / RAG
-- [ ] Step 10 — Knowledge Base CRUD (`KnowledgeDocument` ready — `IsActive` soft-delete)
-- [ ] Step 11 — Embeddings + pgvector (`KnowledgeChunk` ready — 1024-dim, `voyage-3`, HNSW index built; `EmbeddingModel` tracking in place for future model migrations)
-- [ ] Step 12 — RAG (`MessageKnowledgeSource` *new table* ready — content-snapshot citation/provenance mechanism, not in v1's plan at all)
-- [ ] Step 13 — AI Guardrails: `ConversationModeService` (schema ready — `TagModeMapping` redesigned with generalized `IsMinimumFloor`, `Business.AutoRefundLimit` interaction; computation order specified in dev plan v2 Section 6), `TicketService`, `TagModeMappingsController`, SignalR `TicketHub`
+- [x] Step 10 — Knowledge Base CRUD — complete, tested, committed (`9652d8a`): list/get/create/update/soft-delete (`IsActive`) via `KnowledgeDocumentsController`, tenant-isolated, frontend CRUD wired into `/knowledge/*`.
+- [x] Step 11 — Embeddings + pgvector — complete, tested, committed (`d8a37f0`): chunking (`KnowledgeChunker`) + Voyage embedding generation, `EmbeddingModel` persisted per chunk (`voyage-3`), HNSW index (`vector_cosine_ops`) confirmed in the `InitialCreate` migration.
+- [x] Step 12 — RAG — complete, tested, committed (`efc1315`): tenant-scoped, active-document-only cosine-distance retrieval (`KnowledgeRetrievalService`), integrated into `ClaudeReplyService`'s system prompt, `MessageKnowledgeSource` content-snapshot rows persisted per injected chunk, missing-Voyage-key fallback mirrors Step 8's missing-Anthropic-key pattern.
+- [x] Step 13A — AI Guardrails (service/controller layer) — complete, tested, committed (`cc7cfdf`): `ConversationModeService` (schema ready — `TagModeMapping` redesigned with generalized `IsMinimumFloor`, `Business.AutoRefundLimit` interaction; computation order specified in dev plan v2 Section 6), minimal `IAuditLogService` (caller owns `SaveChangesAsync`), `TagModeMappingsController`, standalone `TicketSlaService` (SLA lookup/deadline, `FirstRespondedAt`). Does **not** include ticket creation/lifecycle/claiming/priority selection, refund triggers, human handoff, or AI reply gating — those remain future work (see Step 16).
+- [ ] Step 13B — AI Guardrails (real-time layer): SignalR `TicketHub` — split out as its own later step; not part of 13A
 
 ## Phase 5 — Customer Support Features
 - [ ] Step 14 (backend) — Customer Profiles / identity linking (`ExternalIdentity` redesigned — `Channel`+`VerificationMethod` split, `IsCurrentlyValid()` validity rule; `Customer.ExtendedLoggingEnabled` extended-logging toggle new)
@@ -34,7 +36,7 @@
 - [ ] Step 15 (frontend) — Dashboard UI
 - [ ] Step 16 (backend) — Tickets (`Ticket` fundamentally redesigned: customer-required/conversation-optional, `FirstRespondedAt` human-only-reply rule, `Channel` snapshot, `SlaDeadline` computed-once; `SlaTarget` redesigned with nullable-channel fallback rule)
 - [ ] Step 16 (frontend) — Dashboard UI
-- [ ] Step 17 — Notifications
+- [x] Step 17 — Notifications — complete, tested, committed (`6ee506a` schema/service/controller, `d7aab4d` frontend wiring). `NotificationService.NotifyAsync` currently has no production caller; notification infrastructure is implemented and tested, but no current feature triggers it.
 
 ## Phase 6 — Business Integrations
 - [ ] Step 18 (partial) — Integration framework: `ITokenProtector`/`DataProtectionTokenProtector`, `Integration` entity (redesigned — one row per `(Business, Platform)`, was buggy one-per-business-total in v1; `ExternalAccountIdentifier` renamed from `ShopDomain`, platform-agnostic; `Scopes` cache-not-guarantee discipline), encrypted token storage — **none of this built yet in `Nivora`** (existed in `Nivora old`, not ported)
@@ -70,13 +72,13 @@
 - [ ] Step 29 — Security hardening (MFA, audit logging — `AuditLog` schema exists but `IAuditLogService`/PII-allowlist validation not built, backup/restore testing, dependency updates, **Data Protection keyring move to real secret store — still filesystem-based**)
 
 ## Phase 10 — GDPR / Privacy
-- [x] Retention schema (`Business.RetentionDays`, bounded 30-730 days, CHECK-constrained) — **schema only, no enforcement**
-- [ ] Data deletion/anonymization jobs — **the single highest-priority open gap across the whole plan.** Customer anonymization logic is fully specified (dev plan v2 Section 10) but not implemented; conversation/message retention enforcement job does not exist at all
+- [x] Retention schema + enforcement (`Business.RetentionDays`, bounded 30-730 days, CHECK-constrained) — `RetentionEnforcementService` performs the age-based sweep, actually run by `DataLifecycleBackgroundService` (registered as a hosted service, 24-hour `PeriodicTimer`); no longer schema-only.
+- [x] Data deletion/anonymization jobs — implemented and tested: `CustomerErasureService` (deletes `ExternalIdentity`/`FlaggedCustomerActivityLog`/`CustomerExtendedLoggingHistory`/`VerificationCode` rows, purges every conversation via `ConversationPurgeService`, then anonymizes the `Customer` row last) + `RetentionEnforcementService`, both scheduled via `DataLifecycleBackgroundService`. **Remaining gap: no authenticated HTTP endpoint / manual trigger exists for on-demand customer erasure** — `CustomerErasureService` is only reachable from code/tests today; the customer-vs-staff-initiated trigger design is not yet decided.
 - [ ] Embedding deletion lifecycle (not yet needed — no conversation embeddings exist yet, only knowledge-base embeddings)
 - [ ] Data portability / export mechanism
 - [ ] Anthropic DPA/retention/training-policy documentation
 - [ ] Aggregated analytics vs. anonymization review
-- [ ] **NEW — retention periods for `AuditLog`, `FlaggedCustomerActivityLog`, `VerificationCode` all undecided** (six total retention clocks identified this session, only one — conversation retention — has even a schema column; see dev plan v2 Section 10 table)
+- [ ] **NEW — retention periods: 2 of 6 clocks now decided** — Conversation/Message (`Business.RetentionDays`, enforced by `RetentionEnforcementService`) and `VerificationCode` (fixed 30-day-post-expiry sweep, `VerificationCodeCleanupService`), both scheduled via `DataLifecycleBackgroundService`. `AuditLog` and `FlaggedCustomerActivityLog` retention remain undecided, as do the plan's other two clocks (`OrderCancellation`/`Refund` external-ID retention, backup retention) — see dev plan v2 Section 10 table.
 
 ## Phase 11 — Scaling
 Not started (deliberately deferred until justified)
@@ -98,3 +100,5 @@ Not started (deliberately deferred until justified)
 - **NEW — `RefundItem.BusinessId` vs `Refund.BusinessId` consistency is not DB-enforced** (no composite FK) — relies on service-layer verification before insert, same class of gap as `MessageKnowledgeSource`.
 - **NEW — Staff invite-into-existing-business flow doesn't exist.** Step 4's registration endpoint only creates a *new* `Business` + `Owner` — there's no way yet for an Owner to invite additional staff (Admin/Agent) into their existing business. Worth scoping this before Step 5's dashboard needs an "invite team member" UI.
 - **NEW — Cross-tenant isolation test currently runs locally only, not in an actual CI pipeline** — the original checklist's "Cross-tenant isolation test in CI" item is technically only half-done; the test exists and passes, but there's no automated pipeline running it on every push yet.
+- **NEW — Four implemented/tested pieces of logic currently have no production caller**: `ConversationModeService` and `TicketSlaService` (both Step 13A), `NotificationService.NotifyAsync` (Step 17), and the GDPR customer-erasure workflow (`CustomerErasureService` — reachable only from code/tests, no HTTP endpoint). Not bugs — each is intentionally implemented domain/infrastructure logic awaiting a future integration point (Step 16's ticket lifecycle, a real notification-triggering event, and a decided erasure-trigger design, respectively). Recorded here so future sessions don't re-discover this from scratch.
+- **NEW — SignalR/real-time infrastructure has no existing precedent anywhere in this codebase** (confirmed via inspection, not assumed) — Step 13B needs its own dedicated design/inspection pass before implementation (hub auth reusing the existing staff cookie scheme, connection-to-tenant/business mapping, test conventions for a WebSocket-based feature), separate from and after 13A.
