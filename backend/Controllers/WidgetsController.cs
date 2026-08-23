@@ -1,4 +1,6 @@
+using System.Net;
 using System.Security.Cryptography;
+using System.Text;
 using backend.Auth;
 using backend.Data;
 using backend.Interfaces;
@@ -17,7 +19,8 @@ public record WidgetResponse(
     string PublicKey,
     List<string> AllowedDomains,
     bool IsActive,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt,
+    string EmbedSnippet);
 
 /// <summary>
 /// Step 6: the staff-facing widget-provisioning surface — the production
@@ -58,7 +61,7 @@ public class WidgetsController(
         var authResult = await authorizationService.AuthorizeAsync(User, widget, NivoraPolicies.SameTenant);
         if (!authResult.Succeeded) return NotFound();
 
-        return Ok(ToResponse(widget));
+        return Ok(await ToResponseAsync(widget));
     }
 
     [HttpPost]
@@ -100,9 +103,41 @@ public class WidgetsController(
         db.Widgets.Add(widget);
         await db.SaveChangesAsync();
 
-        return CreatedAtAction(nameof(Get), new { id = widget.Id }, ToResponse(widget));
+        return CreatedAtAction(nameof(Get), new { id = widget.Id }, await ToResponseAsync(widget));
     }
 
-    private static WidgetResponse ToResponse(Widget w) =>
-        new(w.Id, w.Name, w.PublicKey, w.AllowedDomains, w.IsActive, w.CreatedAt);
+    /// <summary>
+    /// Step 6B: a ready-to-paste embed snippet, so an Owner doesn't have to
+    /// hand-assemble one from the raw PublicKey. Script URL is derived from
+    /// the current request's own scheme/host (never a hardcoded domain —
+    /// this project has no fixed production hostname configured anywhere
+    /// yet), pointing at the static bundle Program.cs now serves via
+    /// UseStaticFiles() from wwwroot/widget/nivora-widget.js. Business name
+    /// is a separate DB lookup (Widget.Name is an internal admin label,
+    /// e.g. "Storefront Widget" — not what a header should show a real
+    /// customer) and is optional in the snippet since it's just a nicer
+    /// chat-header default, not required for the widget to function.
+    /// HTML-encoded since it's an Owner-controlled free-text value being
+    /// embedded into an HTML attribute the Owner will copy onto their own
+    /// site.
+    /// </summary>
+    private async Task<WidgetResponse> ToResponseAsync(Widget w)
+    {
+        var businessName = await db.Businesses.AsNoTracking()
+            .Where(b => b.Id == w.BusinessId)
+            .Select(b => b.Name)
+            .FirstOrDefaultAsync();
+
+        var scriptUrl = $"{Request.Scheme}://{Request.Host}/widget/nivora-widget.js";
+        var snippet = new StringBuilder()
+            .Append("<script src=\"").Append(scriptUrl).Append('"')
+            .Append(" data-public-key=\"").Append(WebUtility.HtmlEncode(w.PublicKey)).Append('"');
+        if (!string.IsNullOrWhiteSpace(businessName))
+        {
+            snippet.Append(" data-business-name=\"").Append(WebUtility.HtmlEncode(businessName)).Append('"');
+        }
+        snippet.Append(" async></script>");
+
+        return new(w.Id, w.Name, w.PublicKey, w.AllowedDomains, w.IsActive, w.CreatedAt, snippet.ToString());
+    }
 }

@@ -1,0 +1,11 @@
+# Dependencies — reinstalled via `npm install`, never tracked.
+/node_modules
+
+# The build OUTPUT (backend/wwwroot/widget/nivora-widget.js) is deliberately
+# NOT ignored/excluded from git, unlike frontend's /.next/. That output is
+# the actual asset ASP.NET Core serves to real embedded widgets, and this
+# project has no CI/CD pipeline yet to regenerate it on deploy — committing
+# the built bundle is what makes a plain `git clone` + `dotnet run` actually
+# serve a working widget, rather than 404ing until someone remembers to run
+# `npm run build` here first. Revisit this once a real build/deploy
+# pipeline exists for the project.

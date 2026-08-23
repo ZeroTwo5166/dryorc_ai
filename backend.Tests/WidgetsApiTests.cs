@@ -118,7 +118,7 @@ public class WidgetsApiTests : IAsyncLifetime
         return request;
     }
 
-    private record WidgetResponseDto(Guid Id, string Name, string PublicKey, List<string> AllowedDomains, bool IsActive, DateTimeOffset CreatedAt);
+    private record WidgetResponseDto(Guid Id, string Name, string PublicKey, List<string> AllowedDomains, bool IsActive, DateTimeOffset CreatedAt, string EmbedSnippet);
 
     private async Task<(Guid BusinessId, Guid OwnerId, HttpClient OwnerClient, string OwnerCookie)> SetUpBusinessWithOwnerAsync(string businessName)
     {
@@ -367,5 +367,76 @@ public class WidgetsApiTests : IAsyncLifetime
 
         var getResponse = await agentClient.SendAsync(Authed(HttpMethod.Get, $"/api/widgets/{created!.Id}", agentCookie!));
         Assert.Equal(HttpStatusCode.OK, getResponse.StatusCode);
+    }
+
+    // ── Step 6B: embed snippet ──────────────────────────────────────────
+
+    [Fact]
+    public async Task Create_EmbedSnippet_ContainsScriptTagWithPublicKey()
+    {
+        var (_, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Widget Snippet Business");
+        using var _ = ownerClient;
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/widgets", ownerCookie),
+            new CreateWidgetRequest("Storefront Widget", null)));
+        var body = await response.Content.ReadFromJsonAsync<WidgetResponseDto>();
+
+        Assert.NotNull(body);
+        Assert.StartsWith("<script ", body!.EmbedSnippet);
+        Assert.Contains("nivora-widget.js", body.EmbedSnippet);
+        Assert.Contains($"data-public-key=\"{body.PublicKey}\"", body.EmbedSnippet);
+        Assert.Contains("async", body.EmbedSnippet);
+        Assert.EndsWith("</script>", body.EmbedSnippet);
+    }
+
+    [Fact]
+    public async Task Create_EmbedSnippet_IncludesBusinessName()
+    {
+        var (_, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Widget Snippet Name Business");
+        using var _ = ownerClient;
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/widgets", ownerCookie),
+            new CreateWidgetRequest("Storefront Widget", null)));
+        var body = await response.Content.ReadFromJsonAsync<WidgetResponseDto>();
+
+        Assert.NotNull(body);
+        Assert.Contains("data-business-name=\"Widget Snippet Name Business\"", body!.EmbedSnippet);
+    }
+
+    [Fact]
+    public async Task Create_EmbedSnippet_HtmlEncodesBusinessNameWithSpecialCharacters()
+    {
+        var (_, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Nike & \"Friends\" Co");
+        using var _ = ownerClient;
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/widgets", ownerCookie),
+            new CreateWidgetRequest("Storefront Widget", null)));
+        var body = await response.Content.ReadFromJsonAsync<WidgetResponseDto>();
+
+        Assert.NotNull(body);
+        Assert.Contains("Nike &amp; &quot;Friends&quot; Co", body!.EmbedSnippet);
+        // The raw, unescaped name must never appear — that would mean the
+        // attribute value could be broken out of by an embedded `"`.
+        Assert.DoesNotContain("data-business-name=\"Nike & \"Friends\"", body.EmbedSnippet);
+    }
+
+    [Fact]
+    public async Task Get_EmbedSnippet_MatchesCreateResponse()
+    {
+        var (_, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Widget Snippet Get Business");
+        using var _ = ownerClient;
+
+        var createResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/widgets", ownerCookie),
+            new CreateWidgetRequest("Storefront Widget", null)));
+        var created = await createResponse.Content.ReadFromJsonAsync<WidgetResponseDto>();
+
+        var getResponse = await ownerClient.SendAsync(Authed(HttpMethod.Get, $"/api/widgets/{created!.Id}", ownerCookie));
+        var fetched = await getResponse.Content.ReadFromJsonAsync<WidgetResponseDto>();
+
+        Assert.Equal(created.EmbedSnippet, fetched!.EmbedSnippet);
     }
 }

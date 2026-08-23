@@ -400,6 +400,15 @@ if (app.Environment.IsDevelopment())
     app.UseCors("DashboardDev");
 }
 
+// Step 6B: serves the built embeddable widget bundle from
+// wwwroot/widget/nivora-widget.js at /widget/nivora-widget.js. A
+// <script src> load isn't subject to CORS at all (unlike the widget's own
+// fetch() calls back to /api/widget/*, which the existing "Widget" CORS
+// policy above already covers) — no CORS change needed for this. Placed
+// before authentication/authorization deliberately: this is a public,
+// unauthenticated static asset, same as the script tag itself.
+app.UseStaticFiles();
+
 app.UseAuthentication();
 app.UseAuthorization();
 
