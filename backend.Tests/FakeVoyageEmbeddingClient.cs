@@ -39,7 +39,10 @@ public class FakeVoyageEmbeddingClient : IVoyageEmbeddingClient
         return Task.FromResult(results);
     }
 
-    private static float[] DeterministicVector(string text)
+    // Public so other test files (e.g. KnowledgeRetrievalServiceTests) can
+    // precompute the exact vector this fake will produce for a given text,
+    // without duplicating the algorithm.
+    public static float[] DeterministicVector(string text)
     {
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(text));
         var seed = BitConverter.ToInt32(hash, 0);

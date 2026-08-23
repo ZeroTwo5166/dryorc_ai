@@ -161,6 +161,13 @@ else
 }
 builder.Services.AddScoped<IKnowledgeIndexingService, KnowledgeIndexingService>();
 
+// Step 12: RAG retrieval, over the same lazily-registered IVoyageEmbeddingClient
+// above — reused as-is, no second Voyage client/registration. Degrades
+// internally on Voyage failure (see KnowledgeRetrievalService), so it's
+// always safe to register unconditionally here regardless of whether a key
+// is configured.
+builder.Services.AddScoped<IKnowledgeRetrievalService, KnowledgeRetrievalService>();
+
 // ─────────────────────────────────────────────────────────────
 // Identity — cookie-based auth for staff/dashboard users.
 //

@@ -8,6 +8,8 @@ using backend.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
+using Pgvector;
 using Xunit;
 
 namespace backend.Tests;
@@ -61,7 +63,13 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
             var ids = _businessIdsToClean.ToArray();
 
+            // Messages first — cascades away any MessageKnowledgeSource rows
+            // referencing them. KnowledgeChunks/KnowledgeDocuments before
+            // Businesses — that FK is Restrict, not Cascade, so deleting the
+            // Business first would fail while either still exists.
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Messages\" WHERE \"BusinessId\" = ANY({ids})");
+            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"KnowledgeChunks\" WHERE \"BusinessId\" = ANY({ids})");
+            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"KnowledgeDocuments\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Widgets\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = ANY({ids})");
@@ -118,6 +126,50 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         return (business, conversation);
     }
 
+    /// <summary>
+    /// Seeds a real KnowledgeDocument + KnowledgeChunk row so tests can hand
+    /// FakeKnowledgeRetrievalService a RetrievedKnowledgeChunk with genuinely
+    /// valid ids — MessageKnowledgeSource.KnowledgeChunkId/KnowledgeDocumentId
+    /// are real (non-null-when-set) foreign keys, so a fabricated Guid.NewGuid()
+    /// with no backing row fails with a real FK violation on insert.
+    /// Embedding content is a placeholder; these tests are about
+    /// ClaudeReplyService's prompt-building/persistence logic, not
+    /// retrieval's own vector-search correctness (KnowledgeRetrievalServiceTests'
+    /// job).
+    /// </summary>
+    private static async Task<(Guid DocumentId, Guid ChunkId)> SeedKnowledgeChunkAsync(
+        AppDbContext db, Guid businessId, string title, string content)
+    {
+        var document = new KnowledgeDocument
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            Type = KnowledgeDocumentType.Faq,
+            Title = title,
+            Content = content,
+            IsActive = true,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        var chunk = new KnowledgeChunk
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            KnowledgeDocumentId = document.Id,
+            ChunkIndex = 0,
+            Content = content,
+            Embedding = new Vector(new float[1024]),
+            EmbeddingModel = "voyage-3",
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        db.KnowledgeDocuments.Add(document);
+        db.KnowledgeChunks.Add(chunk);
+        await db.SaveChangesAsync();
+
+        return (document.Id, chunk.Id);
+    }
+
     // ── Success path — fake, but realistic response shape ──────────
 
     [Fact]
@@ -128,7 +180,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
 
         var fake = new FakeMessageService { ReplyText = "Yes, we ship to Denmark within 3-5 business days." };
-        var service = new ClaudeReplyService(db, fake);
+        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), NullLogger<ClaudeReplyService>.Instance);
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -147,6 +199,158 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         Assert.Equal(aiMessage.CreatedAt, updatedConversation.LastMessageAt);
     }
 
+    // ── Step 12: RAG retrieval wiring ────────────────────────────────
+
+    [Fact]
+    public async Task GenerateReplyAsync_RetrievedChunks_QueriesWithLatestCustomerMessage_AndAppearInSystemPrompt()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+        var (documentId, chunkId) = await SeedKnowledgeChunkAsync(db, business.Id, "Shipping Policy", "MARKER_CHUNK_ONE: we ship worldwide.");
+
+        var retrieval = new FakeKnowledgeRetrievalService
+        {
+            ChunksToReturn =
+            [
+                new RetrievedKnowledgeChunk(chunkId, documentId, "Shipping Policy", "MARKER_CHUNK_ONE: we ship worldwide."),
+            ],
+        };
+        var fake = new FakeMessageService { ReplyText = "Yes, we do." };
+        var service = new ClaudeReplyService(db, fake, retrieval, NullLogger<ClaudeReplyService>.Instance);
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.Equal(1, retrieval.CallCount);
+        Assert.Equal("Do you ship to Denmark?", retrieval.Requests[0].QueryText); // the seeded customer message
+        Assert.Equal(business.Id, retrieval.Requests[0].BusinessId);
+
+        var sentSystemPrompt = (string)fake.Requests[0].System!.Value!;
+        Assert.Contains("MARKER_CHUNK_ONE: we ship worldwide.", sentSystemPrompt);
+        Assert.Contains("[1]", sentSystemPrompt);
+        Assert.Contains("Knowledge base context", sentSystemPrompt);
+    }
+
+    [Fact]
+    public async Task GenerateReplyAsync_MultipleRetrievedChunks_NumberedInOrderInSystemPrompt()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+        var (documentIdA, chunkIdA) = await SeedKnowledgeChunkAsync(db, business.Id, "Doc A", "MARKER_FIRST content.");
+        var (documentIdB, chunkIdB) = await SeedKnowledgeChunkAsync(db, business.Id, "Doc B", "MARKER_SECOND content.");
+
+        var retrieval = new FakeKnowledgeRetrievalService
+        {
+            ChunksToReturn =
+            [
+                new RetrievedKnowledgeChunk(chunkIdA, documentIdA, "Doc A", "MARKER_FIRST content."),
+                new RetrievedKnowledgeChunk(chunkIdB, documentIdB, "Doc B", "MARKER_SECOND content."),
+            ],
+        };
+        var fake = new FakeMessageService();
+        var service = new ClaudeReplyService(db, fake, retrieval, NullLogger<ClaudeReplyService>.Instance);
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        var systemPrompt = (string)fake.Requests[0].System!.Value!;
+        var firstIndex = systemPrompt.IndexOf("[1] MARKER_FIRST content.", StringComparison.Ordinal);
+        var secondIndex = systemPrompt.IndexOf("[2] MARKER_SECOND content.", StringComparison.Ordinal);
+        Assert.True(firstIndex >= 0, "expected [1]-labeled first chunk in the system prompt");
+        Assert.True(secondIndex > firstIndex, "expected [2]-labeled second chunk to follow the first");
+    }
+
+    [Fact]
+    public async Task GenerateReplyAsync_RetrievedChunks_PersistsOneMessageKnowledgeSourcePerChunk_WithCorrectSnapshots()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+
+        var (documentIdA, chunkIdA) = await SeedKnowledgeChunkAsync(db, business.Id, "seed doc A", "seed content A");
+        var (documentIdB, chunkIdB) = await SeedKnowledgeChunkAsync(db, business.Id, "seed doc B", "seed content B");
+        var retrieval = new FakeKnowledgeRetrievalService
+        {
+            ChunksToReturn =
+            [
+                new RetrievedKnowledgeChunk(chunkIdA, documentIdA, "Refund Policy", "30-day refunds."),
+                new RetrievedKnowledgeChunk(chunkIdB, documentIdB, "Shipping Policy", "Ships within 2 days."),
+            ],
+        };
+        var fake = new FakeMessageService { ReplyText = "Here's what I found." };
+        var service = new ClaudeReplyService(db, fake, retrieval, NullLogger<ClaudeReplyService>.Instance);
+
+        var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
+        Assert.NotNull(reply);
+
+        var aiMessage = await db.Messages.IgnoreQueryFilters()
+            .SingleAsync(m => m.ConversationId == conversation.Id && m.Role == MessageRole.Ai);
+
+        var sources = await db.MessageKnowledgeSources.IgnoreQueryFilters()
+            .Where(s => s.MessageId == aiMessage.Id)
+            .ToListAsync();
+
+        Assert.Equal(2, sources.Count); // exactly one row per injected chunk
+        var sourceA = sources.Single(s => s.KnowledgeChunkId == chunkIdA);
+        Assert.Equal(documentIdA, sourceA.KnowledgeDocumentId);
+        Assert.Equal("Refund Policy", sourceA.DocumentTitleSnapshot);
+        Assert.Equal("30-day refunds.", sourceA.ChunkContentSnapshot);
+        Assert.Equal(business.Id, sourceA.BusinessId);
+
+        var sourceB = sources.Single(s => s.KnowledgeChunkId == chunkIdB);
+        Assert.Equal(documentIdB, sourceB.KnowledgeDocumentId);
+        Assert.Equal("Shipping Policy", sourceB.DocumentTitleSnapshot);
+        Assert.Equal("Ships within 2 days.", sourceB.ChunkContentSnapshot);
+    }
+
+    [Fact]
+    public async Task GenerateReplyAsync_NoRetrievedChunks_NoMessageKnowledgeSourceRows()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+
+        var fake = new FakeMessageService { ReplyText = "Plain reply." };
+        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), NullLogger<ClaudeReplyService>.Instance); // default: returns nothing
+
+        var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
+        Assert.NotNull(reply);
+
+        var aiMessage = await db.Messages.IgnoreQueryFilters()
+            .SingleAsync(m => m.ConversationId == conversation.Id && m.Role == MessageRole.Ai);
+        var sources = await db.MessageKnowledgeSources.IgnoreQueryFilters()
+            .Where(s => s.MessageId == aiMessage.Id).ToListAsync();
+        Assert.Empty(sources);
+        Assert.DoesNotContain("Knowledge base context", (string)fake.Requests[0].System!.Value!);
+    }
+
+    [Fact]
+    public async Task GenerateReplyAsync_RetrievalServiceThrows_FallsBackToConversationOnlyBehavior()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+
+        // Simulates an unexpected failure inside IKnowledgeRetrievalService —
+        // KnowledgeRetrievalService's own real implementation never throws
+        // for an expected Voyage failure (see KnowledgeRetrievalServiceTests),
+        // but ClaudeReplyService's own defense-in-depth catch must hold
+        // regardless of the reason retrieval failed.
+        var retrieval = new FakeKnowledgeRetrievalService { ExceptionToThrow = new InvalidOperationException("simulated unexpected retrieval failure") };
+        var fake = new FakeMessageService { ReplyText = "Still works." };
+        var service = new ClaudeReplyService(db, fake, retrieval, NullLogger<ClaudeReplyService>.Instance);
+
+        var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.Equal("Still works.", reply); // the conversation continued normally, not broken by retrieval throwing
+        var aiMessage = await db.Messages.IgnoreQueryFilters()
+            .SingleAsync(m => m.ConversationId == conversation.Id && m.Role == MessageRole.Ai);
+        var sources = await db.MessageKnowledgeSources.IgnoreQueryFilters()
+            .Where(s => s.MessageId == aiMessage.Id).ToListAsync();
+        Assert.Empty(sources);
+        Assert.DoesNotContain("Knowledge base context", (string)fake.Requests[0].System!.Value!);
+    }
+
     // ── Anthropic-typed failures — each returns null, nothing persisted ─
 
     [Fact]
@@ -160,7 +364,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         {
             ExceptionToThrow = new AnthropicRateLimitException { StatusCode = HttpStatusCode.TooManyRequests, ResponseBody = "{}" },
         };
-        var service = new ClaudeReplyService(db, fake);
+        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), NullLogger<ClaudeReplyService>.Instance);
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -179,7 +383,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         {
             ExceptionToThrow = new Anthropic5xxException { StatusCode = HttpStatusCode.InternalServerError, ResponseBody = "{}" },
         };
-        var service = new ClaudeReplyService(db, fake);
+        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), NullLogger<ClaudeReplyService>.Instance);
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -198,7 +402,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         {
             ExceptionToThrow = new AnthropicApiException("Simulated API error") { StatusCode = HttpStatusCode.BadRequest, ResponseBody = "{}" },
         };
-        var service = new ClaudeReplyService(db, fake);
+        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), NullLogger<ClaudeReplyService>.Instance);
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -218,7 +422,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
 
         var fake = new FakeMessageService { ExceptionToThrow = new HttpRequestException("Simulated network failure") };
-        var service = new ClaudeReplyService(db, fake);
+        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), NullLogger<ClaudeReplyService>.Instance);
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -238,7 +442,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         // No real secrets touched — this constructs the exact stub
         // Program.cs registers when Anthropic:ApiKey is absent, directly,
         // independent of whatever's actually configured in this environment.
-        var service = new ClaudeReplyService(db, new MissingAnthropicApiKeyMessageService());
+        var service = new ClaudeReplyService(db, new MissingAnthropicApiKeyMessageService(), new FakeKnowledgeRetrievalService(), NullLogger<ClaudeReplyService>.Instance);
 
         await Assert.ThrowsAsync<AnthropicNotConfiguredException>(
             () => service.GenerateReplyAsync(business.Id, conversation.Id));
@@ -272,7 +476,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
 
         var client = new Anthropic.AnthropicClient { ApiKey = apiKey };
-        var service = new ClaudeReplyService(db, client.Messages);
+        var service = new ClaudeReplyService(db, client.Messages, new FakeKnowledgeRetrievalService(), NullLogger<ClaudeReplyService>.Instance);
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
