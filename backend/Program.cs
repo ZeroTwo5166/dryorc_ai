@@ -168,6 +168,15 @@ builder.Services.AddScoped<IKnowledgeIndexingService, KnowledgeIndexingService>(
 // is configured.
 builder.Services.AddScoped<IKnowledgeRetrievalService, KnowledgeRetrievalService>();
 
+// Step 13A: ConversationModeService/TicketSlaService — standalone domain
+// logic, no production caller yet (see each service's own doc comment).
+// AuditLogService — minimal, deliberately narrower than Step 29's eventual
+// PII-allowlist validation; exists only so TagModeMappingsController has
+// something real to call.
+builder.Services.AddScoped<IConversationModeService, ConversationModeService>();
+builder.Services.AddScoped<ITicketSlaService, TicketSlaService>();
+builder.Services.AddScoped<IAuditLogService, AuditLogService>();
+
 // ─────────────────────────────────────────────────────────────
 // Identity — cookie-based auth for staff/dashboard users.
 //
