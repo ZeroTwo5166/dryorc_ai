@@ -1,4 +1,5 @@
 using Anthropic.Services;
+using backend.Services;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -23,6 +24,14 @@ namespace backend.Tests;
 /// Anthropic call just because it happens to POST a widget message. Tests
 /// that genuinely want the real Claude integration use
 /// LiveClaudeApiFactory instead, never this one.
+///
+/// Same reasoning, same pattern, for IVoyageEmbeddingClient as of Step 11 —
+/// always swapped to FakeVoyageEmbeddingClient, regardless of whether
+/// Voyage:ApiKey happens to be configured. Any test that creates or
+/// content-edits a KnowledgeDocument through this factory (including every
+/// pre-Step-11 KnowledgeDocumentsApiTests test) must never incur a real,
+/// billed Voyage call just because Create/Update now indexes synchronously.
+/// No live-Voyage-equivalent factory exists — Step 11 doesn't need one.
 /// </summary>
 public class NivoraApiFactory : WebApplicationFactory<Program>
 {
@@ -32,6 +41,7 @@ public class NivoraApiFactory : WebApplicationFactory<Program>
         builder.ConfigureTestServices(services =>
         {
             services.AddSingleton<IMessageService, FakeMessageService>();
+            services.AddSingleton<IVoyageEmbeddingClient, FakeVoyageEmbeddingClient>();
         });
     }
 }

@@ -3,6 +3,7 @@ using backend.Data;
 using backend.Enums;
 using backend.Interfaces;
 using backend.Models;
+using backend.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -17,8 +18,8 @@ public record CreateKnowledgeDocumentRequest(string Type, string Title, string C
 public record UpdateKnowledgeDocumentRequest(string Type, string Title, string Content, bool IsActive);
 
 /// <summary>
-/// Step 10 — Knowledge Base CRUD only. Creating/updating a document never
-/// touches KnowledgeChunk (chunking/embeddings are Step 11) and nothing
+/// Step 10 — Knowledge Base CRUD; Step 11 — chunking/embedding wired into
+/// Create/content-changing Update via IKnowledgeIndexingService. Nothing
 /// here performs RAG retrieval (Step 12). Same AnyStaff + SameTenant +
 /// OwnerOrAdmin-for-writes pattern CustomersController already established.
 /// </summary>
@@ -28,7 +29,8 @@ public record UpdateKnowledgeDocumentRequest(string Type, string Title, string C
 public class KnowledgeDocumentsController(
     AppDbContext db,
     ICurrentTenantAccessor tenantAccessor,
-    IAuthorizationService authorizationService) : ControllerBase
+    IAuthorizationService authorizationService,
+    IKnowledgeIndexingService indexingService) : ControllerBase
 {
     [HttpGet]
     public async Task<IActionResult> List()
@@ -74,20 +76,17 @@ public class KnowledgeDocumentsController(
         var businessId = tenantAccessor.BusinessId
             ?? throw new InvalidOperationException("Authenticated but no tenant resolved — unreachable behind [Authorize].");
 
-        var now = DateTimeOffset.UtcNow;
-        var document = new KnowledgeDocument
+        KnowledgeDocument document;
+        try
         {
-            Id = Guid.NewGuid(),
-            BusinessId = businessId,
-            Type = type,
-            Title = request.Title,
-            Content = request.Content,
-            IsActive = true,
-            CreatedAt = now,
-            UpdatedAt = now,
-        };
-        db.KnowledgeDocuments.Add(document);
-        await db.SaveChangesAsync();
+            document = await indexingService.CreateAsync(
+                businessId, type, request.Title, request.Content, HttpContext.RequestAborted);
+        }
+        catch (VoyageEmbeddingException)
+        {
+            return StatusCode(StatusCodes.Status502BadGateway,
+                "Failed to generate embeddings for this document. Nothing was saved — try again.");
+        }
 
         return CreatedAtAction(nameof(Get), new { id = document.Id }, ToResponse(document));
     }
@@ -109,13 +108,18 @@ public class KnowledgeDocumentsController(
 
         // IsActive is settable here too — reactivating a deactivated document
         // is just another field update through this same endpoint, no
-        // separate route.
-        document.Type = type;
-        document.Title = request.Title;
-        document.Content = request.Content;
-        document.IsActive = request.IsActive;
-        document.UpdatedAt = DateTimeOffset.UtcNow;
-        await db.SaveChangesAsync();
+        // separate route. IKnowledgeIndexingService decides whether Content
+        // actually changed and only re-chunks/re-embeds when it did.
+        try
+        {
+            document = await indexingService.UpdateAsync(
+                document, type, request.Title, request.Content, request.IsActive, HttpContext.RequestAborted);
+        }
+        catch (VoyageEmbeddingException)
+        {
+            return StatusCode(StatusCodes.Status502BadGateway,
+                "Failed to generate embeddings for this update. The document was left unchanged — try again.");
+        }
 
         return Ok(ToResponse(document));
     }

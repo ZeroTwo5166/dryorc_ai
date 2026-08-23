@@ -138,6 +138,29 @@ else
 }
 builder.Services.AddScoped<IClaudeReplyService, ClaudeReplyService>();
 
+// Step 11: Voyage embeddings for KnowledgeDocument chunking/indexing — same
+// lazy pattern as Anthropic above. Startup must succeed whether or not
+// Voyage:ApiKey is configured; IKnowledgeIndexingService is always
+// registered and resolvable either way. When the key is absent,
+// IVoyageEmbeddingClient is backed by MissingVoyageApiKeyEmbeddingClient,
+// which throws a distinct VoyageNotConfiguredException the moment embedding
+// is actually attempted, not at startup, and never a real client
+// constructed with an empty key.
+var voyageApiKey = builder.Configuration["Voyage:ApiKey"];
+if (!string.IsNullOrWhiteSpace(voyageApiKey))
+{
+    builder.Services.AddHttpClient<IVoyageEmbeddingClient, VoyageEmbeddingClient>(client =>
+    {
+        client.BaseAddress = new Uri("https://api.voyageai.com/");
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", voyageApiKey);
+    });
+}
+else
+{
+    builder.Services.AddScoped<IVoyageEmbeddingClient, MissingVoyageApiKeyEmbeddingClient>();
+}
+builder.Services.AddScoped<IKnowledgeIndexingService, KnowledgeIndexingService>();
+
 // ─────────────────────────────────────────────────────────────
 // Identity — cookie-based auth for staff/dashboard users.
 //

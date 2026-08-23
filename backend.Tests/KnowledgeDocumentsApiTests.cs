@@ -4,6 +4,7 @@ using backend.Auth;
 using backend.Controllers;
 using backend.Data;
 using backend.Models;
+using backend.Services;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -341,5 +342,211 @@ public class KnowledgeDocumentsApiTests : IAsyncLifetime
 
         var getResponse = await ownerClientB.SendAsync(Authed(HttpMethod.Get, $"/api/knowledge/{createdA!.Id}", ownerCookieB));
         Assert.Equal(HttpStatusCode.NotFound, getResponse.StatusCode);
+    }
+
+    // ── Step 11: chunking/embedding lifecycle ───────────────────────
+
+    private FakeVoyageEmbeddingClient FakeVoyage => (FakeVoyageEmbeddingClient)_factory.Services.GetRequiredService<IVoyageEmbeddingClient>();
+
+    private async Task<List<Guid>> GetChunkIdsAsync(Guid documentId)
+    {
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        return await db.KnowledgeChunks
+            .IgnoreQueryFilters()
+            .Where(c => c.KnowledgeDocumentId == documentId)
+            .OrderBy(c => c.ChunkIndex)
+            .Select(c => c.Id)
+            .ToListAsync();
+    }
+
+    [Fact]
+    public async Task Create_PersistsChunksForTheDocument()
+    {
+        using var anonClient = NewClient();
+        using var ownerClient = NewClient();
+        var (_, ownerCookie) = await CreateBusinessAndLoginAsOwnerAsync(anonClient, ownerClient, "Knowledge Indexing Create Business");
+
+        var createResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/knowledge", ownerCookie),
+            new CreateKnowledgeDocumentRequest("Faq", "Shipping", "We ship within 2 business days.")));
+        Assert.Equal(HttpStatusCode.Created, createResponse.StatusCode);
+        var created = await createResponse.Content.ReadFromJsonAsync<KnowledgeDocumentResponse>();
+
+        var chunkIds = await GetChunkIdsAsync(created!.Id);
+        Assert.NotEmpty(chunkIds);
+    }
+
+    [Fact]
+    public async Task Update_ContentChanged_ReplacesChunks()
+    {
+        using var anonClient = NewClient();
+        using var ownerClient = NewClient();
+        var (_, ownerCookie) = await CreateBusinessAndLoginAsOwnerAsync(anonClient, ownerClient, "Knowledge Indexing Update Business");
+
+        var createResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/knowledge", ownerCookie),
+            new CreateKnowledgeDocumentRequest("Faq", "Doc", "MARKER_OLD original content.")));
+        var created = await createResponse.Content.ReadFromJsonAsync<KnowledgeDocumentResponse>();
+        var oldChunkIds = await GetChunkIdsAsync(created!.Id);
+
+        var updateResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, $"/api/knowledge/{created.Id}", ownerCookie),
+            new UpdateKnowledgeDocumentRequest("Faq", "Doc", "MARKER_NEW replaced content.", true)));
+        Assert.Equal(HttpStatusCode.OK, updateResponse.StatusCode);
+
+        var newChunkIds = await GetChunkIdsAsync(created.Id);
+        Assert.NotEmpty(newChunkIds);
+        Assert.Empty(newChunkIds.Intersect(oldChunkIds)); // fully replaced, not reused
+    }
+
+    [Fact]
+    public async Task Update_ContentUnchanged_ChunksUntouched_NoVoyageCall()
+    {
+        using var anonClient = NewClient();
+        using var ownerClient = NewClient();
+        var (_, ownerCookie) = await CreateBusinessAndLoginAsOwnerAsync(anonClient, ownerClient, "Knowledge Indexing Metadata-Only Business");
+
+        var createResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/knowledge", ownerCookie),
+            new CreateKnowledgeDocumentRequest("Faq", "Doc", "Stable content, never edited.")));
+        var created = await createResponse.Content.ReadFromJsonAsync<KnowledgeDocumentResponse>();
+        var chunkIdsBefore = await GetChunkIdsAsync(created!.Id);
+        var callCountBefore = FakeVoyage.CallCount;
+
+        var updateResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, $"/api/knowledge/{created.Id}", ownerCookie),
+            new UpdateKnowledgeDocumentRequest("Policy", "Renamed Doc", "Stable content, never edited.", true)));
+        Assert.Equal(HttpStatusCode.OK, updateResponse.StatusCode);
+        var updated = await updateResponse.Content.ReadFromJsonAsync<KnowledgeDocumentResponse>();
+        Assert.Equal("Policy", updated!.Type);
+        Assert.Equal("Renamed Doc", updated.Title);
+
+        var chunkIdsAfter = await GetChunkIdsAsync(created.Id);
+        Assert.Equal(chunkIdsBefore, chunkIdsAfter);
+        Assert.Equal(callCountBefore, FakeVoyage.CallCount);
+    }
+
+    [Fact]
+    public async Task Deactivate_ChunksRemainIntact()
+    {
+        using var anonClient = NewClient();
+        using var ownerClient = NewClient();
+        var (_, ownerCookie) = await CreateBusinessAndLoginAsOwnerAsync(anonClient, ownerClient, "Knowledge Indexing Deactivate Business");
+
+        var createResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/knowledge", ownerCookie),
+            new CreateKnowledgeDocumentRequest("Faq", "Doc", "Content that survives deactivation.")));
+        var created = await createResponse.Content.ReadFromJsonAsync<KnowledgeDocumentResponse>();
+        var chunkIdsBefore = await GetChunkIdsAsync(created!.Id);
+        Assert.NotEmpty(chunkIdsBefore);
+
+        var deleteResponse = await ownerClient.SendAsync(Authed(HttpMethod.Delete, $"/api/knowledge/{created.Id}", ownerCookie));
+        Assert.Equal(HttpStatusCode.NoContent, deleteResponse.StatusCode);
+
+        var chunkIdsAfter = await GetChunkIdsAsync(created.Id);
+        Assert.Equal(chunkIdsBefore, chunkIdsAfter);
+    }
+
+    [Fact]
+    public async Task Reactivate_WithoutContentChange_ChunksRemain_NoVoyageCall()
+    {
+        using var anonClient = NewClient();
+        using var ownerClient = NewClient();
+        var (_, ownerCookie) = await CreateBusinessAndLoginAsOwnerAsync(anonClient, ownerClient, "Knowledge Indexing Reactivate Business");
+
+        var createResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/knowledge", ownerCookie),
+            new CreateKnowledgeDocumentRequest("Faq", "Doc", "Content, unchanged through the whole lifecycle.")));
+        var created = await createResponse.Content.ReadFromJsonAsync<KnowledgeDocumentResponse>();
+        await ownerClient.SendAsync(Authed(HttpMethod.Delete, $"/api/knowledge/{created!.Id}", ownerCookie));
+
+        var chunkIdsBefore = await GetChunkIdsAsync(created.Id);
+        var callCountBefore = FakeVoyage.CallCount;
+
+        var reactivateResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, $"/api/knowledge/{created.Id}", ownerCookie),
+            new UpdateKnowledgeDocumentRequest("Faq", "Doc", "Content, unchanged through the whole lifecycle.", true)));
+        Assert.Equal(HttpStatusCode.OK, reactivateResponse.StatusCode);
+        var reactivated = await reactivateResponse.Content.ReadFromJsonAsync<KnowledgeDocumentResponse>();
+        Assert.True(reactivated!.IsActive);
+
+        var chunkIdsAfter = await GetChunkIdsAsync(created.Id);
+        Assert.Equal(chunkIdsBefore, chunkIdsAfter);
+        Assert.Equal(callCountBefore, FakeVoyage.CallCount);
+    }
+
+    [Fact]
+    public async Task Reactivate_WithContentChange_ReIndexes()
+    {
+        using var anonClient = NewClient();
+        using var ownerClient = NewClient();
+        var (_, ownerCookie) = await CreateBusinessAndLoginAsOwnerAsync(anonClient, ownerClient, "Knowledge Indexing Reactivate-Edit Business");
+
+        var createResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/knowledge", ownerCookie),
+            new CreateKnowledgeDocumentRequest("Faq", "Doc", "MARKER_OLD content before reactivation edit.")));
+        var created = await createResponse.Content.ReadFromJsonAsync<KnowledgeDocumentResponse>();
+        await ownerClient.SendAsync(Authed(HttpMethod.Delete, $"/api/knowledge/{created!.Id}", ownerCookie));
+        var chunkIdsBefore = await GetChunkIdsAsync(created.Id);
+
+        var reactivateResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, $"/api/knowledge/{created.Id}", ownerCookie),
+            new UpdateKnowledgeDocumentRequest("Faq", "Doc", "MARKER_NEW content set during reactivation.", true)));
+        Assert.Equal(HttpStatusCode.OK, reactivateResponse.StatusCode);
+
+        var chunkIdsAfter = await GetChunkIdsAsync(created.Id);
+        Assert.NotEmpty(chunkIdsAfter);
+        Assert.Empty(chunkIdsAfter.Intersect(chunkIdsBefore));
+    }
+
+    [Fact]
+    public async Task Create_VoyageFailure_Returns502_NoDocumentPersisted()
+    {
+        using var anonClient = NewClient();
+        using var ownerClient = NewClient();
+        var (businessId, ownerCookie) = await CreateBusinessAndLoginAsOwnerAsync(anonClient, ownerClient, "Knowledge Indexing Create Failure Business");
+
+        FakeVoyage.ExceptionToThrow = new VoyageEmbeddingException("simulated Voyage outage");
+
+        var createResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/knowledge", ownerCookie),
+            new CreateKnowledgeDocumentRequest("Faq", "Should Not Persist", "Some real content here.")));
+
+        Assert.Equal(HttpStatusCode.BadGateway, createResponse.StatusCode);
+
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var documents = await db.KnowledgeDocuments.IgnoreQueryFilters().Where(d => d.BusinessId == businessId).ToListAsync();
+        Assert.Empty(documents);
+    }
+
+    [Fact]
+    public async Task Update_VoyageFailure_Returns502_DocumentAndChunksUntouched()
+    {
+        using var anonClient = NewClient();
+        using var ownerClient = NewClient();
+        var (_, ownerCookie) = await CreateBusinessAndLoginAsOwnerAsync(anonClient, ownerClient, "Knowledge Indexing Update Failure Business");
+
+        var createResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/knowledge", ownerCookie),
+            new CreateKnowledgeDocumentRequest("Faq", "Doc", "MARKER_ORIGINAL content, must survive a failed update.")));
+        var created = await createResponse.Content.ReadFromJsonAsync<KnowledgeDocumentResponse>();
+        var chunkIdsBefore = await GetChunkIdsAsync(created!.Id);
+
+        FakeVoyage.ExceptionToThrow = new VoyageEmbeddingException("simulated Voyage outage");
+
+        var updateResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, $"/api/knowledge/{created.Id}", ownerCookie),
+            new UpdateKnowledgeDocumentRequest("Faq", "Doc", "MARKER_ATTEMPTED_CHANGE that must not stick.", true)));
+
+        Assert.Equal(HttpStatusCode.BadGateway, updateResponse.StatusCode);
+
+        var getResponse = await ownerClient.SendAsync(Authed(HttpMethod.Get, $"/api/knowledge/{created.Id}", ownerCookie));
+        var fetched = await getResponse.Content.ReadFromJsonAsync<KnowledgeDocumentResponse>();
+        Assert.Equal("MARKER_ORIGINAL content, must survive a failed update.", fetched!.Content);
+
+        var chunkIdsAfter = await GetChunkIdsAsync(created.Id);
+        Assert.Equal(chunkIdsBefore, chunkIdsAfter);
     }
 }

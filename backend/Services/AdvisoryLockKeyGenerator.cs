@@ -27,9 +27,22 @@ namespace backend.Services;
 /// </summary>
 public static class AdvisoryLockKeyGenerator
 {
-    public static long ForVisitorSession(Guid businessId, Guid widgetId, string visitorSessionId)
+    public static long ForVisitorSession(Guid businessId, Guid widgetId, string visitorSessionId) =>
+        PackToLong($"{businessId:D}:{widgetId:D}:{visitorSessionId}");
+
+    /// <summary>
+    /// Scopes a lock to one KnowledgeDocument's chunk-replacement step —
+    /// serializes two concurrent content-changing updates to the same
+    /// document so their delete-existing/insert-new chunk writes can never
+    /// interleave (which would otherwise risk a raw unique-constraint
+    /// violation on (KnowledgeDocumentId, ChunkIndex), or a chunk set left
+    /// mixing rows from two different updates).
+    /// </summary>
+    public static long ForKnowledgeDocument(Guid businessId, Guid knowledgeDocumentId) =>
+        PackToLong($"{businessId:D}:{knowledgeDocumentId:D}");
+
+    private static long PackToLong(string canonical)
     {
-        var canonical = $"{businessId:D}:{widgetId:D}:{visitorSessionId}";
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
 
         long key = 0;
