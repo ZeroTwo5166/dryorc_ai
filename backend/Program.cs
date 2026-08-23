@@ -341,7 +341,20 @@ if (app.Environment.IsDevelopment())
     app.MapOpenApi();
 }
 
-app.UseHttpsRedirection();
+// Skipped in Development: the dashboard (http://localhost:3000) and this
+// API's http profile (http://localhost:5293) are deliberately both plain
+// HTTP in dev, to keep the auth cookie same-site (see
+// project_nivora_frontend_gotchas memory, schemeful-same-site entry) — if
+// an HTTPS port is ever also bound (e.g. `--launch-profile https`), this
+// middleware redirects every http:// request, including CORS preflight
+// OPTIONS calls, before UseCors() below ever runs. Browsers reject any
+// redirect response to a preflight outright, breaking every cross-origin
+// call. Real deployments terminate TLS in front of the app either way, so
+// skipping this in dev doesn't weaken production.
+if (!app.Environment.IsDevelopment())
+{
+    app.UseHttpsRedirection();
+}
 
 if (app.Environment.IsDevelopment())
 {
