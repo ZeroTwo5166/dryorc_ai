@@ -29,9 +29,12 @@ public interface INotificationService
 
 /// <summary>
 /// The single entry point for creating a Notification + its
-/// NotificationRecipient fan-out. There is no live caller of this service
-/// anywhere in the codebase yet — it ships as ready-to-call infrastructure,
-/// same status the GDPR lifecycle services had when first built.
+/// NotificationRecipient fan-out. WidgetConversationService is currently
+/// the only live production caller (CustomerReplied, fired after a customer
+/// message on a Human-handled conversation — see its own doc comment).
+/// Every other NotificationTypes value still ships as ready-to-call
+/// infrastructure with no live caller yet, same status the GDPR lifecycle
+/// services had when first built.
 ///
 /// Category is derived exclusively from NotificationCategoryMap and is
 /// never a parameter here, so a caller cannot independently mismatch Type

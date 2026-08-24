@@ -35,7 +35,8 @@ public record UnreadCountResponse(int Count);
 /// <summary>
 /// Staff-facing read/mark-read API over Notification/NotificationRecipient.
 /// No endpoint here creates a notification — that's NotificationService's
-/// job, with no live caller yet.
+/// job (WidgetConversationService is its current live caller, for
+/// CustomerReplied notifications).
 /// </summary>
 [ApiController]
 [Route("api/notifications")]
