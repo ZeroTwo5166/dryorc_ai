@@ -57,6 +57,31 @@ export function Topbar() {
     };
   }, [user]);
 
+  // Keeps the unread badge from going stale between page loads/reloads —
+  // the dropdown/list content itself only refetches on open/mount, not on
+  // this interval (deliberately not polling the full notification list).
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+
+    const intervalId = setInterval(() => {
+      getUnreadNotificationCount()
+        .then((unread) => {
+          if (!cancelled) setUnreadCount(unread.count);
+        })
+        .catch(() => {
+          // Best-effort — a transient failure just leaves the badge as-is
+          // until the next tick, same tolerance the widget's own polling
+          // loop already has for a failed poll.
+        });
+    }, 30_000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(intervalId);
+    };
+  }, [user]);
+
   async function handleNotificationClick(notification: NotificationItem) {
     if (notification.isRead) return;
     try {

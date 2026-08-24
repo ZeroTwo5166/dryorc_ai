@@ -861,6 +861,161 @@ public class ConversationsApiTests : IAsyncLifetime
         Assert.Equal("Human", detail.HandledBy);
     }
 
+    // ── Staff reply resolves the CustomerReplied notification ───────────
+
+    [Fact]
+    public async Task CreateMessage_StaffReply_MarksExistingUnreadCustomerRepliedNotificationRead()
+    {
+        using var anonClient = NewClient();
+        using var staffClient = NewClient();
+        var (businessId, userId, cookie) = await CreateBusinessAndLoginWithUserIdAsync(anonClient, staffClient, "Resolve Notification Business");
+
+        Guid conversationId;
+        Guid notificationId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var notificationService = scope.ServiceProvider.GetRequiredService<INotificationService>();
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            conversationId = await SeedConversationAsync(db, businessId, widgetId, DateTimeOffset.UtcNow, null);
+
+            await notificationService.NotifyAsync(
+                businessId, NotificationTypes.CustomerReplied, new CustomerRepliedArgs(),
+                ActorType.NivoraSystem, conversationId: conversationId);
+            notificationId = await db.Notifications.IgnoreQueryFilters()
+                .Where(n => n.ConversationId == conversationId && n.Type == NotificationTypes.CustomerReplied)
+                .Select(n => n.Id)
+                .SingleAsync();
+        }
+
+        var reply = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("On it!")));
+        Assert.Equal(HttpStatusCode.OK, reply.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var recipient = await verifyDb.NotificationRecipients.IgnoreQueryFilters()
+            .SingleAsync(r => r.NotificationId == notificationId && r.UserId == userId);
+        Assert.True(recipient.IsRead);
+        Assert.NotNull(recipient.ReadAt);
+    }
+
+    [Fact]
+    public async Task CreateMessage_StaffReply_MarksNotificationRead_ForAllRecipients_NotJustTheReplyingStaffMember()
+    {
+        using var anonClient = NewClient();
+        using var staffClient = NewClient();
+        var (businessId, userId, cookie) = await CreateBusinessAndLoginWithUserIdAsync(anonClient, staffClient, "Resolve Notification Multi-Staff Business");
+
+        Guid conversationId;
+        Guid notificationId;
+        Guid otherStaffId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var notificationService = scope.ServiceProvider.GetRequiredService<INotificationService>();
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            conversationId = await SeedConversationAsync(db, businessId, widgetId, DateTimeOffset.UtcNow, null);
+
+            // A second active staff member of the same business, not the one
+            // who will send the reply below.
+            var otherStaff = new ApplicationUser
+            {
+                Id = Guid.NewGuid(),
+                BusinessId = businessId,
+                UserName = $"other-staff-{Guid.NewGuid():N}@example.com",
+                Email = $"other-staff-{Guid.NewGuid():N}@example.com",
+                EmailConfirmed = true,
+                IsActive = true,
+                CreatedAt = DateTimeOffset.UtcNow,
+            };
+            db.Users.Add(otherStaff);
+            await db.SaveChangesAsync();
+            otherStaffId = otherStaff.Id;
+
+            await notificationService.NotifyAsync(
+                businessId, NotificationTypes.CustomerReplied, new CustomerRepliedArgs(),
+                ActorType.NivoraSystem, conversationId: conversationId); // broadcast — both staff become recipients
+            notificationId = await db.Notifications.IgnoreQueryFilters()
+                .Where(n => n.ConversationId == conversationId && n.Type == NotificationTypes.CustomerReplied)
+                .Select(n => n.Id)
+                .SingleAsync();
+        }
+
+        var reply = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("Handling this now.")));
+        Assert.Equal(HttpStatusCode.OK, reply.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var recipients = await verifyDb.NotificationRecipients.IgnoreQueryFilters()
+            .Where(r => r.NotificationId == notificationId)
+            .ToListAsync();
+
+        Assert.Equal(2, recipients.Count);
+        // Both the replying staff member and the other, non-replying staff
+        // member's copy of the notification are resolved — the underlying
+        // "needs a human" condition is conversation-wide, not per-viewer.
+        Assert.All(recipients, r => Assert.True(r.IsRead));
+        Assert.Contains(recipients, r => r.UserId == userId);
+        Assert.Contains(recipients, r => r.UserId == otherStaffId);
+    }
+
+    [Fact]
+    public async Task CreateMessage_StaffReply_DoesNotMarkUnrelatedNotificationsRead()
+    {
+        using var anonClient = NewClient();
+        using var staffClient = NewClient();
+        var (businessId, userId, cookie) = await CreateBusinessAndLoginWithUserIdAsync(anonClient, staffClient, "Resolve Notification Unrelated Business");
+
+        Guid conversationId;
+        Guid otherConversationId;
+        Guid sameConversationDifferentTypeNotificationId;
+        Guid differentConversationNotificationId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var notificationService = scope.ServiceProvider.GetRequiredService<INotificationService>();
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            conversationId = await SeedConversationAsync(db, businessId, widgetId, DateTimeOffset.UtcNow, null);
+            otherConversationId = await SeedConversationAsync(db, businessId, widgetId, DateTimeOffset.UtcNow, null);
+
+            // Same conversation, different notification type — must stay untouched.
+            await notificationService.NotifyAsync(
+                businessId, NotificationTypes.ConversationAssigned, new ConversationAssignedArgs(),
+                ActorType.NivoraSystem, conversationId: conversationId);
+            sameConversationDifferentTypeNotificationId = await db.Notifications.IgnoreQueryFilters()
+                .Where(n => n.ConversationId == conversationId && n.Type == NotificationTypes.ConversationAssigned)
+                .Select(n => n.Id).SingleAsync();
+
+            // Same type (CustomerReplied), different conversation — must stay untouched.
+            await notificationService.NotifyAsync(
+                businessId, NotificationTypes.CustomerReplied, new CustomerRepliedArgs(),
+                ActorType.NivoraSystem, conversationId: otherConversationId);
+            differentConversationNotificationId = await db.Notifications.IgnoreQueryFilters()
+                .Where(n => n.ConversationId == otherConversationId && n.Type == NotificationTypes.CustomerReplied)
+                .Select(n => n.Id).SingleAsync();
+        }
+
+        var reply = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("Replying to the right conversation only.")));
+        Assert.Equal(HttpStatusCode.OK, reply.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var unrelatedTypeRecipient = await verifyDb.NotificationRecipients.IgnoreQueryFilters()
+            .SingleAsync(r => r.NotificationId == sameConversationDifferentTypeNotificationId && r.UserId == userId);
+        Assert.False(unrelatedTypeRecipient.IsRead);
+
+        var unrelatedConversationRecipient = await verifyDb.NotificationRecipients.IgnoreQueryFilters()
+            .SingleAsync(r => r.NotificationId == differentConversationNotificationId && r.UserId == userId);
+        Assert.False(unrelatedConversationRecipient.IsRead);
+    }
+
     // ── Step 15: Human -> Ai reversal ────────────────────────────────────
 
     private static async Task<Guid> SeedHumanHandledConversationAsync(
