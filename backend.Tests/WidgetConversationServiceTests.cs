@@ -1,3 +1,4 @@
+using backend.Constants;
 using backend.Data;
 using backend.Enums;
 using backend.Interfaces;
@@ -6,6 +7,9 @@ using backend.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Npgsql;
 using Xunit;
 
 namespace backend.Tests;
@@ -34,6 +38,7 @@ public class WidgetConversationServiceTests : IAsyncLifetime
 {
     private ServiceProvider _provider = null!;
     private readonly List<Guid> _businessIdsToClean = [];
+    private string _adoConnectionString = null!;
 
     public Task InitializeAsync()
     {
@@ -43,12 +48,15 @@ public class WidgetConversationServiceTests : IAsyncLifetime
 
         var connectionUri = configuration.GetConnectionString("DefaultConnection")
             ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
+        _adoConnectionString = PostgresConnectionString.FromUri(connectionUri);
 
         _provider = new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
                 PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()))
             .AddScoped<IWidgetConversationService, WidgetConversationService>()
+            .AddScoped<INotificationService, NotificationService>()
+            .AddSingleton<ILogger<WidgetConversationService>>(NullLogger<WidgetConversationService>.Instance)
             .BuildServiceProvider();
 
         return Task.CompletedTask;
@@ -62,9 +70,14 @@ public class WidgetConversationServiceTests : IAsyncLifetime
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
             var ids = _businessIdsToClean.ToArray();
 
+            // Notification cleanup must run before Businesses is deleted —
+            // same order NotificationDataTests already establishes.
+            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"NotificationRecipients\" WHERE \"BusinessId\" = ANY({ids})");
+            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Notifications\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Messages\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Widgets\" WHERE \"BusinessId\" = ANY({ids})");
+            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AspNetUsers\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = ANY({ids})");
         }
 
@@ -106,6 +119,23 @@ public class WidgetConversationServiceTests : IAsyncLifetime
         return (business, widget);
     }
 
+    private static async Task<ApplicationUser> CreateActiveStaffAsync(AppDbContext db, Guid businessId)
+    {
+        var user = new ApplicationUser
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            UserName = $"staff-{Guid.NewGuid():N}@example.com",
+            Email = $"staff-{Guid.NewGuid():N}@example.com",
+            EmailConfirmed = true,
+            IsActive = true,
+            CreatedAt = DateTimeOffset.UtcNow,
+        };
+        db.Users.Add(user);
+        await db.SaveChangesAsync();
+        return user;
+    }
+
     [Fact]
     public async Task PostMessageAsync_SecondCall_ReusesConversation_SetsLastMessageAtToSecondCustomerMessageTimestamp()
     {
@@ -135,6 +165,423 @@ public class WidgetConversationServiceTests : IAsyncLifetime
         // Specifically the second customer message's own timestamp — not
         // merely "changed" or "non-null."
         Assert.Equal(TruncateToMicroseconds(secondMessage.CreatedAt), conversation.LastMessageAt);
+    }
+
+    // ── Staff-notification wiring (Step 9 follow-up) ────────────────────
+
+    [Fact]
+    public async Task PostMessageAsync_AiHandledConversation_DoesNotCreateCustomerRepliedNotification()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var conversationService = scope.ServiceProvider.GetRequiredService<IWidgetConversationService>();
+
+        var (business, widget) = await CreateBusinessAndWidgetAsync(db);
+        await CreateActiveStaffAsync(db, business.Id);
+
+        var message = await conversationService.PostMessageAsync(
+            business.Id, widget.Id, Guid.NewGuid().ToString("N"), "Hi there");
+
+        // A brand-new conversation defaults HandledBy = Ai (nothing here
+        // changes that) — no staff attention is needed yet, so no
+        // notification should exist for it.
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var exists = await verifyDb.Notifications.IgnoreQueryFilters()
+            .AnyAsync(n => n.ConversationId == message.ConversationId && n.Type == NotificationTypes.CustomerReplied);
+        Assert.False(exists);
+    }
+
+    [Fact]
+    public async Task PostMessageAsync_HumanHandledConversation_CreatesCustomerRepliedNotification_ForActiveStaff()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var conversationService = scope.ServiceProvider.GetRequiredService<IWidgetConversationService>();
+
+        var (business, widget) = await CreateBusinessAndWidgetAsync(db);
+        var staff = await CreateActiveStaffAsync(db, business.Id);
+        var visitorSessionId = Guid.NewGuid().ToString("N");
+
+        // Simulate "staff already replied once" the same way
+        // ConversationsController.CreateMessage does, without going through
+        // the HTTP endpoint (out of scope for this service-level test file).
+        var conversation = new Conversation
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = business.Id,
+            WidgetId = widget.Id,
+            VisitorSessionId = visitorSessionId,
+            Channel = "Website",
+            HandledBy = HandledBy.Human,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        db.Conversations.Add(conversation);
+        await db.SaveChangesAsync();
+
+        var message = await conversationService.PostMessageAsync(business.Id, widget.Id, visitorSessionId, "Any update?");
+        Assert.Equal(conversation.Id, message.ConversationId);
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var notification = await verifyDb.Notifications.IgnoreQueryFilters()
+            .SingleAsync(n => n.ConversationId == conversation.Id && n.Type == NotificationTypes.CustomerReplied);
+        Assert.Equal(NotificationCategory.Customer, notification.Category);
+
+        var recipient = await verifyDb.NotificationRecipients.IgnoreQueryFilters()
+            .SingleAsync(r => r.NotificationId == notification.Id);
+        Assert.Equal(staff.Id, recipient.UserId);
+        Assert.False(recipient.IsRead);
+    }
+
+    [Fact]
+    public async Task PostMessageAsync_MultipleMessagesBeforeStaffResponds_CreatesAtMostOneUnreadCustomerRepliedNotification()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var conversationService = scope.ServiceProvider.GetRequiredService<IWidgetConversationService>();
+
+        var (business, widget) = await CreateBusinessAndWidgetAsync(db);
+        await CreateActiveStaffAsync(db, business.Id);
+        var visitorSessionId = Guid.NewGuid().ToString("N");
+
+        var conversation = new Conversation
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = business.Id,
+            WidgetId = widget.Id,
+            VisitorSessionId = visitorSessionId,
+            Channel = "Website",
+            HandledBy = HandledBy.Human,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        db.Conversations.Add(conversation);
+        await db.SaveChangesAsync();
+
+        // Customer message #1, #2, #3 — staff has not replied to any of them.
+        await conversationService.PostMessageAsync(business.Id, widget.Id, visitorSessionId, "Message 1");
+        await conversationService.PostMessageAsync(business.Id, widget.Id, visitorSessionId, "Message 2");
+        await conversationService.PostMessageAsync(business.Id, widget.Id, visitorSessionId, "Message 3");
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var notificationCount = await verifyDb.Notifications.IgnoreQueryFilters()
+            .CountAsync(n => n.ConversationId == conversation.Id && n.Type == NotificationTypes.CustomerReplied);
+
+        // At most one unread CustomerReplied notification per conversation
+        // — three distinct customer messages before any staff reply must
+        // still collapse to exactly one, not three.
+        Assert.Equal(1, notificationCount);
+    }
+
+    [Fact]
+    public async Task PostMessageAsync_NewMessageAfterEarlierNotificationAlreadyRead_CreatesFreshNotification()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var conversationService = scope.ServiceProvider.GetRequiredService<IWidgetConversationService>();
+        var notificationService = scope.ServiceProvider.GetRequiredService<INotificationService>();
+
+        var (business, widget) = await CreateBusinessAndWidgetAsync(db);
+        var staff = await CreateActiveStaffAsync(db, business.Id);
+        var visitorSessionId = Guid.NewGuid().ToString("N");
+
+        var conversation = new Conversation
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = business.Id,
+            WidgetId = widget.Id,
+            VisitorSessionId = visitorSessionId,
+            Channel = "Website",
+            HandledBy = HandledBy.Human,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        db.Conversations.Add(conversation);
+        await db.SaveChangesAsync();
+
+        await conversationService.PostMessageAsync(business.Id, widget.Id, visitorSessionId, "First unanswered message");
+
+        // Simulate a staff reply resolving it — exactly what
+        // ConversationsController.CreateMessage's own mark-read query does.
+        var firstNotification = await db.Notifications.IgnoreQueryFilters()
+            .SingleAsync(n => n.ConversationId == conversation.Id && n.Type == NotificationTypes.CustomerReplied);
+        await db.NotificationRecipients.IgnoreQueryFilters()
+            .Where(r => r.NotificationId == firstNotification.Id)
+            .ExecuteUpdateAsync(s => s.SetProperty(r => r.IsRead, true).SetProperty(r => r.ReadAt, DateTimeOffset.UtcNow));
+
+        // A later customer message on the still-Human-handled conversation
+        // must notify again — the earlier notification being read must not
+        // permanently suppress future ones for this conversation.
+        await conversationService.PostMessageAsync(business.Id, widget.Id, visitorSessionId, "Second message, still no reply");
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var totalNotifications = await verifyDb.Notifications.IgnoreQueryFilters()
+            .CountAsync(n => n.ConversationId == conversation.Id && n.Type == NotificationTypes.CustomerReplied);
+        Assert.Equal(2, totalNotifications);
+
+        var unreadCount = await verifyDb.NotificationRecipients.IgnoreQueryFilters()
+            .Join(verifyDb.Notifications.IgnoreQueryFilters(), r => r.NotificationId, n => n.Id, (r, n) => new { r, n })
+            .CountAsync(x => x.n.ConversationId == conversation.Id
+                && x.n.Type == NotificationTypes.CustomerReplied
+                && x.r.UserId == staff.Id
+                && !x.r.IsRead);
+        Assert.Equal(1, unreadCount);
+    }
+
+    // ── Audit fix: zero active staff (Finding #2) ────────────────────────
+
+    [Fact]
+    public async Task PostMessageAsync_HumanHandledConversation_NoActiveStaff_CreatesNoOrphanNotification_EvenAcrossMultipleMessages()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var conversationService = scope.ServiceProvider.GetRequiredService<IWidgetConversationService>();
+
+        // Deliberately no CreateActiveStaffAsync call — this business has
+        // zero active staff for the whole test.
+        var (business, widget) = await CreateBusinessAndWidgetAsync(db);
+        var visitorSessionId = Guid.NewGuid().ToString("N");
+
+        var conversation = new Conversation
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = business.Id,
+            WidgetId = widget.Id,
+            VisitorSessionId = visitorSessionId,
+            Channel = "Website",
+            HandledBy = HandledBy.Human,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        db.Conversations.Add(conversation);
+        await db.SaveChangesAsync();
+
+        // Three separate customer messages with no active staff at any
+        // point — must never create a Notification at all, let alone an
+        // unbounded number of recipient-less orphans (the exact failure
+        // mode the audit found: the old recipient-based dedup check could
+        // never see a zero-recipient Notification, so it re-created one on
+        // every single message).
+        await conversationService.PostMessageAsync(business.Id, widget.Id, visitorSessionId, "Message 1");
+        await conversationService.PostMessageAsync(business.Id, widget.Id, visitorSessionId, "Message 2");
+        await conversationService.PostMessageAsync(business.Id, widget.Id, visitorSessionId, "Message 3");
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var notificationCount = await verifyDb.Notifications.IgnoreQueryFilters()
+            .CountAsync(n => n.ConversationId == conversation.Id && n.Type == NotificationTypes.CustomerReplied);
+        Assert.Equal(0, notificationCount);
+    }
+
+    [Fact]
+    public async Task PostMessageAsync_StaffBecomesActiveAfterEarlierZeroStaffMessage_LaterMessageCreatesNotification()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var conversationService = scope.ServiceProvider.GetRequiredService<IWidgetConversationService>();
+
+        var (business, widget) = await CreateBusinessAndWidgetAsync(db);
+        var visitorSessionId = Guid.NewGuid().ToString("N");
+
+        var conversation = new Conversation
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = business.Id,
+            WidgetId = widget.Id,
+            VisitorSessionId = visitorSessionId,
+            Channel = "Website",
+            HandledBy = HandledBy.Human,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        db.Conversations.Add(conversation);
+        await db.SaveChangesAsync();
+
+        // No active staff yet — this message must not create anything (and,
+        // unlike a "vacuously open forever" Notification would, must not
+        // permanently block a later notification either).
+        await conversationService.PostMessageAsync(business.Id, widget.Id, visitorSessionId, "Before any staff exists");
+
+        var staff = await CreateActiveStaffAsync(db, business.Id);
+
+        await conversationService.PostMessageAsync(business.Id, widget.Id, visitorSessionId, "After staff became active");
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var notification = await verifyDb.Notifications.IgnoreQueryFilters()
+            .SingleAsync(n => n.ConversationId == conversation.Id && n.Type == NotificationTypes.CustomerReplied);
+        var recipient = await verifyDb.NotificationRecipients.IgnoreQueryFilters()
+            .SingleAsync(r => r.NotificationId == notification.Id);
+        Assert.Equal(staff.Id, recipient.UserId);
+        Assert.False(recipient.IsRead);
+    }
+
+    // ── Audit fix: genuine concurrency (Finding #1) ──────────────────────
+
+    /// <summary>
+    /// Proves the "at most one unread CustomerReplied notification per
+    /// conversation" invariant holds under real, forced concurrency — not
+    /// just two sequential awaits (the gap the audit found: the original
+    /// tests above all await each PostMessageAsync call before starting the
+    /// next one, so they could never actually observe the race).
+    ///
+    /// Determinism, precisely: a third, independent raw connection
+    /// pre-acquires the exact same pg_advisory_xact_lock key
+    /// (AdvisoryLockKeyGenerator.ForConversationNotification) that
+    /// NotifyStaffOfCustomerReplyAsync now takes, and holds it open. Two
+    /// concurrent PostMessageAsync calls (separate scopes, separate
+    /// DbContexts/connections — simulating two separate concurrent HTTP
+    /// requests) are then started via Task.WhenAll. Both necessarily reach
+    /// the point of requesting that same lock and both genuinely block at
+    /// the PostgreSQL level (confirmed below by polling pg_locks for both
+    /// backend PIDs, not assumed) — this is real inter-connection blocking
+    /// enforced by Postgres itself, not a C# synchronization primitive.
+    /// Only once both are confirmed waiting is the barrier released, so the
+    /// two requests are provably contending for the critical section at the
+    /// same instant, not just "maybe" overlapping. Whichever wins runs the
+    /// check-then-create and commits (releasing the lock); the second can
+    /// then only proceed once the first has fully committed, so under
+    /// ordinary READ COMMITTED visibility it always observes the first's
+    /// write and skips creating a second notification.
+    ///
+    /// Why this would fail against the pre-fix code: the pre-fix
+    /// NotifyStaffOfCustomerReplyAsync never requested this lock at all, so
+    /// the poll-for-2-waiters step below would time out (neither backend
+    /// would ever appear as an advisory-lock waiter on this key) — a
+    /// distinct, equally meaningful failure signal that the fix regressed,
+    /// not merely a flaky race that might not be caught. This was verified
+    /// directly: temporarily reverting the lock acquisition in
+    /// NotifyStaffOfCustomerReplyAsync makes this test fail with the
+    /// "expected 2 concurrent advisory-lock waiters" timeout, as expected.
+    ///
+    /// No sleeps are used as the correctness mechanism — the only wait is a
+    /// short poll loop confirming setup state (both backends genuinely
+    /// blocked) before proceeding; the actual mutual exclusion is 100%
+    /// PostgreSQL's own transaction-scoped advisory lock.
+    /// </summary>
+    [Fact]
+    public async Task PostMessageAsync_GenuinelyConcurrentCustomerMessages_CreatesExactlyOneUnreadCustomerRepliedNotification()
+    {
+        await using var setupScope = _provider.CreateAsyncScope();
+        var setupDb = setupScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var (business, widget) = await CreateBusinessAndWidgetAsync(setupDb);
+        await CreateActiveStaffAsync(setupDb, business.Id);
+        var visitorSessionId = Guid.NewGuid().ToString("N");
+
+        var conversation = new Conversation
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = business.Id,
+            WidgetId = widget.Id,
+            VisitorSessionId = visitorSessionId,
+            Channel = "Website",
+            HandledBy = HandledBy.Human,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        setupDb.Conversations.Add(conversation);
+        await setupDb.SaveChangesAsync();
+
+        var lockKey = AdvisoryLockKeyGenerator.ForConversationNotification(business.Id, conversation.Id);
+
+        // The barrier: a raw, independent connection that pre-acquires the
+        // exact lock NotifyStaffOfCustomerReplyAsync will request, and
+        // holds it until we've confirmed both concurrent requests are
+        // genuinely queued behind it.
+        await using var barrierConnection = new NpgsqlConnection(_adoConnectionString);
+        await barrierConnection.OpenAsync();
+        await using var barrierTransaction = await barrierConnection.BeginTransactionAsync();
+        await using (var lockCmd = new NpgsqlCommand($"SELECT pg_advisory_xact_lock({lockKey})", barrierConnection, barrierTransaction))
+        {
+            await lockCmd.ExecuteNonQueryAsync();
+        }
+
+        await using var scope1 = _provider.CreateAsyncScope();
+        var service1 = scope1.ServiceProvider.GetRequiredService<IWidgetConversationService>();
+
+        await using var scope2 = _provider.CreateAsyncScope();
+        var service2 = scope2.ServiceProvider.GetRequiredService<IWidgetConversationService>();
+
+        // Two genuinely concurrent "requests" — same visitor, same
+        // already-Human-handled conversation. Both message inserts succeed
+        // (a customer legitimately can send two messages back to back);
+        // both then race to notify staff.
+        var task1 = service1.PostMessageAsync(business.Id, widget.Id, visitorSessionId, "Concurrent message A");
+        var task2 = service2.PostMessageAsync(business.Id, widget.Id, visitorSessionId, "Concurrent message B");
+
+        // Wait-for-condition, not a fixed sleep: poll pg_locks until two
+        // separate backends are genuinely blocked requesting the exact same
+        // advisory lock key. Matched by pg_advisory_xact_lock's own
+        // classid/objid decomposition (high/low 32 bits of the key,
+        // objsubid=1 for the single-bigint-argument form — see Postgres's
+        // lock.c), computed here in C# so no PID correlation is needed —
+        // deliberately avoided: this test runs against a real Neon
+        // connection-pooler endpoint (see the "-pooler." host in the dev
+        // connection string), which can rebind a logical connection to a
+        // different physical backend PID between an idle OpenConnectionAsync
+        // and the transaction PostMessageAsync later opens, so a PID
+        // captured ahead of time is not a reliable correlation key here —
+        // confirmed the hard way: an earlier PID-based version of this
+        // check timed out. pg_locks itself is a server-wide system view, so
+        // querying it from the third barrier connection sees every backend
+        // regardless of which physical connection each request landed on.
+        var classId = unchecked((uint)(lockKey >> 32));
+        var objId = unchecked((uint)lockKey);
+
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        int waitingCount;
+        do
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                Assert.Fail(
+                    "Expected two concurrent PostMessageAsync calls to become advisory-lock waiters " +
+                    "on the conversation-notification lock within 10s, but they did not. If the " +
+                    "concurrency fix (AdvisoryLockKeyGenerator.ForConversationNotification acquired in " +
+                    "NotifyStaffOfCustomerReplyAsync) has been removed or is no longer reached, this is " +
+                    "the expected failure mode.");
+            }
+
+            await using var checkCmd = new NpgsqlCommand(
+                "SELECT count(*) FROM pg_locks " +
+                "WHERE locktype = 'advisory' AND NOT granted AND objsubid = 1 " +
+                "AND classid::bigint = @classid AND objid::bigint = @objid",
+                barrierConnection);
+            checkCmd.Parameters.AddWithValue("classid", (long)classId);
+            checkCmd.Parameters.AddWithValue("objid", (long)objId);
+            waitingCount = (int)(long)(await checkCmd.ExecuteScalarAsync())!;
+
+            if (waitingCount < 2)
+            {
+                await Task.Delay(25);
+            }
+        } while (waitingCount < 2);
+
+        Assert.Equal(2, waitingCount); // both backends genuinely, simultaneously blocked — confirmed, not assumed
+
+        // Release the barrier — whichever of the two wins now proceeds,
+        // commits, and releases the lock for the other.
+        await barrierTransaction.RollbackAsync();
+
+        await Task.WhenAll(task1, task2);
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var notificationCount = await verifyDb.Notifications.IgnoreQueryFilters()
+            .CountAsync(n => n.ConversationId == conversation.Id && n.Type == NotificationTypes.CustomerReplied);
+        Assert.Equal(1, notificationCount);
+
+        var unreadRecipientCount = await verifyDb.NotificationRecipients.IgnoreQueryFilters()
+            .Join(verifyDb.Notifications.IgnoreQueryFilters(), r => r.NotificationId, n => n.Id, (r, n) => new { r, n })
+            .CountAsync(x => x.n.ConversationId == conversation.Id
+                && x.n.Type == NotificationTypes.CustomerReplied
+                && !x.r.IsRead);
+        Assert.Equal(1, unreadRecipientCount);
     }
 
     private class FixedTenantAccessor(Guid? businessId) : ICurrentTenantAccessor

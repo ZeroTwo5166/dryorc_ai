@@ -41,6 +41,20 @@ public static class AdvisoryLockKeyGenerator
     public static long ForKnowledgeDocument(Guid businessId, Guid knowledgeDocumentId) =>
         PackToLong($"{businessId:D}:{knowledgeDocumentId:D}");
 
+    /// <summary>
+    /// Scopes a lock to one conversation's CustomerReplied dedup
+    /// check-then-create — serializes two concurrent
+    /// NotifyStaffOfCustomerReplyAsync calls for the same conversation so
+    /// the "at most one unread CustomerReplied notification per
+    /// conversation" invariant holds even when two customer messages land
+    /// close enough together that their notification side effects would
+    /// otherwise run concurrently (they no longer share the visitor-session
+    /// lock by that point — see WidgetConversationService's own doc
+    /// comment).
+    /// </summary>
+    public static long ForConversationNotification(Guid businessId, Guid conversationId) =>
+        PackToLong($"{businessId:D}:notification:{conversationId:D}");
+
     private static long PackToLong(string canonical)
     {
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));

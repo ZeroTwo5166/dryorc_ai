@@ -1,8 +1,10 @@
 using System.Security.Claims;
 using backend.Auth;
+using backend.Constants;
 using backend.Data;
 using backend.Enums;
 using backend.Models;
+using backend.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -189,6 +191,24 @@ public class ConversationsController(AppDbContext db, IAuthorizationService auth
     /// No customer-delivery mechanism exists yet (no SignalR/polling/widget
     /// changes) — this message is persisted and dashboard-visible only, an
     /// explicitly accepted Step 9 MVP limitation, not an oversight.
+    ///
+    /// Also resolves (marks read) any still-unread CustomerReplied
+    /// notification(s) for this conversation, for every recipient — see
+    /// WidgetConversationService's own doc comment for where those get
+    /// created. Concurrency: this mark-read and a near-simultaneous new
+    /// customer message's notification-check run in separate transactions
+    /// with no shared lock. Worst case if a fresh CustomerReplied
+    /// notification is created in the narrow window between this method's
+    /// SaveChangesAsync and its mark-read query below, that brand-new
+    /// notification also gets swept up and marked read here — a benign,
+    /// self-correcting staleness (the badge briefly under-counts; the
+    /// message itself is unaffected and still fully visible in the
+    /// conversation), same class of narrow timing window this codebase
+    /// already accepts for the HandledBy Ai/Human race rather than adding
+    /// locking for. The reverse — an old, genuinely-unaddressed notification
+    /// incorrectly staying unread — cannot happen: this update is
+    /// unconditional over every currently-unread CustomerReplied
+    /// notification for this conversation at the moment it runs.
     /// </summary>
     [HttpPost("{id:guid}/messages")]
     public async Task<IActionResult> CreateMessage(Guid id, [FromBody] CreateConversationMessageRequest request)
@@ -240,6 +260,27 @@ public class ConversationsController(AppDbContext db, IAuthorizationService auth
         conversation.HandledBy = HandledBy.Human;
 
         await db.SaveChangesAsync();
+
+        // A staff reply is the "human attention given" signal — resolve any
+        // still-unread CustomerReplied notification(s) for this conversation
+        // for every recipient, not just the replying staff member (the
+        // underlying "needs a human" condition is conversation-wide, not
+        // per-viewer). Not required to share a transaction with the message
+        // insert above — a notification staying visibly unread for a moment
+        // after the reply already landed is cosmetic, not a correctness
+        // issue (see this method's own doc comment for the fuller
+        // concurrency reasoning against a concurrent new customer message).
+        // Same ExecuteUpdateAsync idiom NotificationsController.MarkRead
+        // already uses. Shares its "which rows count" definition with
+        // WidgetConversationService's dedup check via
+        // CustomerRepliedNotificationQueries — see that class's own doc
+        // comment for why (audit finding: this predicate had drifted into
+        // two independently-written copies).
+        await CustomerRepliedNotificationQueries
+            .UnreadRecipients(db, conversation.BusinessId, conversation.Id)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(r => r.IsRead, true)
+                .SetProperty(r => r.ReadAt, now));
 
         return Ok(new ConversationMessageResponse(message.Id, message.Role.ToString(), message.Content, message.CreatedAt));
     }

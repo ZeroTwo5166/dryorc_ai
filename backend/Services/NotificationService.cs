@@ -123,8 +123,7 @@ public class NotificationService(AppDbContext db) : INotificationService
             CreatedAt = now,
         };
 
-        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
-        try
+        async Task AddAndSaveAsync()
         {
             db.Notifications.Add(notification);
 
@@ -142,6 +141,29 @@ public class NotificationService(AppDbContext db) : INotificationService
             }
 
             await db.SaveChangesAsync(cancellationToken);
+        }
+
+        // A caller that already holds an open transaction on this same
+        // AppDbContext (e.g. WidgetConversationService serializing the
+        // CustomerReplied dedup check-then-create under
+        // AdvisoryLockKeyGenerator.ForConversationNotification) is joined
+        // instead of nesting a second BeginTransactionAsync on the same
+        // connection, which Npgsql/EF Core does not support. Atomicity is
+        // still guaranteed either way — it's just owned by the ambient
+        // caller's transaction instead of one opened here. A standalone
+        // caller (no ambient transaction — every caller today) is
+        // unaffected: this method still owns its own transaction exactly as
+        // before.
+        if (db.Database.CurrentTransaction is not null)
+        {
+            await AddAndSaveAsync();
+            return;
+        }
+
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+        try
+        {
+            await AddAndSaveAsync();
             await transaction.CommitAsync(cancellationToken);
         }
         catch
