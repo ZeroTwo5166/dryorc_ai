@@ -196,6 +196,17 @@ public class ConversationsController(AppDbContext db, IAuthorizationService auth
     /// deliberately idempotent: a second/third staff reply just re-assigns
     /// the same value, no branch needed to detect "is this the first one."
     ///
+    /// Step 15 completion: when this write is a genuine Ai -> Human
+    /// transition (not a second/third reply while already Human), also
+    /// writes a ConversationHandoff row — ActorType.NivoraBusinessStaff,
+    /// HandoffReasons.StaffManualTakeover — making the handoff log
+    /// symmetric with ReturnToAi's own Human -> Ai reversal row below.
+    /// "Genuine transition" is decided from a fresh, lock-protected re-read
+    /// of HandledBy (db.Entry(conversation).ReloadAsync(), same pattern
+    /// ReturnToAi already established — the value read before the lock was
+    /// acquired can be stale relative to a concurrent reversal), not from
+    /// the pre-lock value this method loaded conversation with above.
+    ///
     /// No customer-delivery mechanism exists yet (no SignalR/polling/widget
     /// changes) — this message is persisted and dashboard-visible only, an
     /// explicitly accepted Step 9 MVP limitation, not an oversight.
@@ -279,11 +290,47 @@ public class ConversationsController(AppDbContext db, IAuthorizationService auth
         {
             await db.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock({lockKey})");
 
+            // Fresh read under the lock — same reasoning and same
+            // ReloadAsync mechanism ReturnToAi already uses (conversation
+            // is already tracked from the load above, so a second
+            // db.Conversations query would just hand back that same,
+            // possibly-stale tracked instance via EF's identity
+            // resolution). Needed here because the write below is no
+            // longer a purely idempotent overwrite: whether it represents a
+            // genuine Ai -> Human transition — and therefore needs a
+            // ConversationHandoff row — depends on the actual current
+            // HandledBy value at the moment this lock is held, which a
+            // concurrent ReturnToAi reversal may have changed since this
+            // method's pre-lock load.
+            await db.Entry(conversation).ReloadAsync();
+            var previousHandledBy = conversation.HandledBy;
+
             db.Messages.Add(message);
 
             conversation.LastMessageAt = now;
             conversation.UpdatedAt = now;
             conversation.HandledBy = HandledBy.Human;
+
+            // Only a genuine Ai -> Human transition is logged — a
+            // second/third staff reply while already Human is not a new
+            // handoff event. Mirrors ReturnToAi's own
+            // "if (conversation.HandledBy == HandledBy.Human)" branch, just
+            // for the opposite direction.
+            if (previousHandledBy == HandledBy.Ai)
+            {
+                db.ConversationHandoffs.Add(new ConversationHandoff
+                {
+                    Id = Guid.NewGuid(),
+                    BusinessId = conversation.BusinessId,
+                    ConversationId = conversation.Id,
+                    FromHandledBy = HandledBy.Ai,
+                    ToHandledBy = HandledBy.Human,
+                    Reason = HandoffReasons.StaffManualTakeover,
+                    ActorType = ActorType.NivoraBusinessStaff,
+                    ActorId = CurrentUserId,
+                    CreatedAt = now,
+                });
+            }
 
             await db.SaveChangesAsync();
 

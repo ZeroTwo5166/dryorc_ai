@@ -747,6 +747,13 @@ public class ConversationsApiTests : IAsyncLifetime
         var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var messageCount = await verifyDb.Messages.IgnoreQueryFilters().CountAsync(m => m.ConversationId == conversationIdA);
         Assert.Equal(0, messageCount);
+
+        // The new Step 15 handoff insert only runs after authorization
+        // succeeds and inside the same transaction as the (never-reached)
+        // message insert — a rejected cross-tenant request can't produce
+        // a ConversationHandoff row any more than it can produce a Message.
+        var handoffCount = await verifyDb.ConversationHandoffs.IgnoreQueryFilters().CountAsync(h => h.ConversationId == conversationIdA);
+        Assert.Equal(0, handoffCount);
     }
 
     [Fact]
@@ -1014,6 +1021,159 @@ public class ConversationsApiTests : IAsyncLifetime
         var unrelatedConversationRecipient = await verifyDb.NotificationRecipients.IgnoreQueryFilters()
             .SingleAsync(r => r.NotificationId == differentConversationNotificationId && r.UserId == userId);
         Assert.False(unrelatedConversationRecipient.IsRead);
+    }
+
+    // ── Step 15 completion: CreateMessage's own Ai -> Human handoff row ──
+
+    [Fact]
+    public async Task CreateMessage_FirstAgentReply_WritesAiToHumanConversationHandoffRow_AndStillResolvesNotification()
+    {
+        using var anonClient = NewClient();
+        using var staffClient = NewClient();
+        var (businessId, userId, cookie) = await CreateBusinessAndLoginWithUserIdAsync(anonClient, staffClient, "Staff Takeover Handoff Business");
+
+        Guid conversationId;
+        Guid notificationId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var notificationService = scope.ServiceProvider.GetRequiredService<INotificationService>();
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            // Deliberately Ai-handled (default) — this is the genuine
+            // Ai -> Human transition this test is proving gets logged.
+            conversationId = await SeedConversationAsync(db, businessId, widgetId, DateTimeOffset.UtcNow, null);
+
+            // Also proves the pre-existing notification-resolve behavior
+            // (ed136ec) is untouched by the new handoff insert sharing its
+            // transaction — same seeding pattern as
+            // CreateMessage_StaffReply_MarksExistingUnreadCustomerRepliedNotificationRead
+            // above, folded into this test rather than duplicated per-task.
+            await notificationService.NotifyAsync(
+                businessId, NotificationTypes.CustomerReplied, new CustomerRepliedArgs(),
+                ActorType.NivoraSystem, conversationId: conversationId);
+            notificationId = await db.Notifications.IgnoreQueryFilters()
+                .Where(n => n.ConversationId == conversationId && n.Type == NotificationTypes.CustomerReplied)
+                .Select(n => n.Id)
+                .SingleAsync();
+        }
+
+        var reply = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("Taking over from here.")));
+        Assert.Equal(HttpStatusCode.OK, reply.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var conversation = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversationId);
+        Assert.Equal(HandledBy.Human, conversation.HandledBy);
+
+        var handoff = await verifyDb.ConversationHandoffs.IgnoreQueryFilters().SingleAsync(h => h.ConversationId == conversationId);
+        Assert.Equal(businessId, handoff.BusinessId);
+        Assert.Equal(HandledBy.Ai, handoff.FromHandledBy);
+        Assert.Equal(HandledBy.Human, handoff.ToHandledBy);
+        Assert.Equal(HandoffReasons.StaffManualTakeover, handoff.Reason);
+        Assert.Equal(ActorType.NivoraBusinessStaff, handoff.ActorType);
+        Assert.Equal(userId, handoff.ActorId);
+
+        var recipient = await verifyDb.NotificationRecipients.IgnoreQueryFilters()
+            .SingleAsync(r => r.NotificationId == notificationId && r.UserId == userId);
+        Assert.True(recipient.IsRead);
+    }
+
+    [Fact]
+    public async Task CreateMessage_StaffReply_WhileAlreadyHuman_DoesNotCreateAnotherHandoffRow()
+    {
+        using var anonClient = NewClient();
+        using var staffClient = NewClient();
+        var (businessId, cookie) = await CreateBusinessAndLoginAsync(anonClient, staffClient, "Staff Reply Already Human Business");
+
+        Guid conversationId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            // Deliberately seeded Human-handled directly — no genuine
+            // Ai -> Human transition ever occurs in this test, so no
+            // handoff row should ever be written.
+            conversationId = await SeedHumanHandledConversationAsync(db, businessId, widgetId);
+        }
+
+        var reply = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("Following up.")));
+        Assert.Equal(HttpStatusCode.OK, reply.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var conversation = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversationId);
+        Assert.Equal(HandledBy.Human, conversation.HandledBy);
+
+        var handoffCount = await verifyDb.ConversationHandoffs.IgnoreQueryFilters().CountAsync(h => h.ConversationId == conversationId);
+        Assert.Equal(0, handoffCount);
+    }
+
+    /// <summary>
+    /// Race: two simultaneous staff replies to the same Ai-handled
+    /// conversation. Proves exactly one Ai -> Human ConversationHandoff row
+    /// is written — never two — regardless of which request's lock
+    /// acquisition actually wins, under real forced Postgres-level
+    /// contention (same barrier technique as
+    /// ReturnToAi_TwoSimultaneousReversals_EndsAi_ExactlyOneHandoffRow).
+    /// This is narrower than the tracked Race D follow-up (which additionally
+    /// wants CreateMessage-vs-customer-message coverage); this test exists
+    /// only because the handoff insert itself is new production behavior
+    /// whose duplicate-row risk must be checked before this task can be
+    /// considered done — it does not attempt to close the broader Race D
+    /// gap.
+    /// </summary>
+    [Fact]
+    public async Task CreateMessage_TwoSimultaneousStaffReplies_CreatesExactlyOneHandoffRow()
+    {
+        using var anonClient = NewClient();
+        using var staffClient1 = NewClient();
+        using var staffClient2 = NewClient();
+        var (businessId, cookie) = await CreateBusinessAndLoginAsync(anonClient, staffClient1, "Concurrent Staff Takeover Business");
+
+        Guid conversationId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            conversationId = await SeedConversationAsync(db, businessId, widgetId, DateTimeOffset.UtcNow, null);
+        }
+
+        var lockKey = AdvisoryLockKeyGenerator.ForConversationNotification(businessId, conversationId);
+        var (barrierConnection, barrierTransaction) = await AcquireBarrierAsync(lockKey);
+        await using var _bc = barrierConnection;
+        await using var _bt = barrierTransaction;
+
+        var task1 = staffClient1.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("Concurrent reply A")));
+        var task2 = staffClient2.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("Concurrent reply B")));
+
+        await WaitForAdvisoryLockWaitersAsync(barrierConnection, lockKey, 2, "two-simultaneous-staff-replies");
+        await barrierTransaction.RollbackAsync();
+
+        await Task.WhenAll(task1, task2);
+        Assert.Equal(HttpStatusCode.OK, (await task1).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await task2).StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var conversation = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversationId);
+        Assert.Equal(HandledBy.Human, conversation.HandledBy);
+
+        var messageCount = await verifyDb.Messages.IgnoreQueryFilters().CountAsync(m => m.ConversationId == conversationId && m.Role == MessageRole.Agent);
+        Assert.Equal(2, messageCount); // both replies persisted, no message lost
+
+        var handoffCount = await verifyDb.ConversationHandoffs.IgnoreQueryFilters().CountAsync(h => h.ConversationId == conversationId);
+        Assert.Equal(1, handoffCount); // only the first to acquire the lock observed the genuine Ai -> Human transition
     }
 
     // ── Step 15: Human -> Ai reversal ────────────────────────────────────
@@ -1536,6 +1696,22 @@ public class ConversationsApiTests : IAsyncLifetime
     /// side commits last determines the final HandledBy, but neither the
     /// Agent message nor the ConversationHandoff bookkeeping is ever lost,
     /// duplicated, or torn, in either possible outcome.
+    ///
+    /// Updated for Step 15's completion (CreateMessage now also writes its
+    /// own Ai -> Human handoff row on a genuine transition, symmetric with
+    /// ReturnToAi's Human -> Ai row): this conversation seeds Human, and
+    /// only ReturnToAi ever writes Ai, so ReturnToAi's own handoff always
+    /// fires exactly once regardless of ordering. The two orderings now
+    /// produce two different, fully deterministic outcomes rather than one
+    /// deterministic + one merely-bounded outcome: if the reply's
+    /// lock-protected reload runs before ReturnToAi's transition has
+    /// committed, it observes Human (no transition, no handoff of its own)
+    /// and ReturnToAi — running after — is what determines the final Ai
+    /// state (handoffCount 1); if the reply's reload instead runs after
+    /// ReturnToAi already committed Human -> Ai, the reply correctly
+    /// observes a genuine Ai -> Human transition and logs its own
+    /// StaffManualTakeover row on top of ReturnToAi's already-committed one
+    /// (handoffCount 2, final state Human).
     /// </summary>
     [Fact]
     public async Task ReturnToAi_ConcurrentWithStaffReply_ProducesDeterministicNonTornOutcome()
@@ -1592,10 +1768,14 @@ public class ConversationsApiTests : IAsyncLifetime
         else
         {
             Assert.Equal(HandledBy.Human, conversation.HandledBy);
-            // ReturnToAi may or may not have run before the reply
-            // overwrote it back to Human — either way, never more than one
-            // handoff row (no duplicate/corrupted bookkeeping).
-            Assert.True(handoffCount is 0 or 1);
+            // The reply committed last in this ordering, after ReturnToAi's
+            // own Human -> Ai transition already committed — the reply's
+            // lock-protected reload therefore correctly observed Ai and
+            // logged its own genuine Ai -> Human handoff on top of
+            // ReturnToAi's already-committed one. Two real, distinct
+            // transitions happened in sequence; two rows is the correct,
+            // non-duplicated audit trail for that — not a bug.
+            Assert.Equal(2, handoffCount);
         }
     }
 
