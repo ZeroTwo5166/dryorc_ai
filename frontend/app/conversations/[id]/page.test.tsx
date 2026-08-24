@@ -31,6 +31,7 @@ const { mockRouterReplace, authState, apiState } = vi.hoisted(() => ({
   apiState: {
     getConversationMessages: vi.fn(),
     createConversationMessage: vi.fn(),
+    returnConversationToAi: vi.fn(),
   },
 }));
 
@@ -50,6 +51,7 @@ vi.mock("../../lib/api", async () => {
     ...actual,
     getConversationMessages: apiState.getConversationMessages,
     createConversationMessage: apiState.createConversationMessage,
+    returnConversationToAi: apiState.returnConversationToAi,
   };
 });
 
@@ -68,10 +70,12 @@ describe("ConversationDetailPage staff-reply composer", () => {
       roles: ["Owner"],
       expiresAtUtc: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
     };
-    apiState.getConversationMessages.mockReset().mockResolvedValue([
-      { id: "m1", role: "Customer", content: "Is my order shipped?", createdAt: new Date().toISOString() },
-    ]);
+    apiState.getConversationMessages.mockReset().mockResolvedValue({
+      handledBy: "Ai",
+      messages: [{ id: "m1", role: "Customer", content: "Is my order shipped?", createdAt: new Date().toISOString() }],
+    });
     apiState.createConversationMessage.mockReset();
+    apiState.returnConversationToAi.mockReset();
   });
 
   it("renders the composer once the conversation loads", async () => {
@@ -148,14 +152,120 @@ describe("ConversationDetailPage staff-reply composer", () => {
   });
 
   it("still renders existing customer/AI messages, unaffected by the composer", async () => {
-    apiState.getConversationMessages.mockResolvedValue([
-      { id: "m1", role: "Customer", content: "Do you ship internationally?", createdAt: new Date().toISOString() },
-      { id: "m2", role: "Ai", content: "Yes, we ship worldwide.", createdAt: new Date().toISOString() },
-    ]);
+    apiState.getConversationMessages.mockResolvedValue({
+      handledBy: "Ai",
+      messages: [
+        { id: "m1", role: "Customer", content: "Do you ship internationally?", createdAt: new Date().toISOString() },
+        { id: "m2", role: "Ai", content: "Yes, we ship worldwide.", createdAt: new Date().toISOString() },
+      ],
+    });
 
     renderPage();
 
     await waitFor(() => expect(screen.getByText("Do you ship internationally?")).toBeInTheDocument());
     expect(screen.getByText("Yes, we ship worldwide.")).toBeInTheDocument();
+  });
+});
+
+// Step 15: Human -> Ai reversal
+describe("ConversationDetailPage return-to-AI action", () => {
+  beforeEach(() => {
+    mockRouterReplace.mockClear();
+    authState.status = "ready";
+    authState.user = {
+      userId: "u1",
+      businessId: "b1",
+      email: "staff@example.com",
+      businessName: "Acme Supply Co.",
+      planTier: "trial",
+      roles: ["Owner"],
+      expiresAtUtc: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    };
+    apiState.getConversationMessages.mockReset();
+    apiState.createConversationMessage.mockReset();
+    apiState.returnConversationToAi.mockReset();
+  });
+
+  it("shows a Human badge and a Return to AI button when the conversation is Human-handled", async () => {
+    apiState.getConversationMessages.mockResolvedValue({
+      handledBy: "Human",
+      messages: [{ id: "m1", role: "Customer", content: "Still waiting on a reply", createdAt: new Date().toISOString() }],
+    });
+
+    renderPage();
+
+    expect(await screen.findByText("Handled by Human")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /return to ai/i })).toBeInTheDocument();
+  });
+
+  it("shows an AI badge and no Return to AI button when the conversation is already Ai-handled", async () => {
+    apiState.getConversationMessages.mockResolvedValue({
+      handledBy: "Ai",
+      messages: [{ id: "m1", role: "Customer", content: "Hello", createdAt: new Date().toISOString() }],
+    });
+
+    renderPage();
+
+    expect(await screen.findByText("Handled by AI")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /return to ai/i })).not.toBeInTheDocument();
+  });
+
+  it("calls returnConversationToAi and updates the badge on success, removing the button", async () => {
+    apiState.getConversationMessages.mockResolvedValue({
+      handledBy: "Human",
+      messages: [{ id: "m1", role: "Customer", content: "Still waiting on a reply", createdAt: new Date().toISOString() }],
+    });
+    apiState.returnConversationToAi.mockResolvedValue(null);
+
+    renderPage();
+    const button = await screen.findByRole("button", { name: /return to ai/i });
+    fireEvent.click(button);
+
+    await waitFor(() => expect(screen.getByText("Handled by AI")).toBeInTheDocument());
+    expect(apiState.returnConversationToAi).toHaveBeenCalledWith("conv-1");
+    expect(screen.queryByRole("button", { name: /^return to ai$/i })).not.toBeInTheDocument();
+  });
+
+  it("disables the button while the request is in flight, so a second click cannot double-submit", async () => {
+    apiState.getConversationMessages.mockResolvedValue({
+      handledBy: "Human",
+      messages: [],
+    });
+    let resolveReturn: (value: unknown) => void = () => {};
+    apiState.returnConversationToAi.mockReturnValue(
+      new Promise((resolve) => {
+        resolveReturn = resolve;
+      }),
+    );
+
+    renderPage();
+    const button = await screen.findByRole("button", { name: /return to ai/i });
+
+    fireEvent.click(button);
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(button).toHaveTextContent("Returning to AI…");
+
+    fireEvent.click(button); // second click while the first request is still pending
+    expect(apiState.returnConversationToAi).toHaveBeenCalledTimes(1);
+
+    resolveReturn(null);
+    await waitFor(() => expect(screen.getByText("Handled by AI")).toBeInTheDocument());
+  });
+
+  it("shows a visible error and leaves the conversation shown as Human-handled when the request fails", async () => {
+    apiState.getConversationMessages.mockResolvedValue({
+      handledBy: "Human",
+      messages: [],
+    });
+    apiState.returnConversationToAi.mockRejectedValue(new ApiError(500, "Something went wrong."));
+
+    renderPage();
+    const button = await screen.findByRole("button", { name: /return to ai/i });
+    fireEvent.click(button);
+
+    await waitFor(() => expect(screen.getByText("Something went wrong.")).toBeInTheDocument());
+    // Not falsely optimistic: still shows Human, button still present/enabled to retry.
+    expect(screen.getByText("Handled by Human")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /return to ai/i })).not.toBeDisabled();
   });
 });

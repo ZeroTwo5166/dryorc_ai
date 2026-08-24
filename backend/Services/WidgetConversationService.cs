@@ -75,6 +75,12 @@ public interface IWidgetConversationService
 /// ordinary READ COMMITTED visibility — same reasoning already documented
 /// for ForVisitorSession above.
 ///
+/// Step 15 addition: NotifyStaffOfCustomerReplyAsync now re-checks
+/// HandledBy == Human fresh, inside its own lock, rather than trusting the
+/// pre-lock value PostMessageAsync read — see that method's own comment for
+/// why a stale read became unsafe once ConversationsController.ReturnToAi
+/// introduced a Human→Ai direction sharing the same lock key.
+///
 /// Zero active staff: NotificationService.NotifyAsync's own documented,
 /// general contract is to still create a Notification with zero
 /// recipients when there are no eligible recipients (a deliberate
@@ -197,25 +203,41 @@ public class WidgetConversationService(AppDbContext db, INotificationService not
             await db.Database.ExecuteSqlInterpolatedAsync(
                 $"SELECT pg_advisory_xact_lock({lockKey})", cancellationToken);
 
-            var alreadyUnread = await CustomerRepliedNotificationQueries
-                .UnreadRecipients(db, businessId, conversationId)
-                .AnyAsync(cancellationToken);
+            // Step 15: the caller's own HandledBy == Human check (in
+            // PostMessageAsync) is a cheap pre-filter read BEFORE this lock
+            // was acquired — it can be stale if a Human→Ai reversal
+            // (ConversationsController.ReturnToAi) committed and released
+            // this same lock in between. Re-checking fresh, now that the
+            // lock is actually held, is what makes this authoritative: if a
+            // reversal already committed, this conversation is no longer
+            // Human-handled and must not get a new CustomerReplied
+            // notification, regardless of what the caller saw a moment ago.
+            var stillHuman = await db.Conversations
+                .IgnoreQueryFilters()
+                .AnyAsync(c => c.Id == conversationId && c.HandledBy == HandledBy.Human, cancellationToken);
 
-            if (!alreadyUnread)
+            if (stillHuman)
             {
-                var hasActiveStaff = await db.Users
-                    .IgnoreQueryFilters()
-                    .AnyAsync(u => u.BusinessId == businessId && u.IsActive, cancellationToken);
+                var alreadyUnread = await CustomerRepliedNotificationQueries
+                    .UnreadRecipients(db, businessId, conversationId)
+                    .AnyAsync(cancellationToken);
 
-                if (hasActiveStaff)
+                if (!alreadyUnread)
                 {
-                    await notificationService.NotifyAsync(
-                        businessId,
-                        NotificationTypes.CustomerReplied,
-                        new CustomerRepliedArgs(),
-                        ActorType.NivoraSystem,
-                        conversationId: conversationId,
-                        cancellationToken: cancellationToken);
+                    var hasActiveStaff = await db.Users
+                        .IgnoreQueryFilters()
+                        .AnyAsync(u => u.BusinessId == businessId && u.IsActive, cancellationToken);
+
+                    if (hasActiveStaff)
+                    {
+                        await notificationService.NotifyAsync(
+                            businessId,
+                            NotificationTypes.CustomerReplied,
+                            new CustomerRepliedArgs(),
+                            ActorType.NivoraSystem,
+                            conversationId: conversationId,
+                            cancellationToken: cancellationToken);
+                    }
                 }
             }
 

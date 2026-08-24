@@ -355,10 +355,11 @@ public class WidgetPipelineTests : IAsyncLifetime
         messagesRequest.Headers.Add("Cookie", cookie!);
         var messagesResponse = await staffClient.SendAsync(messagesRequest);
         Assert.Equal(HttpStatusCode.OK, messagesResponse.StatusCode);
-        var messages = await messagesResponse.Content.ReadFromJsonAsync<List<ConversationMessageResponse>>();
-        Assert.NotNull(messages);
-        Assert.Single(messages!.Where(m => m.Role == MessageRole.Customer.ToString()));
-        Assert.Equal("Read via staff API", messages![0].Content);
+        var detail = await messagesResponse.Content.ReadFromJsonAsync<ConversationDetailResponse>();
+        Assert.NotNull(detail);
+        var messages = detail!.Messages;
+        Assert.Single(messages.Where(m => m.Role == MessageRole.Customer.ToString()));
+        Assert.Equal("Read via staff API", messages[0].Content);
         Assert.Equal("Customer", messages[0].Role);
     }
 }

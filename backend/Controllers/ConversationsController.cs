@@ -35,6 +35,14 @@ public record ConversationListResponse(List<ConversationSummaryResponse> Convers
 
 public record ConversationMessageResponse(Guid Id, string Role, string Content, DateTimeOffset CreatedAt);
 
+/// <summary>
+/// Step 15: HandledBy added alongside the existing message list so the
+/// staff detail view can show current handler state and gate the "Return
+/// to AI" action — previously the messages endpoint returned a bare array
+/// with no conversation-level state at all.
+/// </summary>
+public record ConversationDetailResponse(string HandledBy, List<ConversationMessageResponse> Messages);
+
 public record CreateConversationMessageRequest(string Content);
 
 /// <summary>
@@ -175,7 +183,7 @@ public class ConversationsController(AppDbContext db, IAuthorizationService auth
             .Select(m => new ConversationMessageResponse(m.Id, m.Role.ToString(), m.Content, m.CreatedAt))
             .ToListAsync();
 
-        return Ok(messages);
+        return Ok(new ConversationDetailResponse(conversation.HandledBy.ToString(), messages));
     }
 
     /// <summary>
@@ -253,35 +261,189 @@ public class ConversationsController(AppDbContext db, IAuthorizationService auth
             AuthorUserId = CurrentUserId,
             CreatedAt = now,
         };
-        db.Messages.Add(message);
 
-        conversation.LastMessageAt = now;
-        conversation.UpdatedAt = now;
-        conversation.HandledBy = HandledBy.Human;
+        // Step 15: message insert + HandledBy write + notification resolve
+        // now share one explicit transaction, guarded by the same
+        // conversation-scoped advisory lock ReturnToAi uses — see
+        // AdvisoryLockKeyGenerator.ForConversationNotification's own doc
+        // comment for why this became necessary once HandledBy became
+        // bidirectional. Previously this ran as two separate, unlocked
+        // implicit transactions (see the removed comment this replaced);
+        // that was accepted as harmless when HandledBy could only ever move
+        // one direction, but a concurrent Human→Ai reversal now needs a
+        // real serialization point to produce a deterministic result rather
+        // than an uncontrolled last-commit-wins outcome.
+        var lockKey = AdvisoryLockKeyGenerator.ForConversationNotification(conversation.BusinessId, conversation.Id);
+        await using var transaction = await db.Database.BeginTransactionAsync();
+        try
+        {
+            await db.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock({lockKey})");
 
-        await db.SaveChangesAsync();
+            db.Messages.Add(message);
 
-        // A staff reply is the "human attention given" signal — resolve any
-        // still-unread CustomerReplied notification(s) for this conversation
-        // for every recipient, not just the replying staff member (the
-        // underlying "needs a human" condition is conversation-wide, not
-        // per-viewer). Not required to share a transaction with the message
-        // insert above — a notification staying visibly unread for a moment
-        // after the reply already landed is cosmetic, not a correctness
-        // issue (see this method's own doc comment for the fuller
-        // concurrency reasoning against a concurrent new customer message).
-        // Same ExecuteUpdateAsync idiom NotificationsController.MarkRead
-        // already uses. Shares its "which rows count" definition with
-        // WidgetConversationService's dedup check via
-        // CustomerRepliedNotificationQueries — see that class's own doc
-        // comment for why (audit finding: this predicate had drifted into
-        // two independently-written copies).
-        await CustomerRepliedNotificationQueries
-            .UnreadRecipients(db, conversation.BusinessId, conversation.Id)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(r => r.IsRead, true)
-                .SetProperty(r => r.ReadAt, now));
+            conversation.LastMessageAt = now;
+            conversation.UpdatedAt = now;
+            conversation.HandledBy = HandledBy.Human;
+
+            await db.SaveChangesAsync();
+
+            // A staff reply is the "human attention given" signal — resolve
+            // any still-unread CustomerReplied notification(s) for this
+            // conversation for every recipient, not just the replying staff
+            // member (the underlying "needs a human" condition is
+            // conversation-wide, not per-viewer). Same ExecuteUpdateAsync
+            // idiom NotificationsController.MarkRead already uses. Shares
+            // its "which rows count" definition with
+            // WidgetConversationService's dedup check via
+            // CustomerRepliedNotificationQueries — see that class's own doc
+            // comment for why (audit finding: this predicate had drifted
+            // into two independently-written copies).
+            await CustomerRepliedNotificationQueries
+                .UnreadRecipients(db, conversation.BusinessId, conversation.Id)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(r => r.IsRead, true)
+                    .SetProperty(r => r.ReadAt, now));
+
+            await transaction.CommitAsync();
+        }
+        catch
+        {
+            await transaction.RollbackAsync();
+            throw;
+        }
 
         return Ok(new ConversationMessageResponse(message.Id, message.Role.ToString(), message.Content, message.CreatedAt));
+    }
+
+    /// <summary>
+    /// Step 15: Human → Ai reversal — the second half of HandledBy's
+    /// lifecycle (Step 9 already implemented Ai → Human on a staff reply,
+    /// above). Deliberately does not call IClaudeReplyService itself; the
+    /// conversation simply becomes eligible for AI again on whatever
+    /// customer message arrives next through the existing widget pipeline
+    /// (WidgetController.PostMessage → ClaudeReplyService.GenerateReplyAsync,
+    /// both untouched by this endpoint). Any customer messages sent during
+    /// the Human-handled window remain ordinary persisted history — the
+    /// next AI reply's full-history rebuild (ClaudeReplyService's own
+    /// existing, unmodified behavior) naturally includes them as context;
+    /// nothing here proactively answers them, and if the customer never
+    /// sends another message, nothing else happens.
+    ///
+    /// AnyStaff, same as CreateMessage above — no per-handler ownership
+    /// concept exists anywhere on Conversation (deliberately not
+    /// introduced here), so this is symmetric with who can take a
+    /// conversation over in the first place.
+    ///
+    /// Idempotent: calling this on an already-Ai conversation is a no-op —
+    /// no ConversationHandoff row, no notification changes — same
+    /// "unconditional re-assignment, no branch needed" spirit
+    /// CreateMessage's own HandledBy = Human write already established,
+    /// except here the branch is required specifically so a duplicate
+    /// ConversationHandoff row is never written for a conversation that's
+    /// already Ai (see the concurrency reasoning below).
+    ///
+    /// Concurrency: guarded by the same conversation-scoped advisory lock
+    /// as CreateMessage's HandledBy write and
+    /// WidgetConversationService.NotifyStaffOfCustomerReplyAsync's
+    /// check-then-create — see AdvisoryLockKeyGenerator
+    /// .ForConversationNotification's own doc comment for the full
+    /// reasoning. Concretely, holding this lock for the read-decide-write
+    /// sequence below guarantees: (1) two concurrent reversals can never
+    /// both observe Human and both write a ConversationHandoff row — only
+    /// whichever acquires the lock first sees Human and transitions; the
+    /// second, now finding Ai already, no-ops; (2) a concurrent
+    /// CreateMessage (Ai→Human) and this endpoint (Human→Ai) fully
+    /// serialize against each other rather than racing — whichever commits
+    /// last determines the final HandledBy value, which is a deterministic,
+    /// well-defined outcome (not a torn or lost update), and if this
+    /// endpoint is the one that read Human before CreateMessage's write
+    /// landed, a genuine (if immediately superseded) handoff event is still
+    /// correctly recorded — an append-only log recording a real event that
+    /// happened, not a live snapshot; (3) a concurrent customer message's
+    /// notification-creation check (NotifyStaffOfCustomerReplyAsync, same
+    /// lock) can never race this endpoint's notification-resolve step into
+    /// an inconsistent order — whichever runs first under the lock is
+    /// authoritative for the other, since NotifyStaffOfCustomerReplyAsync
+    /// now re-checks HandledBy fresh inside its own lock acquisition (see
+    /// its own doc comment) rather than trusting a pre-lock read.
+    /// </summary>
+    [HttpPost("{id:guid}/return-to-ai")]
+    public async Task<IActionResult> ReturnToAi(Guid id)
+    {
+        var conversation = await db.Conversations.FirstOrDefaultAsync(c => c.Id == id);
+        if (conversation is null)
+        {
+            return NotFound();
+        }
+
+        var authResult = await authorizationService.AuthorizeAsync(User, conversation, NivoraPolicies.SameTenant);
+        if (!authResult.Succeeded)
+        {
+            return NotFound();
+        }
+
+        var lockKey = AdvisoryLockKeyGenerator.ForConversationNotification(conversation.BusinessId, conversation.Id);
+        await using var transaction = await db.Database.BeginTransactionAsync();
+        try
+        {
+            await db.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock({lockKey})");
+
+            // Fresh read under the lock — conversation was loaded above,
+            // before the lock was acquired, and may be stale relative to a
+            // concurrent writer that already committed. Deliberately
+            // db.Entry(conversation).ReloadAsync(), not another
+            // db.Conversations.FirstAsync(...) query: conversation is
+            // already tracked by this context from the load above, and EF
+            // Core's identity resolution would hand back that same tracked
+            // instance (with its now-stale property values) instead of
+            // issuing a real query — ReloadAsync is what actually re-reads
+            // this row's current values from the database.
+            await db.Entry(conversation).ReloadAsync();
+
+            if (conversation.HandledBy == HandledBy.Human)
+            {
+                var now = DateTimeOffset.UtcNow;
+                conversation.HandledBy = HandledBy.Ai;
+                conversation.UpdatedAt = now;
+
+                db.ConversationHandoffs.Add(new ConversationHandoff
+                {
+                    Id = Guid.NewGuid(),
+                    BusinessId = conversation.BusinessId,
+                    ConversationId = conversation.Id,
+                    FromHandledBy = HandledBy.Human,
+                    ToHandledBy = HandledBy.Ai,
+                    Reason = HandoffReasons.ResolvedReturnedToAi,
+                    ActorType = ActorType.NivoraBusinessStaff,
+                    ActorId = CurrentUserId,
+                    CreatedAt = now,
+                });
+
+                await db.SaveChangesAsync();
+
+                // Staff choosing to hand the conversation back to AI is
+                // itself a "human attention given" signal for any customer
+                // message that was still waiting on a reply — same
+                // resolve-for-all-recipients semantics CreateMessage's own
+                // staff-reply path already uses, via the same shared query.
+                // Deliberately does not create any new notification.
+                await CustomerRepliedNotificationQueries
+                    .UnreadRecipients(db, conversation.BusinessId, conversation.Id)
+                    .ExecuteUpdateAsync(s => s
+                        .SetProperty(r => r.IsRead, true)
+                        .SetProperty(r => r.ReadAt, now));
+            }
+            // else: already Ai — idempotent no-op. No ConversationHandoff
+            // row (no genuine transition occurred), no notification change.
+
+            await transaction.CommitAsync();
+        }
+        catch
+        {
+            await transaction.RollbackAsync();
+            throw;
+        }
+
+        return NoContent();
     }
 }

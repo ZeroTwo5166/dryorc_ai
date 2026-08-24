@@ -8,25 +8,36 @@ import { FormError } from "../../components/auth/FormField";
 import { IconArrowRight, IconMessageSquare } from "../../components/landing/icons";
 import { useAuth } from "../../lib/auth-context";
 import { formatRelativeTime } from "../../lib/relative-time";
-import { ApiError, createConversationMessage, getConversationMessages, type ConversationMessage } from "../../lib/api";
+import { ApiError, createConversationMessage, getConversationMessages, returnConversationToAi, type ConversationMessage } from "../../lib/api";
 
 // Step 9: read-only thread view plus a minimal staff-reply composer.
 // Customer delivery is explicitly out of scope here — a sent Agent message
 // is persisted and shows up in this dashboard view, but the customer-facing
 // widget has no way to receive it yet (no polling/push exists). See
 // ConversationsController.CreateMessage's own doc comment.
+//
+// Step 15: also shows current HandledBy state and, when Human, a "Return to
+// AI" action. Deliberately does not poll or otherwise watch for the handler
+// state changing on its own — the same one-shot-load pattern the rest of
+// this page already uses; the button's own optimistic local-state update
+// (see handleReturnToAi) is what keeps this page in sync with a reversal
+// this staff member themselves triggers.
 export default function ConversationDetailPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const { user, status } = useAuth();
 
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
+  const [handledBy, setHandledBy] = useState<"Ai" | "Human" | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
 
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+
+  const [returningToAi, setReturningToAi] = useState(false);
+  const [returnToAiError, setReturnToAiError] = useState<string | null>(null);
 
   useEffect(() => {
     if (status === "ready" && !user) {
@@ -41,7 +52,8 @@ export default function ConversationDetailPage() {
     getConversationMessages(params.id)
       .then((result) => {
         if (cancelled) return;
-        setMessages(result);
+        setMessages(result.messages);
+        setHandledBy(result.handledBy);
         setError(false);
       })
       .catch(() => {
@@ -55,6 +67,25 @@ export default function ConversationDetailPage() {
       cancelled = true;
     };
   }, [user, params.id]);
+
+  async function handleReturnToAi() {
+    if (returningToAi) return; // double-click guard, same convention as handleSend's sending guard
+    setReturningToAi(true);
+    setReturnToAiError(null);
+    try {
+      await returnConversationToAi(params.id);
+      // Optimistic update from the successful response — same pattern
+      // KnowledgeDocumentDetailPage's handleToggleActive already
+      // established, not a re-fetch/poll.
+      setHandledBy("Ai");
+    } catch (err) {
+      // Deliberately does NOT flip handledBy — a failed request must never
+      // leave the UI claiming a reversal happened when it didn't.
+      setReturnToAiError(err instanceof ApiError ? err.message : "Something went wrong. Please try again.");
+    } finally {
+      setReturningToAi(false);
+    }
+  }
 
   async function handleSend(e: FormEvent) {
     e.preventDefault();
@@ -94,6 +125,29 @@ export default function ConversationDetailPage() {
         </Link>
 
         <h1 className="mt-4 text-2xl font-semibold tracking-tight text-foreground sm:text-3xl">Conversation</h1>
+
+        {!loading && !error && handledBy && (
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <span
+              className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wider ${
+                handledBy === "Human" ? "bg-accent-soft text-accent" : "bg-muted text-muted-foreground"
+              }`}
+            >
+              Handled by {handledBy === "Ai" ? "AI" : "Human"}
+            </span>
+            {handledBy === "Human" && (
+              <button
+                type="button"
+                onClick={handleReturnToAi}
+                disabled={returningToAi}
+                className="cursor-pointer rounded-lg border border-border bg-card px-3 py-1.5 text-[12.5px] font-medium text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {returningToAi ? "Returning to AI…" : "Return to AI"}
+              </button>
+            )}
+          </div>
+        )}
+        {returnToAiError && <div className="mt-2"><FormError message={returnToAiError} /></div>}
 
         {loading ? (
           <div className="mt-10 flex justify-center">

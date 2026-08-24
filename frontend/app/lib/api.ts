@@ -367,6 +367,15 @@ export type ConversationMessage = {
   createdAt: string;
 };
 
+// Step 15: HandledBy added alongside the message list so the detail page
+// can show current handler state and gate the "Return to AI" action —
+// previously this endpoint returned a bare message array with no
+// conversation-level state at all.
+export type ConversationDetail = {
+  handledBy: "Ai" | "Human";
+  messages: ConversationMessage[];
+};
+
 export function listConversations(params?: {
   take?: number;
   before?: ConversationCursor;
@@ -381,8 +390,15 @@ export function listConversations(params?: {
   return api.get(`/api/conversations${qs ? `?${qs}` : ""}`);
 }
 
-export function getConversationMessages(id: string): Promise<ConversationMessage[]> {
+export function getConversationMessages(id: string): Promise<ConversationDetail> {
   return api.get(`/api/conversations/${id}/messages`);
+}
+
+// Step 15: Human -> Ai reversal. No request body — the reason is implicitly
+// HandoffReasons.ResolvedReturnedToAi server-side. Idempotent: calling this
+// when already Ai is a harmless no-op, same as the backend endpoint.
+export function returnConversationToAi(id: string): Promise<null> {
+  return api.post(`/api/conversations/${id}/return-to-ai`);
 }
 
 // Step 9 staff-reply composer. Backend derives the author/business from the

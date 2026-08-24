@@ -51,6 +51,21 @@ public static class AdvisoryLockKeyGenerator
     /// otherwise run concurrently (they no longer share the visitor-session
     /// lock by that point — see WidgetConversationService's own doc
     /// comment).
+    ///
+    /// Step 15 broadened this same key's scope: it now also guards every
+    /// write to Conversation.HandledBy and its associated
+    /// CustomerReplied-notification side effects (the Ai→Human write in
+    /// ConversationsController.CreateMessage, and the Human→Ai reversal in
+    /// ConversationsController.ReturnToAi), not just notification creation
+    /// in isolation. HandledBy became bidirectional in Step 15 — before
+    /// that, a plain unlocked read-modify-write was accepted as benign
+    /// because the value only ever moved one direction within a short
+    /// window; bidirectionality means an unlocked writer could otherwise
+    /// race a concurrent reversal into a genuinely ambiguous, non-serialized
+    /// outcome (not just a stale-but-consistent read). One shared key for
+    /// all of this is deliberate: HandledBy state and CustomerReplied
+    /// notification state are one atomic decision boundary per conversation
+    /// now, not two independently-timed ones.
     /// </summary>
     public static long ForConversationNotification(Guid businessId, Guid conversationId) =>
         PackToLong($"{businessId:D}:notification:{conversationId:D}");
