@@ -112,6 +112,20 @@ describe("WidgetUI", () => {
     expect(aiMsg?.classList.contains("message-customer")).toBe(false);
   });
 
+  it("visually distinguishes agent messages from both customer and AI, with no staff identity rendered", () => {
+    const { container, ui } = mount();
+    ui.renderMessages([
+      { id: "m1", role: "ai", content: "ai text", createdAt: "2026-01-01T00:00:00Z" },
+      { id: "m2", role: "agent", content: "a human replied", createdAt: "2026-01-01T00:00:01Z" },
+    ]);
+
+    const aiMsg = container.querySelector(".message-ai");
+    const agentMsg = container.querySelector(".message-agent");
+    expect(agentMsg?.textContent).toBe("a human replied"); // content only — no author name/id ever rendered
+    expect(agentMsg?.classList.contains("message-ai")).toBe(false);
+    expect(aiMsg?.classList.contains("message-agent")).toBe(false);
+  });
+
   it("appendMessage adds one more message without clearing existing ones", () => {
     const { container, ui } = mount();
     ui.renderMessages([{ id: "m1", role: "customer", content: "first", createdAt: "2026-01-01T00:00:00Z" }]);

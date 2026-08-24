@@ -1,7 +1,12 @@
-import { initSession, sendMessage, ApiError, NetworkError } from "./api";
-import { loadState, saveState, type WidgetMessage } from "./state";
+import { initSession, sendMessage, pollMessages, ApiError, NetworkError } from "./api";
+import { loadState, saveState, type PollCursor, type WidgetMessage } from "./state";
 import { WidgetUI, isValidPublicKey } from "./ui";
 import stylesCss from "./styles.css";
+
+// Step 6C polling MVP tunable value — not a fixed production guarantee,
+// same "revisit once real traffic exists" caveat as the paired backend
+// rate limit (Program.cs, "WidgetPoll" policy).
+const POLL_INTERVAL_MS = 5000;
 
 /**
  * document.currentScript is null once execution resumes after an async
@@ -100,11 +105,33 @@ async function bootstrap(): Promise<void> {
   // applies to (null means "no message has failed — Retry just re-inits").
   let failedMessageId: string | null = null;
 
+  /**
+   * Seeds the polling cursor from the newest Ai/Agent message already
+   * known locally, if any — a real, server-originated (CreatedAt, Id), so
+   * resuming from it is safe (never re-delivers anything already seen).
+   * Falls back to undefined (no local seed) for a genuinely first-time
+   * visitor or a cache written before this field existed; pollOnce/api.ts
+   * treat that as "let the server anchor at its own current time" — never
+   * as "fetch everything," preserving Step 6B's own decision not to build
+   * a general history-fetch endpoint.
+   */
+  function newestPolledCursorFromTranscript(): PollCursor | undefined {
+    let newest: WidgetMessage | undefined;
+    for (const m of transcript) {
+      if (m.role !== "ai" && m.role !== "agent") continue;
+      if (!newest || m.createdAt > newest.createdAt) newest = m;
+    }
+    return newest ? { createdAt: newest.createdAt, id: newest.id } : undefined;
+  }
+
+  let pollCursor: PollCursor | undefined = cached?.lastPolledCursor ?? newestPolledCursorFromTranscript();
+
   function persist(): void {
     saveState(publicKey, {
       visitorSessionId: visitorSessionId ?? "",
       token: token ?? "",
       transcript,
+      lastPolledCursor: pollCursor,
     });
   }
 
@@ -146,6 +173,8 @@ async function bootstrap(): Promise<void> {
         void doInit();
       }
     },
+    onOpen: () => startPolling(),
+    onClose: () => stopPolling(),
   });
 
   if (transcript.length > 0) {
@@ -226,15 +255,30 @@ async function bootstrap(): Promise<void> {
       ui.updateMessage(message);
       failedMessageId = null;
 
-      if (result.aiReply) {
-        const aiMessage: WidgetMessage = {
-          id: result.id,
-          role: "ai",
-          content: result.aiReply,
-          createdAt: result.createdAt,
-        };
-        transcript.push(aiMessage);
-        ui.appendMessage(aiMessage);
+      // aiReplyId/aiReplyCreatedAt are the Ai message's own real server
+      // identity — deliberately not result.id/result.createdAt, which are
+      // the customer message's. Using the correct id here is what lets a
+      // later poll response recognize this as the same message it already
+      // has and skip it, rather than appending a duplicate. The reverse
+      // race also needs the same guard here: a poll tick can land before
+      // this synchronous reply is processed and add the same message
+      // first, so this path must dedup by id too, not just the poll path.
+      if (result.aiReply && result.aiReplyId && result.aiReplyCreatedAt) {
+        const aiReplyId = result.aiReplyId;
+        const aiReplyCreatedAt = result.aiReplyCreatedAt;
+        if (!transcript.some((m) => m.id === aiReplyId)) {
+          const aiMessage: WidgetMessage = {
+            id: aiReplyId,
+            role: "ai",
+            content: result.aiReply,
+            createdAt: aiReplyCreatedAt,
+          };
+          transcript.push(aiMessage);
+          ui.appendMessage(aiMessage);
+        }
+        if (!pollCursor || aiReplyCreatedAt > pollCursor.createdAt) {
+          pollCursor = { createdAt: aiReplyCreatedAt, id: aiReplyId };
+        }
       }
       persist();
     } catch (err) {
@@ -272,6 +316,107 @@ async function bootstrap(): Promise<void> {
     if (!message) return;
     await submitCustomerMessage(message);
   }
+
+  // ── Step 6C: customer-side delivery via minimal polling ──────────────
+  //
+  // No SignalR/WebSockets/SSE — a plain self-rescheduling setTimeout loop,
+  // active only while the panel is open (wired via onOpen/onClose above)
+  // and paused (not just slowed) while the browser tab is hidden, resuming
+  // with an immediate catch-up poll rather than waiting out a full
+  // interval. Single-flight-guarded the same way submitCustomerMessage's
+  // `sending` boolean already guards sends, for the same reason: the
+  // visibilitychange listener and the interval loop can both try to fire a
+  // poll around the same moment, and only one may actually be in flight.
+
+  let polling = false;
+  let pollingActive = false;
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function clearPollTimer(): void {
+    if (pollTimer !== null) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  async function pollOnce(): Promise<void> {
+    if (polling || !token) return;
+    polling = true;
+    try {
+      const result = await pollMessages(apiBaseUrl, token, pollCursor);
+
+      let appended = false;
+      for (const polled of result.messages) {
+        // Dedup by stable server id — never a timing heuristic. Catches
+        // both a message already delivered synchronously via send (see
+        // submitCustomerMessage above) and a message this same poll cursor
+        // already returned once before.
+        if (transcript.some((m) => m.id === polled.id)) continue;
+
+        const widgetMessage: WidgetMessage = {
+          id: polled.id,
+          // Backend serializes the raw enum name ("Ai"/"Agent"); Customer
+          // is never returned by this endpoint at all (see
+          // WidgetController.PollMessages' own doc comment), so anything
+          // that isn't literally "Agent" is treated as "ai" defensively.
+          role: polled.role === "Agent" ? "agent" : "ai",
+          content: polled.content,
+          createdAt: polled.createdAt,
+        };
+        transcript.push(widgetMessage);
+        ui.appendMessage(widgetMessage);
+        appended = true;
+      }
+
+      // Only advances after every message above was safely appended —
+      // if anything in the loop had thrown, this line (and the persist()
+      // below) would never run, so the cursor can't skip past a message
+      // that was never actually added to the transcript.
+      if (result.nextCursor) {
+        pollCursor = result.nextCursor;
+      }
+      if (appended || result.nextCursor) {
+        persist();
+      }
+    } catch {
+      // Silent, deliberately — polling is a background sync, not a user
+      // action; a transient failure here must not surface an error banner
+      // or destroy pollCursor. The next scheduled tick retries on its own.
+    } finally {
+      polling = false;
+    }
+  }
+
+  async function runPollTick(): Promise<void> {
+    pollTimer = null;
+    if (!pollingActive) return;
+    // Paused (not rescheduled) while hidden — the visibilitychange
+    // listener below is what resumes it, with an immediate catch-up poll
+    // rather than waiting out the rest of an interval.
+    if (document.visibilityState !== "visible") return;
+    await pollOnce();
+    if (pollingActive) {
+      pollTimer = setTimeout(() => void runPollTick(), POLL_INTERVAL_MS);
+    }
+  }
+
+  function startPolling(): void {
+    if (pollingActive) return;
+    pollingActive = true;
+    void runPollTick();
+  }
+
+  function stopPolling(): void {
+    pollingActive = false;
+    clearPollTimer();
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (pollingActive && document.visibilityState === "visible") {
+      clearPollTimer();
+      void runPollTick();
+    }
+  });
 
   await doInit();
 }

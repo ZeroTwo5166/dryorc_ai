@@ -128,6 +128,41 @@ describe("state", () => {
     expect(loadState(PUBLIC_KEY)?.transcript[0].status).toBeUndefined();
   });
 
+  it("accepts and round-trips an agent-role message", () => {
+    const transcript = [{ id: "m1", role: "agent" as const, content: "a human reply", createdAt: "2026-01-01T00:00:00Z" }];
+    saveState(PUBLIC_KEY, { visitorSessionId: "v", token: "t", transcript });
+    const loaded = loadState(PUBLIC_KEY);
+    expect(loaded!.transcript).toHaveLength(1);
+    expect(loaded!.transcript[0]).toMatchObject({ role: "agent", content: "a human reply" });
+  });
+
+  it("round-trips lastPolledCursor", () => {
+    saveState(PUBLIC_KEY, {
+      visitorSessionId: "v",
+      token: "t",
+      transcript: [],
+      lastPolledCursor: { createdAt: "2026-01-01T00:00:05Z", id: "srv-1" },
+    });
+    const loaded = loadState(PUBLIC_KEY);
+    expect(loaded!.lastPolledCursor).toEqual({ createdAt: "2026-01-01T00:00:05Z", id: "srv-1" });
+  });
+
+  it("drops a malformed lastPolledCursor rather than invalidating the whole cached session", () => {
+    window.localStorage.setItem(
+      `nivora_widget_${PUBLIC_KEY}`,
+      JSON.stringify({
+        visitorSessionId: "v",
+        token: "t",
+        transcript: [{ id: "m1", role: "ai", content: "still here", createdAt: "2026-01-01T00:00:00Z" }],
+        lastPolledCursor: { createdAt: "2026-01-01T00:00:05Z" }, // missing id
+      }),
+    );
+    const loaded = loadState(PUBLIC_KEY);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.lastPolledCursor).toBeUndefined();
+    expect(loaded!.transcript).toHaveLength(1);
+  });
+
   it("clearState removes a stale/cached session entirely", () => {
     saveState(PUBLIC_KEY, { visitorSessionId: "v", token: "t", transcript: [] });
     expect(loadState(PUBLIC_KEY)).not.toBeNull();

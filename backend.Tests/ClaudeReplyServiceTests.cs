@@ -188,7 +188,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         // response.Content.Select(b => b.Value).OfType<TextBlock>()
         // extraction — the fake returns a Message with a real TextBlock
         // inside a real ContentBlock union, not a pre-extracted string.
-        Assert.Equal(fake.ReplyText, reply);
+        Assert.Equal(fake.ReplyText, reply?.Content);
         Assert.Equal(1, fake.CallCount);
 
         var aiMessage = await db.Messages.IgnoreQueryFilters()
@@ -342,7 +342,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
-        Assert.Equal("Still works.", reply); // the conversation continued normally, not broken by retrieval throwing
+        Assert.Equal("Still works.", reply?.Content); // the conversation continued normally, not broken by retrieval throwing
         var aiMessage = await db.Messages.IgnoreQueryFilters()
             .SingleAsync(m => m.ConversationId == conversation.Id && m.Role == MessageRole.Ai);
         var sources = await db.MessageKnowledgeSources.IgnoreQueryFilters()
@@ -495,7 +495,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
-        Assert.Equal("Normal AI reply.", reply);
+        Assert.Equal("Normal AI reply.", reply?.Content);
         Assert.Equal(1, fake.CallCount);
         var aiMessage = await db.Messages.IgnoreQueryFilters()
             .SingleAsync(m => m.ConversationId == conversation.Id && m.Role == MessageRole.Ai);
@@ -528,11 +528,12 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
-        Assert.False(string.IsNullOrWhiteSpace(reply));
+        Assert.False(string.IsNullOrWhiteSpace(reply?.Content));
 
         var aiMessage = await db.Messages.IgnoreQueryFilters()
             .SingleAsync(m => m.ConversationId == conversation.Id && m.Role == MessageRole.Ai);
-        Assert.Equal(reply, aiMessage.Content);
+        Assert.Equal(reply!.Content, aiMessage.Content);
+        Assert.Equal(reply.Id, aiMessage.Id);
 
         var updatedConversation = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
         Assert.Equal(aiMessage.CreatedAt, updatedConversation.LastMessageAt);

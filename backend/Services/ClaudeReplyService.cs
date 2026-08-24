@@ -8,18 +8,29 @@ using Microsoft.EntityFrameworkCore;
 
 namespace backend.Services;
 
+/// <summary>
+/// The persisted AI message's own stable identity — distinct from the
+/// customer message that triggered it. Customer-side delivery (widget
+/// polling) needs the AI message's real Id/CreatedAt to dedup correctly
+/// against the same message arriving later via GET /api/widget/messages;
+/// returning only the reply text here (as before) left no way for a caller
+/// to know that identity.
+/// </summary>
+public record AiReplyResult(Guid Id, string Content, DateTimeOffset CreatedAt);
+
 public interface IClaudeReplyService
 {
     /// <summary>
     /// Generates a reply from the conversation's full message history and
     /// persists it as Message{Role=Ai}, updating Conversation.LastMessageAt
-    /// in the same write. Returns the reply text, or null if the Claude
-    /// call failed, or if the conversation is HandledBy.Human (Step 9: a
-    /// staff member has already replied — see Conversation.HandledBy's own
-    /// doc comment) — the customer's own message (already committed by the
-    /// time this is called) is never affected either way.
+    /// in the same write. Returns the persisted message's id/content/
+    /// timestamp, or null if the Claude call failed, or if the conversation
+    /// is HandledBy.Human (Step 9: a staff member has already replied — see
+    /// Conversation.HandledBy's own doc comment) — the customer's own
+    /// message (already committed by the time this is called) is never
+    /// affected either way.
     /// </summary>
-    Task<string?> GenerateReplyAsync(Guid businessId, Guid conversationId, CancellationToken cancellationToken = default);
+    Task<AiReplyResult?> GenerateReplyAsync(Guid businessId, Guid conversationId, CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -56,7 +67,7 @@ public class ClaudeReplyService(
 {
     private const int MaxReplyTokens = 1024;
 
-    public async Task<string?> GenerateReplyAsync(Guid businessId, Guid conversationId, CancellationToken cancellationToken = default)
+    public async Task<AiReplyResult?> GenerateReplyAsync(Guid businessId, Guid conversationId, CancellationToken cancellationToken = default)
     {
         var business = await db.Businesses
             .IgnoreQueryFilters()
@@ -250,7 +261,7 @@ public class ClaudeReplyService(
 
         await db.SaveChangesAsync(cancellationToken);
 
-        return replyText;
+        return new AiReplyResult(aiMessage.Id, replyText, now);
     }
 
     private static string BuildSystemPrompt(string businessName, IReadOnlyList<RetrievedKnowledgeChunk> retrievedChunks)

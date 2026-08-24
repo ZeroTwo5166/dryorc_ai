@@ -6,7 +6,7 @@
 // endpoint exists (by design — see the Step 6B design report); this module
 // is the only source of conversation continuity across a reload.
 
-export type MessageRole = "customer" | "ai";
+export type MessageRole = "customer" | "ai" | "agent";
 
 // Only customer messages carry a status — a message the widget itself
 // created optimistically before the server confirmed it. AI messages only
@@ -22,10 +22,27 @@ export interface WidgetMessage {
   status?: MessageStatus;
 }
 
+/** The last (CreatedAt, Id) position a poll response established — see api.ts's pollMessages. */
+export interface PollCursor {
+  createdAt: string;
+  id: string;
+}
+
 export interface WidgetState {
   visitorSessionId: string;
   token: string;
   transcript: WidgetMessage[];
+  /**
+   * Absent for a visitor who has never successfully polled yet (a brand
+   * new session, or one restored from a cache written before this field
+   * existed) — index.ts falls back to deriving a starting point from the
+   * newest Ai/Agent message already in the transcript, or if there is
+   * none, lets the server establish a fresh "now" anchor on the first
+   * poll. Never used to reconstruct full history — see index.ts's own
+   * doc comment on why a cursor-less poll deliberately returns nothing
+   * pre-existing.
+   */
+  lastPolledCursor?: PollCursor;
 }
 
 const STORAGE_PREFIX = "nivora_widget_";
@@ -41,11 +58,17 @@ function isWidgetMessage(value: unknown): value is WidgetMessage {
     m.status === undefined || m.status === "pending" || m.status === "sent" || m.status === "failed";
   return (
     typeof m.id === "string" &&
-    (m.role === "customer" || m.role === "ai") &&
+    (m.role === "customer" || m.role === "ai" || m.role === "agent") &&
     typeof m.content === "string" &&
     typeof m.createdAt === "string" &&
     validStatus
   );
+}
+
+function isPollCursor(value: unknown): value is PollCursor {
+  if (typeof value !== "object" || value === null) return false;
+  const c = value as Record<string, unknown>;
+  return typeof c.createdAt === "string" && typeof c.id === "string";
 }
 
 /**
@@ -82,7 +105,14 @@ export function loadState(publicKey: string): WidgetState | null {
     ? candidate.transcript.filter(isWidgetMessage)
     : [];
 
-  return { visitorSessionId: candidate.visitorSessionId, token: candidate.token, transcript };
+  // A malformed lastPolledCursor is dropped, not treated as invalidating
+  // the whole cached session — same "one bad row doesn't break the cache"
+  // policy as transcript entries above. index.ts's own fallback (derive
+  // from the transcript, or let the server establish a fresh anchor)
+  // covers the resulting "absent" case safely.
+  const lastPolledCursor = isPollCursor(candidate.lastPolledCursor) ? candidate.lastPolledCursor : undefined;
+
+  return { visitorSessionId: candidate.visitorSessionId, token: candidate.token, transcript, lastPolledCursor };
 }
 
 /**

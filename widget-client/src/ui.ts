@@ -15,6 +15,9 @@ export interface WidgetUIOptions {
   businessName?: string;
   onSend: (content: string) => void;
   onRetry: () => void;
+  /** Step 6C: drives starting/stopping the poll loop — see index.ts. */
+  onOpen?: () => void;
+  onClose?: () => void;
 }
 
 type Container = Element | ShadowRoot;
@@ -115,10 +118,12 @@ export class WidgetUI {
 
   open(): void {
     this.panel.hidden = false;
+    this.options.onOpen?.();
   }
 
   close(): void {
     this.panel.hidden = true;
+    this.options.onClose?.();
   }
 
   get isOpen(): boolean {

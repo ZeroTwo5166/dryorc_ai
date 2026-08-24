@@ -17,7 +17,32 @@ public record WidgetInitResponse(string VisitorSessionId, string Token);
 
 public record PostWidgetMessageRequest(string Content);
 
-public record WidgetMessageResponse(Guid Id, DateTimeOffset CreatedAt, string? AiReply);
+/// <summary>
+/// Id/CreatedAt are the customer message just persisted. AiReplyId/
+/// AiReplyCreatedAt are the separately-persisted Ai message's own identity
+/// (null together whenever AiReply is null) — added for Step 6C so the
+/// widget can dedup this same message against a later poll delivery by its
+/// real server id, not the customer message's id.
+/// </summary>
+public record WidgetMessageResponse(Guid Id, DateTimeOffset CreatedAt, string? AiReply, Guid? AiReplyId, DateTimeOffset? AiReplyCreatedAt);
+
+/// <summary>
+/// Step 6C customer-side delivery. Role is the raw enum name ("Ai"/"Agent"),
+/// same serialization convention ConversationMessageResponse already uses.
+/// Never includes AuthorUserId, BusinessId, or ConversationId — see
+/// PollMessages' own doc comment for why.
+/// </summary>
+public record WidgetPolledMessage(Guid Id, string Role, string Content, DateTimeOffset CreatedAt);
+
+/// <summary>
+/// Opaque to the client in practice (it should only ever echo back
+/// whatever NextCursor it was last given), but transparent in shape —
+/// same convention ConversationCursor already established, not an encoded
+/// token.
+/// </summary>
+public record WidgetMessageCursor(DateTimeOffset CreatedAt, Guid Id);
+
+public record WidgetPollResponse(List<WidgetPolledMessage> Messages, WidgetMessageCursor? NextCursor);
 
 /// <summary>
 /// Public, widget-facing endpoints — no staff cookie involved anywhere
@@ -126,7 +151,103 @@ public class WidgetController(AppDbContext db, IWidgetTokenService tokenService)
         // customer's message is already safely persisted regardless.
         var aiReply = await replyService.GenerateReplyAsync(businessId, message.ConversationId);
 
-        return Ok(new WidgetMessageResponse(message.Id, message.CreatedAt, aiReply));
+        return Ok(new WidgetMessageResponse(
+            message.Id, message.CreatedAt,
+            aiReply?.Content, aiReply?.Id, aiReply?.CreatedAt));
+    }
+
+    /// <summary>
+    /// Step 6C: customer-side delivery of Agent/Ai messages via minimal
+    /// polling — no SignalR/WebSockets, matching the approved design.
+    /// Never accepts a client-supplied ConversationId; the caller's
+    /// conversation is resolved exactly the way PostMessage above resolves
+    /// it (from the widget JWT's own BusinessId/WidgetId/VisitorSessionId
+    /// claims), so there is no parameter for a guessed/manipulated
+    /// conversation id to even target.
+    ///
+    /// Cursor semantics: forward keyset on (CreatedAt, Id), same convention
+    /// ConversationsController.List already established for its own
+    /// (backward) cursor. Supplying neither afterCreatedAt nor afterId
+    /// deliberately does NOT return conversation history — it's treated as
+    /// "anchor at the server's current time" (cursorCreatedAt defaults to
+    /// UtcNow, cursorId to Guid.Empty, the minimum for the tie-break), so a
+    /// first-ever poll returns nothing pre-existing and hands back a fresh
+    /// NextCursor the client can resume from. This is deliberate: Step 6B's
+    /// own decision to defer a general history-fetch endpoint stands —
+    /// polling exists to deliver what arrives AFTER a visitor's already-
+    /// known point (from their own localStorage transcript, if any), never
+    /// to backfill everything they missed. Supplying exactly one of the two
+    /// cursor fields is rejected as malformed (400) rather than guessed at.
+    ///
+    /// Only Ai and Agent messages are returned — never Customer (the widget
+    /// already renders its own sent messages optimistically; echoing them
+    /// back here would risk duplication for no benefit) and never
+    /// AuthorUserId/BusinessId/ConversationId (staff identity and tenant
+    /// internals stay server-side, same precedent Step 9's
+    /// ConversationMessageResponse already set).
+    /// </summary>
+    [HttpGet("messages")]
+    [Authorize(Policy = NivoraPolicies.Widget)]
+    [EnableRateLimiting("WidgetPoll")]
+    public async Task<IActionResult> PollMessages(
+        [FromQuery] DateTimeOffset? afterCreatedAt = null,
+        [FromQuery] Guid? afterId = null)
+    {
+        if (afterCreatedAt.HasValue != afterId.HasValue)
+        {
+            return BadRequest();
+        }
+
+        var cursorCreatedAt = afterCreatedAt ?? DateTimeOffset.UtcNow;
+        var cursorId = afterId ?? Guid.Empty;
+
+        var businessId = Guid.Parse(User.FindFirstValue(NivoraClaimTypes.BusinessId)!);
+        var widgetId = Guid.Parse(User.FindFirstValue(NivoraClaimTypes.WidgetId)!);
+        var visitorSessionId = User.FindFirstValue(NivoraClaimTypes.VisitorSessionId)!;
+
+        // Same resolution PostMessageAsync uses — IgnoreQueryFilters() +
+        // explicit BusinessId comparisons throughout, not relying on the
+        // ambient tenant query filter (same defensive posture
+        // WidgetConversationService's own doc comment explains).
+        var conversation = await db.Conversations
+            .IgnoreQueryFilters()
+            .Where(c => c.BusinessId == businessId
+                && c.WidgetId == widgetId
+                && c.VisitorSessionId == visitorSessionId
+                && c.Status == ConversationStatus.Open
+                && !c.IsAnonymized)
+            .OrderByDescending(c => c.CreatedAt)
+            .FirstOrDefaultAsync();
+
+        // No open conversation yet (visitor has never sent a message, or
+        // it's since closed) — a normal state, not an error.
+        if (conversation is null)
+        {
+            return Ok(new WidgetPollResponse([], null));
+        }
+
+        const int PageSize = 50;
+        var polled = await db.Messages
+            .IgnoreQueryFilters()
+            .Where(m => m.BusinessId == businessId
+                && m.ConversationId == conversation.Id
+                && (m.Role == MessageRole.Ai || m.Role == MessageRole.Agent)
+                && (m.CreatedAt > cursorCreatedAt || (m.CreatedAt == cursorCreatedAt && m.Id > cursorId)))
+            .OrderBy(m => m.CreatedAt)
+            .ThenBy(m => m.Id)
+            .Take(PageSize)
+            .Select(m => new WidgetPolledMessage(m.Id, m.Role.ToString(), m.Content, m.CreatedAt))
+            .ToListAsync();
+
+        // Always return a cursor, even for an empty page — either the last
+        // message actually returned, or (nothing new) an echo of whatever
+        // cursor this request effectively used, so the client always has a
+        // stable value for its next poll with no special-cased branch.
+        var nextCursor = polled.Count > 0
+            ? new WidgetMessageCursor(polled[^1].CreatedAt, polled[^1].Id)
+            : new WidgetMessageCursor(cursorCreatedAt, cursorId);
+
+        return Ok(new WidgetPollResponse(polled, nextCursor));
     }
 
     private static bool OriginIsAllowed(string origin, List<string> allowedDomains)

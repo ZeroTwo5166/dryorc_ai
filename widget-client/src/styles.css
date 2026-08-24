@@ -112,6 +112,17 @@
   border-bottom-left-radius: 2px;
 }
 
+/* Same side as AI (business's side of the conversation) but visually
+   distinct — signals "a person replied" without naming who. No identity
+   is ever rendered here, only the role. */
+.message-agent {
+  align-self: flex-start;
+  background: #eaf2ff;
+  color: #1a1a1a;
+  border-bottom-left-radius: 2px;
+  border-left: 3px solid #2f6fed;
+}
+
 .message-pending {
   opacity: 0.6;
 }

@@ -283,6 +283,22 @@ builder.Services.AddRateLimiter(options =>
             PermitLimit = 20,
             Window = TimeSpan.FromMinutes(1),
         }));
+
+    // Step 6C polling MVP. A separate policy from WidgetMessages, not a
+    // shared budget — polling is a background, ~5-second-interval loop
+    // while the widget is open, a different traffic shape from occasional
+    // message sends; sharing one limit would let a chatty poll loop starve
+    // a real send. 20/min is a placeholder matched loosely to the ~5s poll
+    // interval plus headroom for tab-visibility catch-up polls — like both
+    // limits above, not a tuned production value, expected to be revisited
+    // once real widget traffic/observability exists.
+    options.AddPolicy("WidgetPoll", httpContext => RateLimitPartition.GetFixedWindowLimiter(
+        partitionKey: httpContext.User.FindFirst(NivoraClaimTypes.VisitorSessionId)?.Value ?? "unauthenticated",
+        factory: _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 20,
+            Window = TimeSpan.FromMinutes(1),
+        }));
 });
 
 // Resend (https://resend.com) — transactional email for the account
