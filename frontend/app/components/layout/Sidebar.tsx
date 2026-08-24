@@ -53,7 +53,7 @@ const navSections: NavSection[] = [
     items: [
       { label: "Overview", icon: IconMonitor, href: "/home" },
       { label: "Inbox", icon: IconMail, href: "/conversations" },
-      { label: "Customers", icon: IconUserCheck, soon: true },
+      { label: "Customers", icon: IconUserCheck, href: "/customers" },
       { label: "Knowledge base", icon: IconWorkflow, href: "/knowledge" },
       { label: "Tickets", icon: IconMessageSquare, soon: true },
     ],

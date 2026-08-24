@@ -42,6 +42,9 @@ public static class AuditEventTypes
     public const string KnowledgeDocumentDeleted = "KnowledgeDocumentDeleted";
     public const string KnowledgeDocumentUpdated = "KnowledgeDocumentUpdated";
 
+    // Step 14 — identity linking
+    public const string IdentityLinked = "IdentityLinked";
+    public const string IdentityRevoked = "IdentityRevoked";
 
     // Extended logging (customer-level flag)
     public const string CustomerExtendedLoggingEnabled = "CustomerExtendedLoggingEnabled";

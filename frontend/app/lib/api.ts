@@ -458,3 +458,83 @@ export function updateKnowledgeDocument(id: string, body: UpdateKnowledgeDocumen
 export function deactivateKnowledgeDocument(id: string): Promise<null> {
   return api.delete(`/api/knowledge/${id}`);
 }
+
+// Talks to backend/Controllers/CustomersController.cs (Step 14).
+
+export type CustomerSummary = {
+  id: string;
+  businessId: string;
+  email: string | null;
+  name: string | null;
+};
+
+export type CustomerConversationSummary = {
+  id: string;
+  channel: string;
+  status: string;
+  handledBy: string;
+  lastMessageAt: string | null;
+  createdAt: string;
+};
+
+export type CustomerDetail = {
+  id: string;
+  businessId: string;
+  email: string | null;
+  name: string | null;
+  isAnonymized: boolean;
+  extendedLoggingEnabled: boolean;
+  createdAt: string;
+  recentConversations: CustomerConversationSummary[];
+};
+
+// Matches ExternalIdentity.Channel — same set Conversation.Channel uses
+// (ConversationChannels), not a separate list.
+export type IdentityChannel = "Website" | "Email";
+
+export type IdentityVerificationMethod = "SignedToken" | "Otp";
+
+export type ExternalIdentity = {
+  id: string;
+  channel: IdentityChannel;
+  verificationMethod: IdentityVerificationMethod;
+  externalUserId: string;
+  linkedAt: string;
+  expiresAt: string | null;
+  revokedAt: string | null;
+  revokedByUserId: string | null;
+  // Server-computed via ExternalIdentityExtensions.IsCurrentlyValid — never
+  // re-derive this from revokedAt/expiresAt client-side.
+  isCurrentlyValid: boolean;
+};
+
+export type LinkExternalIdentityRequest = {
+  channel: IdentityChannel;
+  verificationMethod: IdentityVerificationMethod;
+  externalUserId: string;
+  expiresAt?: string | null;
+};
+
+export function listCustomers(): Promise<CustomerSummary[]> {
+  return api.get("/api/customers");
+}
+
+export function getCustomer(id: string): Promise<CustomerDetail> {
+  return api.get(`/api/customers/${id}`);
+}
+
+export function listCustomerIdentities(customerId: string): Promise<ExternalIdentity[]> {
+  return api.get(`/api/customers/${customerId}/identities`);
+}
+
+export function linkCustomerIdentity(customerId: string, body: LinkExternalIdentityRequest): Promise<ExternalIdentity> {
+  return api.post(`/api/customers/${customerId}/identities`, body);
+}
+
+export function revokeCustomerIdentity(customerId: string, identityId: string): Promise<null> {
+  return api.post(`/api/customers/${customerId}/identities/${identityId}/revoke`);
+}
+
+export function setCustomerExtendedLogging(customerId: string, enabled: boolean): Promise<null> {
+  return api.put(`/api/customers/${customerId}/extended-logging`, { enabled });
+}
