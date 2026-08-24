@@ -26,8 +26,13 @@ public class Conversation : ITenantOwned
     public ConversationStatus Status { get; set; } = ConversationStatus.Open;
 
     /// <summary>
-    /// AI/human status shown in the Step 9 inbox. Defaults to Ai; Step 15's
-    /// human handoff flips this to Human.
+    /// AI/human status shown in the Step 9 inbox. Defaults to Ai. Flipped to
+    /// Human by the Step 9 staff-reply endpoint on a conversation's first
+    /// Agent message — while Human, ClaudeReplyService stops auto-replying
+    /// to that conversation's customer messages (see its own doc comment).
+    /// There is no reversal path back to Ai yet; that, plus a full
+    /// ConversationHandoff audit trail/reason codes/dashboard affordance,
+    /// is Step 15's own, larger scope.
     /// </summary>
     public HandledBy HandledBy { get; set; } = HandledBy.Ai;
 

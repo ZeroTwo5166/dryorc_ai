@@ -14,7 +14,9 @@ public interface IClaudeReplyService
     /// Generates a reply from the conversation's full message history and
     /// persists it as Message{Role=Ai}, updating Conversation.LastMessageAt
     /// in the same write. Returns the reply text, or null if the Claude
-    /// call failed — the customer's own message (already committed by the
+    /// call failed, or if the conversation is HandledBy.Human (Step 9: a
+    /// staff member has already replied — see Conversation.HandledBy's own
+    /// doc comment) — the customer's own message (already committed by the
     /// time this is called) is never affected either way.
     /// </summary>
     Task<string?> GenerateReplyAsync(Guid businessId, Guid conversationId, CancellationToken cancellationToken = default);
@@ -28,6 +30,12 @@ public interface IClaudeReplyService
 /// no tools/dispatch (Step 20, "not built"). Model is claude-sonnet-5 per
 /// NIVORA_DEVELOPMENT_PLAN_V2.md's own recorded stack decision, not a
 /// default picked here.
+///
+/// Step 9 added a narrow gate: a conversation with HandledBy == Human (set
+/// by the staff-reply endpoint on its first Agent message) never gets an
+/// automatic reply here — see Conversation.HandledBy's own doc comment.
+/// This is the full extent of Step 9's interaction with this service; no
+/// other behavior changed.
 ///
 /// Deliberately called AFTER the customer message's own transaction has
 /// already committed (see WidgetController.PostMessage) — same reasoning
@@ -58,6 +66,25 @@ public class ClaudeReplyService(
             return null;
         }
 
+        var conversation = await db.Conversations
+            .IgnoreQueryFilters()
+            .FirstOrDefaultAsync(c => c.Id == conversationId, cancellationToken);
+        if (conversation is null)
+        {
+            return null;
+        }
+
+        // Step 9: once a staff member has replied, HandledBy flips to Human
+        // and this conversation stops receiving automatic Claude replies —
+        // a human is now answering. See Conversation.HandledBy's own doc
+        // comment. Checked before any Claude/retrieval call is made, not
+        // just before persisting, so a Human-handled conversation never
+        // incurs the Voyage/Anthropic calls at all.
+        if (conversation.HandledBy == HandledBy.Human)
+        {
+            return null;
+        }
+
         var history = await db.Messages
             .IgnoreQueryFilters()
             .Where(m => m.BusinessId == businessId && m.ConversationId == conversationId)
@@ -71,9 +98,11 @@ public class ClaudeReplyService(
 
         // Customer -> User; both Ai and Agent map to Assistant (both are
         // "the business's side" of the conversation from Claude's turn-
-        // taking perspective — no Agent-authored messages can exist yet
-        // anyway, since no staff-reply UI is built, but the mapping is
-        // correct either way).
+        // taking perspective). Agent-authored messages can exist since Step
+        // 9, but by the time any exist on a conversation, HandledBy is
+        // already Human and the guard above already returned — so an Agent
+        // message is never actually seen by the history-mapping below in
+        // practice; the mapping is kept correct regardless.
         var messages = history
             .Select(m => new MessageParam
             {
@@ -216,9 +245,6 @@ public class ClaudeReplyService(
             }));
         }
 
-        var conversation = await db.Conversations
-            .IgnoreQueryFilters()
-            .FirstAsync(c => c.Id == conversationId, cancellationToken);
         conversation.LastMessageAt = now;
         conversation.UpdatedAt = now;
 

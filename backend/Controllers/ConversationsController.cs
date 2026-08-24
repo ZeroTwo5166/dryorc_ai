@@ -1,5 +1,8 @@
+using System.Security.Claims;
 using backend.Auth;
 using backend.Data;
+using backend.Enums;
+using backend.Models;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -30,10 +33,13 @@ public record ConversationListResponse(List<ConversationSummaryResponse> Convers
 
 public record ConversationMessageResponse(Guid Id, string Role, string Content, DateTimeOffset CreatedAt);
 
+public record CreateConversationMessageRequest(string Content);
+
 /// <summary>
 /// Backend verification/read surface for Steps 6-7, now also the Step 9
-/// Business Inbox read API. Same AnyStaff + SameTenant two-layer pattern
-/// CustomersController already established — nothing new invented here.
+/// Business Inbox read+reply API. Same AnyStaff + SameTenant two-layer
+/// pattern CustomersController already established — nothing new invented
+/// here.
 /// </summary>
 [ApiController]
 [Route("api/conversations")]
@@ -41,6 +47,17 @@ public record ConversationMessageResponse(Guid Id, string Role, string Content, 
 public class ConversationsController(AppDbContext db, IAuthorizationService authorizationService) : ControllerBase
 {
     private const int PreviewMaxLength = 120;
+
+    private Guid CurrentUserId
+    {
+        get
+        {
+            var raw = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            return Guid.TryParse(raw, out var id)
+                ? id
+                : throw new InvalidOperationException("Authenticated but no parsable user id claim — unreachable behind [Authorize].");
+        }
+    }
 
     /// <summary>
     /// Business Inbox, most-recently-active-first: ordered and paginated by
@@ -157,5 +174,73 @@ public class ConversationsController(AppDbContext db, IAuthorizationService auth
             .ToListAsync();
 
         return Ok(messages);
+    }
+
+    /// <summary>
+    /// Step 9 staff-reply composer. Persists a Message{Role=Agent,
+    /// AuthorUserId=CurrentUserId} and, on the conversation's first Agent
+    /// reply, flips HandledBy from Ai to Human in the same SaveChangesAsync
+    /// — see Conversation.HandledBy's own doc comment for what that flip
+    /// means downstream (ClaudeReplyService stops auto-replying while
+    /// Human). Setting HandledBy = Human unconditionally here is
+    /// deliberately idempotent: a second/third staff reply just re-assigns
+    /// the same value, no branch needed to detect "is this the first one."
+    ///
+    /// No customer-delivery mechanism exists yet (no SignalR/polling/widget
+    /// changes) — this message is persisted and dashboard-visible only, an
+    /// explicitly accepted Step 9 MVP limitation, not an oversight.
+    /// </summary>
+    [HttpPost("{id:guid}/messages")]
+    public async Task<IActionResult> CreateMessage(Guid id, [FromBody] CreateConversationMessageRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.Content))
+        {
+            return BadRequest();
+        }
+
+        var conversation = await db.Conversations.FirstOrDefaultAsync(c => c.Id == id);
+        if (conversation is null)
+        {
+            return NotFound();
+        }
+
+        // Layer 2, explicit — same SameTenant check Messages() above uses,
+        // not assumed redundant just because layer 1 already worked.
+        var authResult = await authorizationService.AuthorizeAsync(User, conversation, NivoraPolicies.SameTenant);
+        if (!authResult.Succeeded)
+        {
+            return NotFound();
+        }
+
+        // Defensive only — nothing in this codebase ever sets a conversation
+        // to Closed yet (closing/reopening is unbuilt), so this branch is
+        // currently unreachable in practice. Kept so the endpoint is already
+        // correct once a future step introduces closing, rather than
+        // silently allowing replies to a closed conversation.
+        if (conversation.Status == ConversationStatus.Closed)
+        {
+            return Conflict();
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var message = new Message
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = conversation.BusinessId,
+            ConversationId = conversation.Id,
+            Role = MessageRole.Agent,
+            Content = request.Content,
+            AuthorUserId = CurrentUserId,
+            CreatedAt = now,
+        };
+        db.Messages.Add(message);
+
+        conversation.LastMessageAt = now;
+        conversation.UpdatedAt = now;
+        conversation.HandledBy = HandledBy.Human;
+
+        await db.SaveChangesAsync();
+
+        return Ok(new ConversationMessageResponse(message.Id, message.Role.ToString(), message.Content, message.CreatedAt));
     }
 }

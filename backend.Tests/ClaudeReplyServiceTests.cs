@@ -454,6 +454,54 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         await AssertNoAiMessageOrLastMessageAtChangeAsync(db, conversation.Id);
     }
 
+    // ── Step 9: HandledBy gate ───────────────────────────────────────
+
+    [Fact]
+    public async Task GenerateReplyAsync_HandledByHuman_SkipsClaudeEntirely_ReturnsNull()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+
+        var conversationEntity = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        conversationEntity.HandledBy = HandledBy.Human;
+        await db.SaveChangesAsync();
+
+        var fake = new FakeMessageService { ReplyText = "Should never be sent." };
+        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), NullLogger<ClaudeReplyService>.Instance);
+
+        var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.Null(reply);
+        Assert.Equal(0, fake.CallCount); // Claude is never called at all, not called-then-discarded
+        await AssertNoAiMessageOrLastMessageAtChangeAsync(db, conversation.Id);
+    }
+
+    [Fact]
+    public async Task GenerateReplyAsync_HandledByAi_RetainsExistingBehavior_ClaudeIsCalled()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+
+        // HandledBy defaults to Ai via the model's own field initializer —
+        // asserted explicitly here so this test documents the contrast with
+        // the Human-gated test above, not just relying on an implicit default.
+        var conversationEntity = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        Assert.Equal(HandledBy.Ai, conversationEntity.HandledBy);
+
+        var fake = new FakeMessageService { ReplyText = "Normal AI reply." };
+        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), NullLogger<ClaudeReplyService>.Instance);
+
+        var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.Equal("Normal AI reply.", reply);
+        Assert.Equal(1, fake.CallCount);
+        var aiMessage = await db.Messages.IgnoreQueryFilters()
+            .SingleAsync(m => m.ConversationId == conversation.Id && m.Role == MessageRole.Ai);
+        Assert.Equal("Normal AI reply.", aiMessage.Content);
+    }
+
     private static async Task AssertNoAiMessageOrLastMessageAtChangeAsync(AppDbContext db, Guid conversationId)
     {
         var messageCount = await db.Messages.IgnoreQueryFilters().CountAsync(m => m.ConversationId == conversationId);

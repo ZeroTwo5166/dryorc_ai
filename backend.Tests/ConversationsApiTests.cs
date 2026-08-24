@@ -114,6 +114,30 @@ public class ConversationsApiTests : IAsyncLifetime
         return request;
     }
 
+    private static HttpRequestMessage WithBody<T>(HttpRequestMessage request, T body)
+    {
+        request.Content = JsonContent.Create(body);
+        return request;
+    }
+
+    /// <summary>Same as CreateBusinessAndLoginAsync but also returns the staff user's own id, needed to assert Message.AuthorUserId.</summary>
+    private async Task<(Guid BusinessId, Guid UserId, string Cookie)> CreateBusinessAndLoginWithUserIdAsync(
+        HttpClient anonClient, HttpClient staffClient, string businessName)
+    {
+        var email = $"staff-{Guid.NewGuid():N}@example.com";
+        var (registerResponse, registerBody) = await RegisterAsync(anonClient, businessName, email);
+        Assert.Equal(HttpStatusCode.OK, registerResponse.StatusCode);
+        Assert.NotNull(registerBody);
+        _businessIdsToClean.Add(registerBody!.BusinessId);
+        await ConfirmEmailAsync(anonClient, registerBody.UserId);
+
+        var (loginResponse, _, cookie) = await LoginAsync(staffClient, email);
+        Assert.Equal(HttpStatusCode.OK, loginResponse.StatusCode);
+        Assert.NotNull(cookie);
+
+        return (registerBody.BusinessId, registerBody.UserId, cookie!);
+    }
+
     private static string PageUrl(int take, ConversationCursor cursor) =>
         $"/api/conversations?take={take}&beforeActivityAt={Uri.EscapeDataString(cursor.ActivityAt.ToString("O"))}&beforeId={cursor.Id}";
 
@@ -594,5 +618,217 @@ public class ConversationsApiTests : IAsyncLifetime
         var freshBody = await freshRequest.Content.ReadFromJsonAsync<ConversationListResponse>();
         Assert.NotNull(freshBody);
         Assert.Equal(new[] { aboutToBecomeActiveId }, freshBody!.Conversations.Select(c => c.Id));
+    }
+
+    // ── Step 9: staff-reply composer ──────────────────────────────────
+
+    [Fact]
+    public async Task CreateMessage_AuthorizedStaff_PersistsAgentMessage_WithCorrectRoleAndAuthor()
+    {
+        using var anonClient = NewClient();
+        using var staffClient = NewClient();
+        var (businessId, userId, cookie) = await CreateBusinessAndLoginWithUserIdAsync(anonClient, staffClient, "Staff Reply Business");
+
+        Guid conversationId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            conversationId = await SeedConversationAsync(db, businessId, widgetId, DateTimeOffset.UtcNow, null);
+        }
+
+        var response = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("Thanks for reaching out — let me take a look.")));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<ConversationMessageResponse>();
+        Assert.NotNull(body);
+        Assert.Equal("Agent", body!.Role);
+        Assert.Equal("Thanks for reaching out — let me take a look.", body.Content);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var message = await verifyDb.Messages.IgnoreQueryFilters().SingleAsync(m => m.Id == body.Id);
+        Assert.Equal(MessageRole.Agent, message.Role);
+        Assert.Equal(userId, message.AuthorUserId);
+        Assert.Equal(conversationId, message.ConversationId);
+        Assert.Equal(businessId, message.BusinessId);
+    }
+
+    [Fact]
+    public async Task CreateMessage_BlankContent_ReturnsBadRequest()
+    {
+        using var anonClient = NewClient();
+        using var staffClient = NewClient();
+        var (businessId, cookie) = await CreateBusinessAndLoginAsync(anonClient, staffClient, "Staff Reply Blank Business");
+
+        Guid conversationId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            conversationId = await SeedConversationAsync(db, businessId, widgetId, DateTimeOffset.UtcNow, null);
+        }
+
+        var response = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("   ")));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task CreateMessage_Unauthenticated_ReturnsUnauthorized()
+    {
+        using var anonClient = NewClient();
+
+        var response = await anonClient.PostAsJsonAsync(
+            $"/api/conversations/{Guid.NewGuid()}/messages",
+            new CreateConversationMessageRequest("Hello"));
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task CreateMessage_CrossTenantConversation_ReturnsNotFound()
+    {
+        using var anonClientA = NewClient();
+        using var staffClientA = NewClient();
+        var (businessIdA, _) = await CreateBusinessAndLoginAsync(anonClientA, staffClientA, "Staff Reply Isolation Business A");
+
+        using var anonClientB = NewClient();
+        using var staffClientB = NewClient();
+        var (_, cookieB) = await CreateBusinessAndLoginAsync(anonClientB, staffClientB, "Staff Reply Isolation Business B");
+
+        Guid conversationIdA;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var widgetId = await SeedWidgetAsync(db, businessIdA);
+            conversationIdA = await SeedConversationAsync(db, businessIdA, widgetId, DateTimeOffset.UtcNow, null);
+        }
+
+        // Business B's staff attempting to reply to Business A's conversation
+        // id must not succeed — proves the endpoint can't be used for
+        // cross-tenant access merely by guessing/enumerating a conversationId.
+        var response = await staffClientB.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationIdA}/messages", cookieB),
+            new CreateConversationMessageRequest("Should never be accepted.")));
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var messageCount = await verifyDb.Messages.IgnoreQueryFilters().CountAsync(m => m.ConversationId == conversationIdA);
+        Assert.Equal(0, messageCount);
+    }
+
+    [Fact]
+    public async Task CreateMessage_ClosedConversation_ReturnsConflict()
+    {
+        using var anonClient = NewClient();
+        using var staffClient = NewClient();
+        var (businessId, cookie) = await CreateBusinessAndLoginAsync(anonClient, staffClient, "Staff Reply Closed Business");
+
+        Guid conversationId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            conversationId = await SeedConversationAsync(db, businessId, widgetId, DateTimeOffset.UtcNow, null);
+
+            var conversation = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversationId);
+            conversation.Status = ConversationStatus.Closed;
+            await db.SaveChangesAsync();
+        }
+
+        var response = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("Reopening attempt.")));
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var messageCount = await verifyDb.Messages.IgnoreQueryFilters().CountAsync(m => m.ConversationId == conversationId);
+        Assert.Equal(0, messageCount);
+        var conversation2 = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversationId);
+        Assert.Equal(HandledBy.Ai, conversation2.HandledBy); // rejected before any mutation, HandledBy untouched
+    }
+
+    [Fact]
+    public async Task CreateMessage_FirstAgentReply_ChangesHandledByFromAiToHuman()
+    {
+        using var anonClient = NewClient();
+        using var staffClient = NewClient();
+        var (businessId, cookie) = await CreateBusinessAndLoginAsync(anonClient, staffClient, "Staff Reply HandledBy Business");
+
+        Guid conversationId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            conversationId = await SeedConversationAsync(db, businessId, widgetId, DateTimeOffset.UtcNow, null);
+
+            var conversationBefore = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversationId);
+            Assert.Equal(HandledBy.Ai, conversationBefore.HandledBy);
+        }
+
+        var firstReply = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("First reply.")));
+        Assert.Equal(HttpStatusCode.OK, firstReply.StatusCode);
+
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var conversation = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversationId);
+            Assert.Equal(HandledBy.Human, conversation.HandledBy);
+        }
+
+        // A second reply is idempotent — no error, HandledBy simply stays Human.
+        var secondReply = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("Second reply.")));
+        Assert.Equal(HttpStatusCode.OK, secondReply.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var finalConversation = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversationId);
+        Assert.Equal(HandledBy.Human, finalConversation.HandledBy);
+        var messageCount = await verifyDb.Messages.IgnoreQueryFilters().CountAsync(m => m.ConversationId == conversationId);
+        Assert.Equal(2, messageCount); // exactly the two replies just sent, no duplicates
+    }
+
+    [Fact]
+    public async Task CreateMessage_AgentMessage_AppearsInExistingMessagesEndpoint_NoDuplicates()
+    {
+        using var anonClient = NewClient();
+        using var staffClient = NewClient();
+        var (businessId, cookie) = await CreateBusinessAndLoginAsync(anonClient, staffClient, "Staff Reply Visibility Business");
+
+        Guid conversationId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            conversationId = await SeedConversationAsync(db, businessId, widgetId, DateTimeOffset.UtcNow, null);
+            await SeedMessageAsync(db, businessId, conversationId, MessageRole.Customer, "Is my order shipped?", DateTimeOffset.UtcNow);
+        }
+
+        var reply = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("Yes, it shipped yesterday!")));
+        Assert.Equal(HttpStatusCode.OK, reply.StatusCode);
+
+        var messagesResponse = await staffClient.SendAsync(Authed(HttpMethod.Get, $"/api/conversations/{conversationId}/messages", cookie));
+        Assert.Equal(HttpStatusCode.OK, messagesResponse.StatusCode);
+        var messages = await messagesResponse.Content.ReadFromJsonAsync<List<ConversationMessageResponse>>();
+        Assert.NotNull(messages);
+        Assert.Equal(2, messages!.Count);
+        Assert.Equal("Customer", messages[0].Role);
+        Assert.Equal("Agent", messages[1].Role);
+        Assert.Equal("Yes, it shipped yesterday!", messages[1].Content);
     }
 }

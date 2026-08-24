@@ -385,6 +385,14 @@ export function getConversationMessages(id: string): Promise<ConversationMessage
   return api.get(`/api/conversations/${id}/messages`);
 }
 
+// Step 9 staff-reply composer. Backend derives the author/business from the
+// authenticated staff cookie — there is no field here for either, matching
+// the same server-derives-identity convention as the widget's own message
+// endpoint.
+export function createConversationMessage(id: string, content: string): Promise<ConversationMessage> {
+  return api.post(`/api/conversations/${id}/messages`, { content });
+}
+
 // Talks to backend/Controllers/KnowledgeDocumentsController.cs.
 
 export type KnowledgeDocumentType = "Faq" | "Policy" | "Product" | "Document";

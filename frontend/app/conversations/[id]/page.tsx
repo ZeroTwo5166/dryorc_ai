@@ -1,17 +1,20 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { DashboardShell } from "../../components/layout/DashboardShell";
+import { FormError } from "../../components/auth/FormField";
 import { IconArrowRight, IconMessageSquare } from "../../components/landing/icons";
 import { useAuth } from "../../lib/auth-context";
 import { formatRelativeTime } from "../../lib/relative-time";
-import { getConversationMessages, type ConversationMessage } from "../../lib/api";
+import { ApiError, createConversationMessage, getConversationMessages, type ConversationMessage } from "../../lib/api";
 
-// Read-only thread view — no reply composer, no staff-reply/agent-message
-// functionality. Step 9 scope is limited to viewing what's already there;
-// replying is a separate, later, explicitly-approved step.
+// Step 9: read-only thread view plus a minimal staff-reply composer.
+// Customer delivery is explicitly out of scope here — a sent Agent message
+// is persisted and shows up in this dashboard view, but the customer-facing
+// widget has no way to receive it yet (no polling/push exists). See
+// ConversationsController.CreateMessage's own doc comment.
 export default function ConversationDetailPage() {
   const params = useParams<{ id: string }>();
   const router = useRouter();
@@ -20,6 +23,10 @@ export default function ConversationDetailPage() {
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
 
   useEffect(() => {
     if (status === "ready" && !user) {
@@ -48,6 +55,24 @@ export default function ConversationDetailPage() {
       cancelled = true;
     };
   }, [user, params.id]);
+
+  async function handleSend(e: FormEvent) {
+    e.preventDefault();
+    const content = draft.trim();
+    if (!content || sending) return; // blank-content guard + double-submit guard
+
+    setSending(true);
+    setSendError(null);
+    try {
+      const created = await createConversationMessage(params.id, content);
+      setMessages((prev) => [...prev, created]);
+      setDraft("");
+    } catch (err) {
+      setSendError(err instanceof ApiError ? err.message : "Something went wrong. Please try again.");
+    } finally {
+      setSending(false);
+    }
+  }
 
   if (status === "loading" || !user) {
     return (
@@ -121,6 +146,28 @@ export default function ConversationDetailPage() {
             })}
           </div>
         )}
+
+        {!loading && !error && (
+          <form onSubmit={handleSend} className="mt-6 flex items-center gap-2">
+            <input
+              type="text"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              disabled={sending}
+              placeholder="Reply to this conversation…"
+              aria-label="Reply message"
+              className="w-full rounded-xl border border-border bg-card px-3.5 py-2.5 text-sm text-foreground shadow-sm outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-accent focus:ring-2 focus:ring-accent/20 disabled:opacity-60"
+            />
+            <button
+              type="submit"
+              disabled={sending || !draft.trim()}
+              className="shrink-0 cursor-pointer rounded-xl bg-accent px-4 py-2.5 text-sm font-medium text-accent-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {sending ? "Sending…" : "Send"}
+            </button>
+          </form>
+        )}
+        {sendError && <div className="mt-2"><FormError message={sendError} /></div>}
       </main>
     </DashboardShell>
   );
