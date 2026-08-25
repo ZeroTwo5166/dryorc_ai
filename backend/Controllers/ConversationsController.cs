@@ -54,7 +54,7 @@ public record CreateConversationMessageRequest(string Content);
 [ApiController]
 [Route("api/conversations")]
 [Authorize(Policy = NivoraPolicies.AnyStaff)]
-public class ConversationsController(AppDbContext db, IAuthorizationService authorizationService) : ControllerBase
+public class ConversationsController(AppDbContext db, IAuthorizationService authorizationService, ITicketSlaService ticketSlaService) : ControllerBase
 {
     private const int PreviewMaxLength = 120;
 
@@ -330,6 +330,30 @@ public class ConversationsController(AppDbContext db, IAuthorizationService auth
                     ActorId = CurrentUserId,
                     CreatedAt = now,
                 });
+            }
+
+            // Step 16: this conversation's active (non-Resolved) ticket, if
+            // any, gets its FirstRespondedAt set from this Agent message —
+            // never from an AI-generated one (this endpoint only ever
+            // creates Role == Agent messages, confirmed above). The DB's
+            // IX_Tickets_ActiveTicketPerConversation partial unique index
+            // guarantees at most one such ticket exists, so this query is
+            // never ambiguous. Query runs inside the lock already held for
+            // this conversation, so it's inherently fresh — no ReloadAsync
+            // concern applies, unlike `conversation` above, since this is
+            // the first read of this Ticket in this request, not a reuse of
+            // a pre-lock value. TicketSlaService.ComputeFirstRespondedAt is
+            // a pure function: it returns the ticket's own current value
+            // unchanged if already set (never overwritten) or null if the
+            // message doesn't qualify, so assigning its result back is
+            // always safe to call unconditionally. Added to the same change
+            // tracker as everything else above — flushed by the single
+            // SaveChangesAsync() below, no second one introduced.
+            var activeTicket = await db.Tickets
+                .FirstOrDefaultAsync(t => t.ConversationId == conversation.Id && t.Status != TicketStatus.Resolved);
+            if (activeTicket is not null)
+            {
+                activeTicket.FirstRespondedAt = ticketSlaService.ComputeFirstRespondedAt(activeTicket, message);
             }
 
             await db.SaveChangesAsync();

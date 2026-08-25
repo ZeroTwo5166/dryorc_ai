@@ -538,3 +538,90 @@ export function revokeCustomerIdentity(customerId: string, identityId: string): 
 export function setCustomerExtendedLogging(customerId: string, enabled: boolean): Promise<null> {
   return api.put(`/api/customers/${customerId}/extended-logging`, { enabled });
 }
+
+// Talks to backend/Controllers/TicketsController.cs (Step 16).
+
+export type TicketStatus = "Open" | "InProgress" | "Resolved" | "Reopened";
+export type TicketPriority = "Low" | "Medium" | "High" | "Urgent";
+export type TicketPriorityReason = "RefundDispute" | "ManualEscalation" | "RefundLimitReached";
+
+export type Ticket = {
+  id: string;
+  customerId: string;
+  conversationId: string | null;
+  status: TicketStatus;
+  priority: TicketPriority;
+  priorityReason: TicketPriorityReason;
+  channel: string;
+  claimedByUserId: string | null;
+  claimedAt: string | null;
+  resolvedByUserId: string | null;
+  resolvedAt: string | null;
+  firstRespondedAt: string | null;
+  slaDeadline: string | null;
+  summary: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+// Ticket.CreatedAt never mutates after insert (unlike Conversation's
+// LastMessageAt), so the cursor is named createdAt directly — not
+// activityAt, which specifically signals a mutable sort key.
+export type TicketCursor = {
+  createdAt: string;
+  id: string;
+};
+
+export type TicketListResponse = {
+  tickets: Ticket[];
+  nextCursor: TicketCursor | null;
+};
+
+export type CreateTicketRequest = {
+  customerId: string;
+  conversationId?: string | null;
+  channel?: string | null;
+  priority: TicketPriority;
+  priorityReason: TicketPriorityReason;
+  summary?: string | null;
+};
+
+export function listTickets(params?: { status?: TicketStatus; take?: number; before?: TicketCursor }): Promise<TicketListResponse> {
+  const query = new URLSearchParams();
+  if (params?.status) query.set("status", params.status);
+  if (params?.take) query.set("take", String(params.take));
+  if (params?.before) {
+    query.set("beforeCreatedAt", params.before.createdAt);
+    query.set("beforeId", params.before.id);
+  }
+  const qs = query.toString();
+  return api.get(`/api/tickets${qs ? `?${qs}` : ""}`);
+}
+
+export function getTicket(id: string): Promise<Ticket> {
+  return api.get(`/api/tickets/${id}`);
+}
+
+export function createTicket(body: CreateTicketRequest): Promise<Ticket> {
+  return api.post("/api/tickets", body);
+}
+
+export function claimTicket(id: string): Promise<null> {
+  return api.post(`/api/tickets/${id}/claim`);
+}
+
+export function unclaimTicket(id: string): Promise<null> {
+  return api.post(`/api/tickets/${id}/unclaim`);
+}
+
+export function resolveTicket(id: string): Promise<null> {
+  return api.post(`/api/tickets/${id}/resolve`);
+}
+
+export function reopenTicket(id: string): Promise<null> {
+  return api.post(`/api/tickets/${id}/reopen`);
+}
+
+export function updateTicketPriority(id: string, priority: TicketPriority): Promise<null> {
+  return api.put(`/api/tickets/${id}/priority`, { priority });
+}

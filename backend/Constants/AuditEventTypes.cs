@@ -37,6 +37,11 @@ public static class AuditEventTypes
     // Conversation / ticket
     public const string ConversationModeOverridden = "ConversationModeOverridden";
     public const string TicketReopened = "TicketReopened";
+    public const string TicketCreated = "TicketCreated";
+    public const string TicketClaimed = "TicketClaimed";
+    public const string TicketUnclaimed = "TicketUnclaimed";
+    public const string TicketResolved = "TicketResolved";
+    public const string TicketPriorityChanged = "TicketPriorityChanged";
 
     // Knowledge base
     public const string KnowledgeDocumentDeleted = "KnowledgeDocumentDeleted";

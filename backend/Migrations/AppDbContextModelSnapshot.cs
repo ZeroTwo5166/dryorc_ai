@@ -1419,7 +1419,10 @@ namespace backend.Migrations
 
                     b.HasIndex("ClaimedByUserId");
 
-                    b.HasIndex("ConversationId");
+                    b.HasIndex("ConversationId")
+                        .IsUnique()
+                        .HasDatabaseName("IX_Tickets_ActiveTicketPerConversation")
+                        .HasFilter("\"ConversationId\" IS NOT NULL AND \"Status\" <> 'Resolved'");
 
                     b.HasIndex("CustomerId");
 

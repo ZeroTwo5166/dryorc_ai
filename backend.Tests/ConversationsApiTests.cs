@@ -62,11 +62,16 @@ public class ConversationsApiTests : IAsyncLifetime
 
             // Must run before Businesses is deleted — same order NotificationDataTests already establishes.
             // ConversationHandoffs (Step 15) has the same Restrict-on-Business FK shape.
+            // Tickets (Step 16) is Restrict-on-Business AND Restrict-on-Customer, so it must
+            // run before both Businesses and Customers below.
+            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AuditLogs\" WHERE \"BusinessId\" = ANY({ids})");
+            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Tickets\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"ConversationHandoffs\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"NotificationRecipients\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Notifications\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Messages\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({ids})");
+            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Customers\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Widgets\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AspNetUserRoles\" WHERE \"UserId\" IN (SELECT \"Id\" FROM \"AspNetUsers\" WHERE \"BusinessId\" = ANY({ids}))");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AspNetUsers\" WHERE \"BusinessId\" = ANY({ids})");
@@ -1905,5 +1910,275 @@ public class ConversationsApiTests : IAsyncLifetime
         var totalCustomerRepliedCount = await verifyDb.Notifications.IgnoreQueryFilters()
             .CountAsync(n => n.ConversationId == conversationId && n.Type == NotificationTypes.CustomerReplied);
         Assert.True(totalCustomerRepliedCount is 0 or 1);
+    }
+
+    // ── Step 16: FirstRespondedAt integration ────────────────────────────
+
+    private static async Task<Guid> SeedTicketForFirstRespondedAsync(
+        AppDbContext db, Guid businessId, Guid conversationId, TicketStatus status, DateTimeOffset createdAt)
+    {
+        var customer = new Customer
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            Email = "ticket-customer@example.com",
+            Name = "Ticket Customer",
+            CreatedAt = createdAt,
+            UpdatedAt = createdAt,
+        };
+        db.Customers.Add(customer);
+
+        var ticket = new Ticket
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            CustomerId = customer.Id,
+            ConversationId = conversationId,
+            Status = status,
+            Priority = TicketPriority.Low,
+            PriorityReason = TicketPriorityReasons.ManualEscalation,
+            Channel = "Website",
+            CreatedAt = createdAt,
+            UpdatedAt = createdAt,
+        };
+        db.Tickets.Add(ticket);
+        await db.SaveChangesAsync();
+        return ticket.Id;
+    }
+
+    [Fact]
+    public async Task CreateMessage_FirstAgentReply_SetsFirstRespondedAt_OnOpenTicket()
+    {
+        using var anonClient = NewClient();
+        using var staffClient = NewClient();
+        var (businessId, cookie) = await CreateBusinessAndLoginAsync(anonClient, staffClient, "FirstResponded Business");
+
+        Guid conversationId, ticketId;
+        var ticketCreatedAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            conversationId = await SeedConversationAsync(db, businessId, widgetId, ticketCreatedAt, ticketCreatedAt);
+            ticketId = await SeedTicketForFirstRespondedAsync(db, businessId, conversationId, TicketStatus.Open, ticketCreatedAt);
+        }
+
+        var reply = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("First human response.")));
+        Assert.Equal(HttpStatusCode.OK, reply.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var ticket = await verifyDb.Tickets.IgnoreQueryFilters().SingleAsync(t => t.Id == ticketId);
+        Assert.NotNull(ticket.FirstRespondedAt);
+        Assert.True(ticket.FirstRespondedAt >= ticket.CreatedAt);
+    }
+
+    [Fact]
+    public async Task CreateMessage_SecondAgentReply_DoesNotReplaceAlreadySetFirstRespondedAt()
+    {
+        using var anonClient = NewClient();
+        using var staffClient = NewClient();
+        var (businessId, cookie) = await CreateBusinessAndLoginAsync(anonClient, staffClient, "FirstResponded Second Reply Business");
+
+        Guid conversationId, ticketId;
+        var ticketCreatedAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            conversationId = await SeedConversationAsync(db, businessId, widgetId, ticketCreatedAt, ticketCreatedAt);
+            ticketId = await SeedTicketForFirstRespondedAsync(db, businessId, conversationId, TicketStatus.Open, ticketCreatedAt);
+        }
+
+        var first = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("First human response.")));
+        Assert.Equal(HttpStatusCode.OK, first.StatusCode);
+
+        DateTimeOffset? firstRespondedAtAfterFirstReply;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            firstRespondedAtAfterFirstReply = await db.Tickets.IgnoreQueryFilters()
+                .Where(t => t.Id == ticketId).Select(t => t.FirstRespondedAt).SingleAsync();
+        }
+        Assert.NotNull(firstRespondedAtAfterFirstReply);
+
+        var second = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("Second human response.")));
+        Assert.Equal(HttpStatusCode.OK, second.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var ticket = await verifyDb.Tickets.IgnoreQueryFilters().SingleAsync(t => t.Id == ticketId);
+        Assert.Equal(firstRespondedAtAfterFirstReply, ticket.FirstRespondedAt); // unchanged by the second reply
+    }
+
+    [Fact]
+    public async Task CreateMessage_ResolvedTicket_IsIgnored_FirstRespondedAtNotSet()
+    {
+        using var anonClient = NewClient();
+        using var staffClient = NewClient();
+        var (businessId, cookie) = await CreateBusinessAndLoginAsync(anonClient, staffClient, "FirstResponded Resolved Ticket Business");
+
+        Guid conversationId, ticketId;
+        var ticketCreatedAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            conversationId = await SeedConversationAsync(db, businessId, widgetId, ticketCreatedAt, ticketCreatedAt);
+            // Already Resolved — must be ignored by the FirstRespondedAt
+            // lookup (Status != Resolved), same as it's excluded from the
+            // active-ticket-per-conversation invariant.
+            ticketId = await SeedTicketForFirstRespondedAsync(db, businessId, conversationId, TicketStatus.Resolved, ticketCreatedAt);
+        }
+
+        var reply = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("Reply after resolution.")));
+        Assert.Equal(HttpStatusCode.OK, reply.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var ticket = await verifyDb.Tickets.IgnoreQueryFilters().SingleAsync(t => t.Id == ticketId);
+        Assert.Null(ticket.FirstRespondedAt);
+    }
+
+    [Fact]
+    public async Task CreateMessage_NoActiveTicket_DoesNotThrow_NoTicketAffected()
+    {
+        using var anonClient = NewClient();
+        using var staffClient = NewClient();
+        var (businessId, cookie) = await CreateBusinessAndLoginAsync(anonClient, staffClient, "FirstResponded No Ticket Business");
+
+        Guid conversationId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            conversationId = await SeedConversationAsync(db, businessId, widgetId, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        }
+
+        var reply = await staffClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationId}/messages", cookie),
+            new CreateConversationMessageRequest("No ticket exists for this conversation.")));
+        Assert.Equal(HttpStatusCode.OK, reply.StatusCode); // no exception from the missing-ticket lookup
+    }
+
+    /// <summary>
+    /// AI-generated replies must never set FirstRespondedAt (the single
+    /// most important non-obvious rule in the Ticket schema, per
+    /// NIVORA_SCHEMA_AND_LOGIC_REFERENCE.md's own wording) — proven here
+    /// through the real widget → ClaudeReplyService pipeline (not by
+    /// seeding an Ai-role message directly, which would bypass the code
+    /// path entirely), confirming ClaudeReplyService's own message-
+    /// creation path — independently verified to contain zero Ticket
+    /// references anywhere — never touches this ticket.
+    /// </summary>
+    [Fact]
+    public async Task WidgetAiReply_NeverSetsFirstRespondedAt()
+    {
+        using var anonClient = NewClient();
+        using var staffClient = NewClient();
+        var (businessId, cookie) = await CreateBusinessAndLoginAsync(anonClient, staffClient, "FirstResponded AI Reply Business");
+
+        var visitorSessionId = Guid.NewGuid().ToString("N");
+        Widget widget;
+        Guid conversationId, ticketId;
+        var ticketCreatedAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            widget = await SeedWidgetWithPublicKeyAsync(db, businessId);
+
+            // Built directly (not via SeedConversationAsync, which has no
+            // VisitorSessionId parameter) so WidgetConversationService's
+            // lazy-conversation-creation finds this existing, still-Open,
+            // still-Ai-handled conversation for this exact
+            // (BusinessId, WidgetId, VisitorSessionId) tuple instead of
+            // creating a fresh one this test couldn't attach a Ticket to
+            // in advance.
+            var conversation = new Conversation
+            {
+                Id = Guid.NewGuid(),
+                BusinessId = businessId,
+                WidgetId = widget.Id,
+                VisitorSessionId = visitorSessionId,
+                Channel = "Website",
+                Status = ConversationStatus.Open,
+                HandledBy = HandledBy.Ai,
+                CreatedAt = ticketCreatedAt,
+                UpdatedAt = ticketCreatedAt,
+            };
+            db.Conversations.Add(conversation);
+            await db.SaveChangesAsync();
+            conversationId = conversation.Id;
+
+            ticketId = await SeedTicketForFirstRespondedAsync(db, businessId, conversationId, TicketStatus.Open, ticketCreatedAt);
+        }
+
+        using var widgetClient = NewClient();
+        var (token, _) = await InitWidgetAsync(widgetClient, widget.PublicKey, visitorSessionId);
+
+        var response = await widgetClient.SendAsync(WithBody(
+            WidgetBearer(HttpMethod.Post, "/api/widget/messages", token),
+            new PostWidgetMessageRequest("Customer message that will get an AI reply")));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        // Confirm an Ai-role message really was persisted for this
+        // conversation — otherwise this test would trivially, vacuously
+        // pass without ever exercising the AI reply path at all.
+        var hasAiMessage = await verifyDb.Messages.IgnoreQueryFilters()
+            .AnyAsync(m => m.ConversationId == conversationId && m.Role == MessageRole.Ai);
+        Assert.True(hasAiMessage, "Expected the fake AI reply to have been persisted — otherwise this test proves nothing.");
+
+        var ticket = await verifyDb.Tickets.IgnoreQueryFilters().SingleAsync(t => t.Id == ticketId);
+        Assert.Null(ticket.FirstRespondedAt);
+    }
+
+    [Fact]
+    public async Task CreateMessage_FirstAgentReply_TenantIsolation_OnlySameTenantTicketAffected()
+    {
+        using var anonClientA = NewClient();
+        using var staffClientA = NewClient();
+        var (businessIdA, cookieA) = await CreateBusinessAndLoginAsync(anonClientA, staffClientA, "FirstResponded Tenant A");
+
+        using var anonClientB = NewClient();
+        using var staffClientB = NewClient();
+        var (businessIdB, cookieB) = await CreateBusinessAndLoginAsync(anonClientB, staffClientB, "FirstResponded Tenant B");
+
+        Guid conversationIdA, ticketIdA, conversationIdB, ticketIdB;
+        var createdAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var widgetIdA = await SeedWidgetAsync(db, businessIdA);
+            conversationIdA = await SeedConversationAsync(db, businessIdA, widgetIdA, createdAt, createdAt);
+            ticketIdA = await SeedTicketForFirstRespondedAsync(db, businessIdA, conversationIdA, TicketStatus.Open, createdAt);
+
+            var widgetIdB = await SeedWidgetAsync(db, businessIdB);
+            conversationIdB = await SeedConversationAsync(db, businessIdB, widgetIdB, createdAt, createdAt);
+            ticketIdB = await SeedTicketForFirstRespondedAsync(db, businessIdB, conversationIdB, TicketStatus.Open, createdAt);
+        }
+
+        var reply = await staffClientA.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/conversations/{conversationIdA}/messages", cookieA),
+            new CreateConversationMessageRequest("Business A's own reply.")));
+        Assert.Equal(HttpStatusCode.OK, reply.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var ticketA = await verifyDb.Tickets.IgnoreQueryFilters().SingleAsync(t => t.Id == ticketIdA);
+        Assert.NotNull(ticketA.FirstRespondedAt);
+
+        var ticketB = await verifyDb.Tickets.IgnoreQueryFilters().SingleAsync(t => t.Id == ticketIdB);
+        Assert.Null(ticketB.FirstRespondedAt); // Business B's ticket must never be touched by Business A's reply
     }
 }

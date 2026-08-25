@@ -55,7 +55,7 @@ const navSections: NavSection[] = [
       { label: "Inbox", icon: IconMail, href: "/conversations" },
       { label: "Customers", icon: IconUserCheck, href: "/customers" },
       { label: "Knowledge base", icon: IconWorkflow, href: "/knowledge" },
-      { label: "Tickets", icon: IconMessageSquare, soon: true },
+      { label: "Tickets", icon: IconMessageSquare, href: "/tickets" },
     ],
   },
   {

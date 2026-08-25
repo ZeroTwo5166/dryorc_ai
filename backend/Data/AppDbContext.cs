@@ -392,6 +392,20 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
             t.HasIndex(x => new { x.BusinessId, x.ClaimedByUserId });
             t.HasIndex(x => x.ResolvedByUserId);
 
+            // Step 16: at most one non-Resolved ticket per conversation.
+            // NULLs are already exempt from uniqueness under standard SQL
+            // semantics (ConversationId IS NULL rows never conflict with
+            // each other), so conversationless tickets coexist freely
+            // without special-casing — the explicit "IS NOT NULL" clause
+            // below is included anyway to match Integration's own
+            // (Platform, ExternalAccountIdentifier) precedent for a unique
+            // index over a nullable column, not because it's required for
+            // correctness here.
+            t.HasIndex(x => x.ConversationId)
+                .IsUnique()
+                .HasDatabaseName("IX_Tickets_ActiveTicketPerConversation")
+                .HasFilter("\"ConversationId\" IS NOT NULL AND \"Status\" <> 'Resolved'");
+
             t.ToTable(tb =>
             {
                 tb.HasCheckConstraint(
