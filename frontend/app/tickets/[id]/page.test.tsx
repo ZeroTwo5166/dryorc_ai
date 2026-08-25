@@ -1,7 +1,9 @@
+import { act } from "react";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import TicketDetailPage from "./page";
 import { ThemeProvider } from "../../lib/theme-context";
+import type { TicketEvent, TicketHubHandlers } from "../../lib/ticketHub";
 
 function renderPage() {
   return render(
@@ -21,7 +23,7 @@ type MockUser = {
   expiresAtUtc: string;
 };
 
-const { mockRouterReplace, authState, apiState } = vi.hoisted(() => ({
+const { mockRouterReplace, authState, apiState, hubState } = vi.hoisted(() => ({
   mockRouterReplace: vi.fn(),
   authState: { user: null as MockUser | null, status: "ready" as "loading" | "ready" },
   apiState: {
@@ -32,6 +34,11 @@ const { mockRouterReplace, authState, apiState } = vi.hoisted(() => ({
     resolveTicket: vi.fn(),
     reopenTicket: vi.fn(),
     updateTicketPriority: vi.fn(),
+  },
+  hubState: {
+    handlers: null as TicketHubHandlers | null,
+    stop: vi.fn(),
+    connectTicketHub: vi.fn(),
   },
 }));
 
@@ -58,6 +65,10 @@ vi.mock("../../lib/api", async () => {
     updateTicketPriority: apiState.updateTicketPriority,
   };
 });
+
+vi.mock("../../lib/ticketHub", () => ({
+  connectTicketHub: hubState.connectTicketHub,
+}));
 
 const baseTicket = {
   id: "ticket-1",
@@ -113,7 +124,20 @@ describe("TicketDetailPage", () => {
     apiState.resolveTicket.mockReset().mockResolvedValue(null);
     apiState.reopenTicket.mockReset().mockResolvedValue(null);
     apiState.updateTicketPriority.mockReset().mockResolvedValue(null);
+    hubState.handlers = null;
+    hubState.stop.mockReset();
+    hubState.connectTicketHub.mockReset().mockImplementation((handlers: TicketHubHandlers) => {
+      hubState.handlers = handlers;
+      return { stop: hubState.stop };
+    });
   });
+
+  async function emitTicketEvent(event: TicketEvent) {
+    await act(async () => {
+      hubState.handlers?.onTicketEvent(event);
+      await Promise.resolve();
+    });
+  }
 
   it("renders ticket information once loaded", async () => {
     renderPage();
@@ -290,5 +314,65 @@ describe("TicketDetailPage", () => {
     apiState.getCustomer.mockRejectedValue(new Error("network error"));
     renderPage();
     expect(await screen.findByRole("heading", { name: "Needs a callback" })).toBeInTheDocument();
+  });
+
+  describe("SignalR live updates", () => {
+    it("refetches when a TicketEvent for this ticket is received", async () => {
+      renderPage();
+      await screen.findByRole("heading", { name: "Needs a callback" });
+      apiState.getTicket.mockClear();
+      apiState.getTicket.mockResolvedValue({ ...baseTicket, status: "InProgress", claimedByUserId: "u1" });
+
+      await emitTicketEvent({ ticketId: "ticket-1", eventType: "TicketClaimed" });
+
+      await waitFor(() => expect(apiState.getTicket).toHaveBeenCalledTimes(1));
+      expect(await screen.findByRole("button", { name: /^resolve$/i })).toBeInTheDocument();
+    });
+
+    it("ignores a TicketEvent for a different ticket", async () => {
+      renderPage();
+      await screen.findByRole("heading", { name: "Needs a callback" });
+      apiState.getTicket.mockClear();
+
+      await emitTicketEvent({ ticketId: "some-other-ticket", eventType: "TicketClaimed" });
+
+      // Give any (incorrect) refetch a chance to have fired before asserting it didn't.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(apiState.getTicket).not.toHaveBeenCalled();
+    });
+
+    it("refetches on reconnect", async () => {
+      renderPage();
+      await screen.findByRole("heading", { name: "Needs a callback" });
+      apiState.getTicket.mockClear();
+
+      await act(async () => {
+        hubState.handlers?.onReconnected?.();
+        await Promise.resolve();
+      });
+
+      await waitFor(() => expect(apiState.getTicket).toHaveBeenCalledTimes(1));
+    });
+
+    it("stops the connection on unmount", async () => {
+      const { unmount } = renderPage();
+      await screen.findByRole("heading", { name: "Needs a callback" });
+
+      unmount();
+
+      expect(hubState.stop).toHaveBeenCalledTimes(1);
+    });
+
+    it("a SignalR connection failure does not break the REST-loaded ticket", async () => {
+      // Same reasoning as the list page's equivalent test — connectTicketHub
+      // swallows its own connection failures internally and never throws or
+      // rejects to its caller; "no handler ever fires" is the realistic
+      // failure mode, which every other test in this block already covers
+      // via the default mock.
+      renderPage();
+
+      expect(await screen.findByRole("heading", { name: "Needs a callback" })).toBeInTheDocument();
+      expect(hubState.connectTicketHub).toHaveBeenCalledTimes(1);
+    });
   });
 });

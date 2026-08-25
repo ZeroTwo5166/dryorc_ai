@@ -8,6 +8,7 @@ using Microsoft.Extensions.Options;
 using backend.Auth;
 using backend.Data;
 using backend.Email;
+using backend.Hubs;
 using backend.Interfaces;
 using backend.Models;
 using backend.Services;
@@ -379,6 +380,15 @@ builder.Services.AddAuthorizationBuilder()
 
 builder.Services.AddScoped<IAuthorizationHandler, SameTenantAuthorizationHandler>();
 
+// Step 13B: TicketHub — server-side SignalR is already part of the
+// ASP.NET Core shared framework referenced via Microsoft.NET.Sdk.Web, no
+// extra PackageReference needed. Registered here, mapped below (after
+// UseAuthentication/UseAuthorization/UseCors) so the hub's own
+// [Authorize(Policy = NivoraPolicies.AnyStaff)] is enforced through the
+// same middleware pipeline every other authenticated endpoint uses — no
+// second auth scheme, no bypass.
+builder.Services.AddSignalR();
+
 builder.Services.AddControllers();
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
@@ -436,6 +446,12 @@ app.UseAuthorization();
 app.UseRateLimiter();
 
 app.MapControllers();
+
+// Step 13B: mapped after UseAuthentication()/UseAuthorization()/UseCors()
+// above, so the negotiate/connect handshake goes through the same staff
+// cookie auth + CORS-with-credentials pipeline as every other authenticated
+// endpoint — no bypass, no second auth mechanism.
+app.MapHub<TicketHub>("/hubs/tickets");
 
 app.Run();
 

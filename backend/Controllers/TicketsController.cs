@@ -4,11 +4,13 @@ using backend.Auth;
 using backend.Constants;
 using backend.Data;
 using backend.Enums;
+using backend.Hubs;
 using backend.Interfaces;
 using backend.Models;
 using backend.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
 
@@ -70,7 +72,9 @@ public class TicketsController(
     ICurrentTenantAccessor tenantAccessor,
     IAuthorizationService authorizationService,
     IAuditLogService auditLogService,
-    ITicketSlaService ticketSlaService) : ControllerBase
+    ITicketSlaService ticketSlaService,
+    IHubContext<TicketHub> hubContext,
+    ILogger<TicketsController> logger) : ControllerBase
 {
     private const int ListTake = 20;
 
@@ -257,6 +261,8 @@ public class TicketsController(
             return Conflict("An active (non-Resolved) ticket already exists for this conversation.");
         }
 
+        await PublishTicketEventAsync(businessId, ticket.Id, AuditEventTypes.TicketCreated);
+
         return CreatedAtAction(nameof(Get), new { id = ticket.Id }, ToResponse(ticket));
     }
 
@@ -310,6 +316,7 @@ public class TicketsController(
             throw;
         }
 
+        await PublishTicketEventAsync(ticket.BusinessId, ticket.Id, AuditEventTypes.TicketClaimed);
         return NoContent();
     }
 
@@ -355,6 +362,7 @@ public class TicketsController(
             throw;
         }
 
+        await PublishTicketEventAsync(ticket.BusinessId, ticket.Id, AuditEventTypes.TicketUnclaimed);
         return NoContent();
     }
 
@@ -414,6 +422,10 @@ public class TicketsController(
             throw;
         }
 
+        // Only reached on the genuine InProgress -> Resolved transition
+        // above — the idempotent already-Resolved branch returns early
+        // (before this point) and never publishes a second TicketResolved.
+        await PublishTicketEventAsync(ticket.BusinessId, ticket.Id, AuditEventTypes.TicketResolved);
         return NoContent();
     }
 
@@ -469,6 +481,7 @@ public class TicketsController(
             throw;
         }
 
+        await PublishTicketEventAsync(ticket.BusinessId, ticket.Id, AuditEventTypes.TicketReopened);
         return NoContent();
     }
 
@@ -506,7 +519,29 @@ public class TicketsController(
 
         await db.SaveChangesAsync();
 
+        await PublishTicketEventAsync(ticket.BusinessId, ticket.Id, AuditEventTypes.TicketPriorityChanged);
         return NoContent();
+    }
+
+    /// <summary>
+    /// Step 13B. Always called strictly after a successful commit — never
+    /// before, never on a losing/no-op branch. Broadcast failures are
+    /// caught and logged here, never allowed to turn an already-successful
+    /// mutation into a 500 or trigger a second database attempt; SignalR is
+    /// an invalidation signal only, never load-bearing for the HTTP
+    /// response already determined above this call.
+    /// </summary>
+    private async Task PublishTicketEventAsync(Guid businessId, Guid ticketId, string eventType)
+    {
+        try
+        {
+            await hubContext.Clients.Group(TicketHub.GroupName(businessId))
+                .SendAsync("TicketEvent", new TicketEvent(ticketId, eventType));
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to publish {EventType} SignalR event for ticket {TicketId}.", eventType, ticketId);
+        }
     }
 
     private static TicketResponse ToResponse(Ticket t) => new(

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { DashboardShell } from "../components/layout/DashboardShell";
@@ -8,6 +8,7 @@ import { IconMessageSquare } from "../components/landing/icons";
 import { useAuth } from "../lib/auth-context";
 import { formatRelativeTime } from "../lib/relative-time";
 import { listTickets, type Ticket, type TicketCursor, type TicketStatus } from "../lib/api";
+import { connectTicketHub } from "../lib/ticketHub";
 
 const STATUS_BADGE: Record<TicketStatus, string> = {
   Open: "bg-accent-soft text-accent",
@@ -48,33 +49,65 @@ export default function TicketsPage() {
     }
   }, [status, user, router]);
 
-  useEffect(() => {
-    if (!user) return;
-    let cancelled = false;
-
-    // Only the very first load shows the full-page spinner (`loading`
-    // starts true and is only ever set false below). Switching the status
-    // filter afterward re-fetches in place — the previous page's tickets
-    // stay visible until the new filtered list resolves, same tolerance
-    // "Load more" already has for its own in-flight window.
-    listTickets({ take: 20, status: statusFilter || undefined })
+  // Only the very first load shows the full-page spinner (`loading` starts
+  // true and is only ever set false below). Filter changes and SignalR
+  // TicketEvent/reconnect signals below all re-fetch page 1 in place — the
+  // previously-loaded tickets stay visible until the fresh list resolves,
+  // same tolerance "Load more" already has for its own in-flight window. A
+  // request-id ref (not a per-effect `cancelled` flag) discards a stale
+  // response: this function is now called from three different triggers
+  // (mount/filter-change, a live TicketEvent, and reconnect), so "the
+  // latest call wins" has to hold across all of them, not just within one
+  // effect's own lifetime.
+  const latestRequestId = useRef(0);
+  const refetchFirstPage = useCallback(() => {
+    const requestId = ++latestRequestId.current;
+    return listTickets({ take: 20, status: statusFilter || undefined })
       .then((result) => {
-        if (cancelled) return;
+        if (latestRequestId.current !== requestId) return;
         setTickets(result.tickets);
         setNextCursor(result.nextCursor);
         setError(false);
       })
       .catch(() => {
-        if (!cancelled) setError(true);
+        if (latestRequestId.current !== requestId) return;
+        setError(true);
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (latestRequestId.current !== requestId) return;
+        setLoading(false);
       });
+  }, [statusFilter]);
+
+  useEffect(() => {
+    if (!user) return;
+    void refetchFirstPage();
+  }, [user, refetchFirstPage]);
+
+  // Always calls the freshest refetchFirstPage (via this ref) without
+  // tearing down and reopening the connection itself on every filter
+  // change — the connection's own lifecycle is tied only to `user`.
+  const refetchRef = useRef(refetchFirstPage);
+  useEffect(() => {
+    refetchRef.current = refetchFirstPage;
+  }, [refetchFirstPage]);
+
+  useEffect(() => {
+    if (!user) return;
+
+    const connection = connectTicketHub({
+      // Unconditional on every event, per the approved Step 13B design —
+      // ticket volume here is small and the REST query is authoritative,
+      // so no client-side reasoning about which event/filter combination
+      // "matters" is attempted.
+      onTicketEvent: () => void refetchRef.current(),
+      onReconnected: () => void refetchRef.current(),
+    });
 
     return () => {
-      cancelled = true;
+      void connection.stop();
     };
-  }, [user, statusFilter]);
+  }, [user]);
 
   async function handleLoadMore() {
     if (!nextCursor || loadingMore) return;

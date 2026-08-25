@@ -1,7 +1,9 @@
+import { act } from "react";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import TicketsPage from "./page";
 import { ThemeProvider } from "../lib/theme-context";
+import type { TicketEvent, TicketHubHandlers } from "../lib/ticketHub";
 
 function renderPage() {
   return render(
@@ -21,10 +23,15 @@ type MockUser = {
   expiresAtUtc: string;
 };
 
-const { mockRouterReplace, authState, apiState } = vi.hoisted(() => ({
+const { mockRouterReplace, authState, apiState, hubState } = vi.hoisted(() => ({
   mockRouterReplace: vi.fn(),
   authState: { user: null as MockUser | null, status: "ready" as "loading" | "ready" },
   apiState: { listTickets: vi.fn() },
+  hubState: {
+    handlers: null as TicketHubHandlers | null,
+    stop: vi.fn(),
+    connectTicketHub: vi.fn(),
+  },
 }));
 
 vi.mock("next/navigation", () => ({
@@ -40,6 +47,13 @@ vi.mock("../lib/api", async () => {
   const actual = await vi.importActual<typeof import("../lib/api")>("../lib/api");
   return { ...actual, listTickets: apiState.listTickets };
 });
+
+// Never a real WebSocket/negotiate call in tests — captures the handlers
+// the page registered so a test can simulate a server-pushed event, and a
+// fake connection object so unmount/.stop() is observable.
+vi.mock("../lib/ticketHub", () => ({
+  connectTicketHub: hubState.connectTicketHub,
+}));
 
 const baseTicket = {
   id: "t1",
@@ -74,7 +88,20 @@ describe("TicketsPage", () => {
       expiresAtUtc: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
     };
     apiState.listTickets.mockReset().mockResolvedValue({ tickets: [], nextCursor: null });
+    hubState.handlers = null;
+    hubState.stop.mockReset();
+    hubState.connectTicketHub.mockReset().mockImplementation((handlers: TicketHubHandlers) => {
+      hubState.handlers = handlers;
+      return { stop: hubState.stop };
+    });
   });
+
+  async function emitTicketEvent(event: TicketEvent) {
+    await act(async () => {
+      hubState.handlers?.onTicketEvent(event);
+      await Promise.resolve();
+    });
+  }
 
   it("renders the ticket list once loaded", async () => {
     apiState.listTickets.mockResolvedValue({ tickets: [baseTicket], nextCursor: null });
@@ -138,5 +165,83 @@ describe("TicketsPage", () => {
     authState.user = null;
     renderPage();
     expect(mockRouterReplace).toHaveBeenCalledWith("/login");
+  });
+
+  describe("SignalR live updates", () => {
+    it("refetches the list when a TicketEvent is received", async () => {
+      apiState.listTickets.mockResolvedValue({ tickets: [baseTicket], nextCursor: null });
+      renderPage();
+      await screen.findByText("Customer needs help");
+      apiState.listTickets.mockClear();
+
+      await emitTicketEvent({ ticketId: "t1", eventType: "TicketClaimed" });
+
+      await waitFor(() => expect(apiState.listTickets).toHaveBeenCalledTimes(1));
+    });
+
+    it("does not reason about event contents — any event, including for an unrelated ticket, triggers the same unconditional refetch", async () => {
+      apiState.listTickets.mockResolvedValue({ tickets: [baseTicket], nextCursor: null });
+      renderPage();
+      await screen.findByText("Customer needs help");
+      apiState.listTickets.mockClear();
+
+      await emitTicketEvent({ ticketId: "some-other-ticket-entirely", eventType: "TicketResolved" });
+
+      await waitFor(() => expect(apiState.listTickets).toHaveBeenCalledTimes(1));
+    });
+
+    it("multiple events remain harmless", async () => {
+      apiState.listTickets.mockResolvedValue({ tickets: [baseTicket], nextCursor: null });
+      renderPage();
+      await screen.findByText("Customer needs help");
+      apiState.listTickets.mockClear();
+
+      await emitTicketEvent({ ticketId: "t1", eventType: "TicketClaimed" });
+      await emitTicketEvent({ ticketId: "t1", eventType: "TicketResolved" });
+      await emitTicketEvent({ ticketId: "t1", eventType: "TicketReopened" });
+
+      await waitFor(() => expect(apiState.listTickets).toHaveBeenCalledTimes(3));
+      expect(screen.getByText("Customer needs help")).toBeInTheDocument();
+    });
+
+    it("refetches on reconnect", async () => {
+      apiState.listTickets.mockResolvedValue({ tickets: [baseTicket], nextCursor: null });
+      renderPage();
+      await screen.findByText("Customer needs help");
+      apiState.listTickets.mockClear();
+
+      await act(async () => {
+        hubState.handlers?.onReconnected?.();
+        await Promise.resolve();
+      });
+
+      await waitFor(() => expect(apiState.listTickets).toHaveBeenCalledTimes(1));
+    });
+
+    it("stops the connection on unmount", async () => {
+      apiState.listTickets.mockResolvedValue({ tickets: [baseTicket], nextCursor: null });
+      const { unmount } = renderPage();
+      await screen.findByText("Customer needs help");
+
+      unmount();
+
+      expect(hubState.stop).toHaveBeenCalledTimes(1);
+    });
+
+    it("a SignalR connection failure does not break the REST-loaded list", async () => {
+      // connectTicketHub itself swallows connection failures internally
+      // (its own .start().catch(() => {})) and never rejects/throws to its
+      // caller — the realistic failure mode is simply "no handler ever
+      // fires," which every other test in this block already exercises via
+      // the default mock. This test pins that down explicitly: the page
+      // must render normally from REST data alone even when SignalR never
+      // delivers a single event.
+      apiState.listTickets.mockResolvedValue({ tickets: [baseTicket], nextCursor: null });
+
+      renderPage();
+
+      expect(await screen.findByText("Customer needs help")).toBeInTheDocument();
+      expect(hubState.connectTicketHub).toHaveBeenCalledTimes(1);
+    });
   });
 });

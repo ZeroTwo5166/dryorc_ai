@@ -1,12 +1,15 @@
 using System.Net;
+using System.Security.Claims;
 using backend.Auth;
 using backend.Data;
 using backend.Email;
+using backend.Hubs;
 using backend.Models;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
 
@@ -20,6 +23,7 @@ public class AuthController(
     SignInManager<ApplicationUser> signInManager,
     IEmailSender emailSender,
     IConfiguration configuration,
+    IHubContext<TicketHub> ticketHubContext,
     ILogger<AuthController> logger) : ControllerBase
 {
     /// <summary>
@@ -330,7 +334,31 @@ public class AuthController(
     [Authorize(Policy = NivoraPolicies.AnyStaff)]
     public async Task<IActionResult> Logout()
     {
+        // Captured before SignOutAsync() — same ClaimTypes.NameIdentifier
+        // convention every controller already uses for the acting user, and
+        // the value SignalR's own default IUserIdProvider groups
+        // connections by, so Clients.User(...) below reaches this staff
+        // member's already-open TicketHub connection(s) with no custom
+        // IUserIdProvider needed.
+        var userId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+
         await signInManager.SignOutAsync();
+
+        if (userId is not null)
+        {
+            try
+            {
+                await ticketHubContext.Clients.User(userId).SendAsync("ForceDisconnect");
+            }
+            catch (Exception ex)
+            {
+                // Best-effort, same as TicketsController's own broadcast
+                // failures — a SignalR delivery problem must never turn an
+                // otherwise-successful logout into an error response.
+                logger.LogError(ex, "Failed to send ForceDisconnect to user {UserId} on logout.", userId);
+            }
+        }
+
         return NoContent();
     }
 

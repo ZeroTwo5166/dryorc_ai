@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { DashboardShell } from "../../components/layout/DashboardShell";
@@ -8,6 +8,7 @@ import { FormError } from "../../components/auth/FormField";
 import { IconArrowRight } from "../../components/landing/icons";
 import { useAuth } from "../../lib/auth-context";
 import { formatRelativeTime } from "../../lib/relative-time";
+import { connectTicketHub } from "../../lib/ticketHub";
 import {
   ApiError,
   claimTicket,
@@ -56,19 +57,22 @@ export default function TicketDetailPage() {
     }
   }, [status, user, router]);
 
-  useEffect(() => {
-    if (!user) return;
-    let cancelled = false;
-
-    getTicket(params.id)
+  // A request-id ref (not a per-effect `cancelled` flag) discards a stale
+  // response: this function is now called from three different triggers
+  // (mount/id-change, a live TicketEvent for this ticket, and reconnect),
+  // so "the latest call wins" has to hold across all of them.
+  const latestRequestId = useRef(0);
+  const refetchTicket = useCallback(() => {
+    const requestId = ++latestRequestId.current;
+    return getTicket(params.id)
       .then(async (result) => {
-        if (cancelled) return;
+        if (latestRequestId.current !== requestId) return;
         setTicket(result);
         setPriorityDraft(result.priority);
         setLoadError(false);
         try {
           const customerResult = await getCustomer(result.customerId);
-          if (!cancelled) setCustomer(customerResult);
+          if (latestRequestId.current === requestId) setCustomer(customerResult);
         } catch {
           // Customer info is a nice-to-have on this page — the ticket
           // itself already loaded successfully, so this failure alone
@@ -76,14 +80,46 @@ export default function TicketDetailPage() {
         }
       })
       .catch(() => {
-        if (!cancelled) setLoadError(true);
+        if (latestRequestId.current !== requestId) return;
+        setLoadError(true);
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (latestRequestId.current !== requestId) return;
+        setLoading(false);
       });
+  }, [params.id]);
+
+  useEffect(() => {
+    if (!user) return;
+    void refetchTicket();
+  }, [user, refetchTicket]);
+
+  // Always calls the freshest refetchTicket (via this ref) without tearing
+  // down and reopening the connection itself if params.id were ever to
+  // change without a full remount — the connection's own lifecycle is tied
+  // only to `user`.
+  const refetchRef = useRef(refetchTicket);
+  useEffect(() => {
+    refetchRef.current = refetchTicket;
+  }, [refetchTicket]);
+
+  useEffect(() => {
+    if (!user) return;
+
+    const connection = connectTicketHub({
+      // Only this ticket's own events trigger a refetch here — unrelated
+      // tickets on the same tenant are deliberately ignored, unlike the
+      // list page's unconditional refetch.
+      onTicketEvent: (event) => {
+        if (event.ticketId === params.id) {
+          void refetchRef.current();
+        }
+      },
+      onReconnected: () => void refetchRef.current(),
+    });
 
     return () => {
-      cancelled = true;
+      void connection.stop();
     };
   }, [user, params.id]);
 
