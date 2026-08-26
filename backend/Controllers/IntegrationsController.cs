@@ -113,7 +113,21 @@ public class IntegrationsController(
             ?? throw new InvalidOperationException("Authenticated but no tenant resolved — unreachable behind [Authorize].");
 
         var state = stateTokenService.Issue(businessId, CurrentUserId, platform);
-        var authorizationUrl = provider.BuildAuthorizationUrl(state, request.ExternalAccountIdentifier);
+
+        string authorizationUrl;
+        try
+        {
+            authorizationUrl = provider.BuildAuthorizationUrl(state, request.ExternalAccountIdentifier);
+        }
+        catch (ArgumentException ex)
+        {
+            // Providers with their own syntax rules for ExternalAccountIdentifier
+            // (e.g. Shopify's bare-shop-name rule) throw ArgumentException on an
+            // invalid value — see IIntegrationOAuthProvider.BuildAuthorizationUrl's
+            // doc comment. A 400 here, not a 500: this is caller input, not a
+            // server fault.
+            return BadRequest(ex.Message);
+        }
 
         return Ok(new ConnectIntegrationResponse(authorizationUrl));
     }
@@ -126,15 +140,39 @@ public class IntegrationsController(
     /// rather than returning a raw API error, since the caller here is a
     /// browser mid-navigation, not fetch(). Unregistered-platform check
     /// happens first, before any state/token work, same contract as Connect.
+    ///
+    /// Step 19 LOCKED ordering (do not reorder): provider resolution →
+    /// provider-specific callback STRUCTURAL validation (against the raw
+    /// query collection, not bound parameters — see
+    /// IIntegrationOAuthProvider.ValidateCallbackStructure's doc comment for
+    /// why this must run before state validation) → Nivora state-token
+    /// validation → live-cookie↔state BusinessId/UserId check →
+    /// provider-specific callback AUTHENTICITY validation (e.g. Shopify
+    /// HMAC, then post-HMAC shop-syntax revalidation — the SSRF boundary) →
+    /// token exchange → existing upsert/audit/save/redirect. Shopify HMAC
+    /// and the Nivora state token are independent mechanisms — neither
+    /// substitutes for the other; both must pass. `code`/`state` are read
+    /// from the raw query, not [FromQuery]-bound parameters, since binding
+    /// alone can silently hide duplicate/unknown parameters that structural
+    /// validation must catch.
     /// </summary>
     [HttpGet("{platform}/callback")]
     [Authorize(Policy = NivoraPolicies.OwnerOnly)]
-    public async Task<IActionResult> Callback(string platform, [FromQuery] string code, [FromQuery] string state)
+    public async Task<IActionResult> Callback(string platform)
     {
         var provider = providers.FirstOrDefault(p => p.Platform == platform);
         if (provider is null) return NotFound();
 
         var settingsUrl = BuildSettingsRedirectUrl();
+        var query = HttpContext.Request.Query;
+
+        if (!provider.ValidateCallbackStructure(query))
+        {
+            return Redirect($"{settingsUrl}?integrationError=hmac_invalid");
+        }
+
+        var code = query["code"].ToString();
+        var state = query["state"].ToString();
 
         var claims = stateTokenService.Validate(state, platform);
         if (claims is null)
@@ -154,10 +192,24 @@ public class IntegrationsController(
             return Redirect($"{settingsUrl}?integrationError=state_mismatch");
         }
 
+        // Provider-specific authenticity (e.g. Shopify HMAC) + post-HMAC
+        // shop-syntax revalidation — the untrusted callback `shop`/external
+        // identifier only becomes authoritative here, never earlier. Reuses
+        // integrationError=hmac_invalid: both a structural failure above and
+        // an authenticity failure here mean the same thing to the caller —
+        // "this callback did not pass Shopify's own contract" — Shopify's
+        // current documentation defines no separate error taxonomy between
+        // them.
+        var externalAccountIdentifier = provider.ValidateCallbackAuthenticity(query);
+        if (externalAccountIdentifier is null)
+        {
+            return Redirect($"{settingsUrl}?integrationError=hmac_invalid");
+        }
+
         OAuthTokenResult tokenResult;
         try
         {
-            tokenResult = await provider.ExchangeCodeAsync(code, HttpContext.RequestAborted);
+            tokenResult = await provider.ExchangeCodeAsync(code, externalAccountIdentifier, HttpContext.RequestAborted);
         }
         catch (Exception ex)
         {

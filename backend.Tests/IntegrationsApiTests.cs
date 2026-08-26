@@ -1,15 +1,20 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Text;
 using backend.Auth;
 using backend.Controllers;
 using backend.Data;
 using backend.Models;
 using backend.Services;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using Xunit;
 
 namespace backend.Tests;
@@ -23,8 +28,13 @@ namespace backend.Tests;
 /// (registered only in NivoraApiFactory, never in Program.cs), reconnect
 /// semantics, tenant isolation, OwnerOnly enforcement, the OAuth state
 /// token's cross-tenant-replay rejection, and the explicit
-/// unregistered-platform 404 contract (Step 18 ships zero concrete
-/// production providers).
+/// unregistered-platform 404 contract. Also covers Step 19 — the real
+/// ShopifyIntegrationOAuthProvider exercised through the real
+/// IEnumerable&lt;IIntegrationOAuthProvider&gt; provider-selection path,
+/// with only the outbound Shopify HTTP call faked (see
+/// FakeShopifyHttpMessageHandler / NewShopifyFactory below). As of Step 19,
+/// "shopify" is a genuinely registered platform — the unregistered-platform
+/// tests use FakeIntegrationOAuthProvider.UnregisteredPlatformName instead.
 /// </summary>
 public class IntegrationsApiTests : IAsyncLifetime
 {
@@ -322,7 +332,7 @@ public class IntegrationsApiTests : IAsyncLifetime
         var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Integration Unregistered Connect Business");
 
         var response = await ownerClient.SendAsync(WithBody(
-            Authed(HttpMethod.Post, "/api/integrations/shopify/connect", ownerCookie),
+            Authed(HttpMethod.Post, $"/api/integrations/{FakeIntegrationOAuthProvider.UnregisteredPlatformName}/connect", ownerCookie),
             new ConnectIntegrationRequest("my-shop.example.com")));
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
@@ -337,13 +347,14 @@ public class IntegrationsApiTests : IAsyncLifetime
     {
         var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Integration Unregistered Callback Business");
 
-        // No provider is registered for "shopify" in this test host either
-        // (only "fake" is) — matching production, where zero providers are
-        // registered at all. A hand-crafted, syntactically plausible
-        // code/state pair is used since a real one can never be obtained for
-        // a platform with no provider to issue it.
+        // No provider is registered for FakeIntegrationOAuthProvider.UnregisteredPlatformName
+        // in this test host either (only "fake" and, as of Step 19,
+        // "shopify" are) — matching production, where that platform string
+        // has no registered provider either. A hand-crafted, syntactically
+        // plausible code/state pair is used since a real one can never be
+        // obtained for a platform with no provider to issue it.
         var response = await ownerClient.SendAsync(Authed(HttpMethod.Get,
-            "/api/integrations/shopify/callback?code=irrelevant&state=irrelevant", ownerCookie));
+            $"/api/integrations/{FakeIntegrationOAuthProvider.UnregisteredPlatformName}/callback?code=irrelevant&state=irrelevant", ownerCookie));
 
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
 
@@ -477,5 +488,259 @@ public class IntegrationsApiTests : IAsyncLifetime
         var disconnectAuditCount = await db.AuditLogs.IgnoreQueryFilters().CountAsync(a =>
             a.BusinessId == businessId && a.EventType == backend.Constants.AuditEventTypes.IntegrationDisconnected);
         Assert.Equal(1, disconnectAuditCount);
+    }
+
+    // ── Step 19: Shopify, through the real provider-selection path ─────
+
+    /// <summary>
+    /// Clones _factory (same NivoraApiFactory base wiring, same Postgres DB
+    /// and Data Protection key ring — see NivoraApiFactory's doc comment)
+    /// and additionally fakes only ShopifyIntegrationOAuthProvider's
+    /// underlying HttpClient handler. Real controller, real provider
+    /// resolution, real ShopifyIntegrationOAuthProvider — only the outbound
+    /// network call to Shopify's token endpoint is faked. See Program.cs's
+    /// Step 19 registration comment for why overriding
+    /// AddHttpClient&lt;ShopifyIntegrationOAuthProvider&gt; here (rather than
+    /// AddHttpClient&lt;IIntegrationOAuthProvider, ...&gt;) cannot create a
+    /// second IIntegrationOAuthProvider registration.
+    /// </summary>
+    private (WebApplicationFactory<Program> Factory, FakeShopifyHttpMessageHandler Handler) NewShopifyFactory(
+        Func<HttpRequestMessage, HttpResponseMessage> respond)
+    {
+        var handler = new FakeShopifyHttpMessageHandler(respond);
+        var factory = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureTestServices(services =>
+            {
+                services.AddHttpClient<ShopifyIntegrationOAuthProvider>()
+                    .ConfigurePrimaryHttpMessageHandler(() => handler);
+            });
+        });
+        return (factory, handler);
+    }
+
+    // Independently implements Shopify's documented HMAC procedure — used
+    // only to construct realistic test callbacks, never to validate them
+    // (validation is ShopifyIntegrationOAuthProvider's own production code,
+    // exercised for real through these tests).
+    private static string ComputeShopifyHmacHex(string clientSecret, string code, string shop, string state, string timestamp)
+    {
+        var canonical = string.Join('&', new[]
+        {
+            $"code={code}", $"shop={shop}", $"state={state}", $"timestamp={timestamp}",
+        }.OrderBy(s => s, StringComparer.Ordinal));
+
+        var bytes = HMACSHA256.HashData(Encoding.UTF8.GetBytes(clientSecret), Encoding.UTF8.GetBytes(canonical));
+        return Convert.ToHexString(bytes).ToLowerInvariant();
+    }
+
+    private static string BuildShopifyCallbackUrl(string code, string hmac, string shop, string state, string timestamp) =>
+        "/api/integrations/shopify/callback" +
+        $"?code={Uri.EscapeDataString(code)}" +
+        $"&hmac={hmac}" +
+        $"&shop={Uri.EscapeDataString(shop)}" +
+        $"&state={Uri.EscapeDataString(state)}" +
+        $"&timestamp={Uri.EscapeDataString(timestamp)}";
+
+    private static HttpResponseMessage ShopifySuccessResponse() => new(HttpStatusCode.OK)
+    {
+        Content = JsonContent.Create(new
+        {
+            access_token = "shopify-access-token",
+            refresh_token = "shopify-refresh-token",
+            expires_in = 3600,
+            scope = "read_orders,write_orders,read_customers,write_customers,read_products,read_inventory",
+        }),
+    };
+
+    [Fact]
+    public async Task ConnectCallback_Shopify_FullFlow_PersistsEncryptedIntegrationWithRefreshToken_AuditsWithoutSecrets()
+    {
+        var (businessId, _, _, ownerCookie) = await SetUpBusinessWithOwnerAsync("Shopify Full Flow Business");
+        var (shopifyFactory, _) = NewShopifyFactory(_ => ShopifySuccessResponse());
+
+        using var connectClient = shopifyFactory.CreateClient(new() { BaseAddress = new Uri("https://localhost") });
+        var connectResponse = await connectClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/integrations/shopify/connect", ownerCookie),
+            new ConnectIntegrationRequest("my-real-shop")));
+        var state = await ExtractStateAsync(connectResponse);
+
+        string clientSecret;
+        await using (var scope = shopifyFactory.Services.CreateAsyncScope())
+        {
+            clientSecret = scope.ServiceProvider.GetRequiredService<IOptions<ShopifyOptions>>().Value.ClientSecret;
+        }
+
+        const string code = "shopify-auth-code";
+        const string shop = "my-real-shop";
+        const string timestamp = "1700000000";
+        var hmac = ComputeShopifyHmacHex(clientSecret, code, shop, state, timestamp);
+
+        using var noRedirectClient = shopifyFactory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("https://localhost"),
+            AllowAutoRedirect = false,
+        });
+        var callbackResponse = await noRedirectClient.SendAsync(Authed(
+            HttpMethod.Get, BuildShopifyCallbackUrl(code, hmac, shop, state, timestamp), ownerCookie));
+
+        Assert.Equal(HttpStatusCode.Redirect, callbackResponse.StatusCode);
+        Assert.Contains("connected=shopify", callbackResponse.Headers.Location!.ToString());
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var db = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var protector = verifyScope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
+
+        var row = await db.Integrations.IgnoreQueryFilters().SingleAsync(i => i.BusinessId == businessId);
+        Assert.Equal("shopify", row.Platform);
+        Assert.Equal(shop, row.ExternalAccountIdentifier);
+        Assert.Equal("shopify-access-token", protector.Unprotect("shopify", row.EncryptedAccessToken));
+        Assert.NotNull(row.EncryptedRefreshToken);
+        Assert.Equal("shopify-refresh-token", protector.Unprotect("shopify", row.EncryptedRefreshToken!));
+        Assert.NotNull(row.TokenExpiresAt);
+        Assert.Equal(6, row.Scopes.Count);
+
+        var auditLog = await db.AuditLogs.IgnoreQueryFilters()
+            .Where(a => a.BusinessId == businessId && a.EventType == backend.Constants.AuditEventTypes.IntegrationConnected)
+            .SingleAsync();
+        Assert.DoesNotContain("shopify-access-token", auditLog.NewValue);
+        Assert.DoesNotContain("shopify-refresh-token", auditLog.NewValue);
+        Assert.DoesNotContain(clientSecret, auditLog.NewValue ?? "");
+
+        await shopifyFactory.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Callback_Shopify_TamperedHmac_RedirectsWithHmacInvalid_NoIntegrationRowCreated()
+    {
+        var (businessId, _, _, ownerCookie) = await SetUpBusinessWithOwnerAsync("Shopify Tampered Hmac Business");
+        var (shopifyFactory, _) = NewShopifyFactory(_ => ShopifySuccessResponse());
+
+        using var connectClient = shopifyFactory.CreateClient(new() { BaseAddress = new Uri("https://localhost") });
+        var connectResponse = await connectClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/integrations/shopify/connect", ownerCookie),
+            new ConnectIntegrationRequest("my-real-shop")));
+        var state = await ExtractStateAsync(connectResponse);
+
+        var wrongHmac = new string('a', 64);
+        using var noRedirectClient = shopifyFactory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("https://localhost"),
+            AllowAutoRedirect = false,
+        });
+        var callbackResponse = await noRedirectClient.SendAsync(Authed(HttpMethod.Get,
+            BuildShopifyCallbackUrl("shopify-auth-code", wrongHmac, "my-real-shop", state, "1700000000"), ownerCookie));
+
+        Assert.Equal(HttpStatusCode.Redirect, callbackResponse.StatusCode);
+        Assert.Contains("integrationError=hmac_invalid", callbackResponse.Headers.Location!.ToString());
+
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        Assert.False(await db.Integrations.IgnoreQueryFilters().AnyAsync(i => i.BusinessId == businessId));
+
+        await shopifyFactory.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Callback_Shopify_DuplicateQueryParameter_RedirectsWithHmacInvalid_NoIntegrationRowCreated()
+    {
+        var (businessId, _, _, ownerCookie) = await SetUpBusinessWithOwnerAsync("Shopify Duplicate Param Business");
+        var (shopifyFactory, _) = NewShopifyFactory(_ => ShopifySuccessResponse());
+
+        using var connectClient = shopifyFactory.CreateClient(new() { BaseAddress = new Uri("https://localhost") });
+        var connectResponse = await connectClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/integrations/shopify/connect", ownerCookie),
+            new ConnectIntegrationRequest("my-real-shop")));
+        var state = await ExtractStateAsync(connectResponse);
+
+        string clientSecret;
+        await using (var scope = shopifyFactory.Services.CreateAsyncScope())
+        {
+            clientSecret = scope.ServiceProvider.GetRequiredService<IOptions<ShopifyOptions>>().Value.ClientSecret;
+        }
+
+        const string code = "shopify-auth-code";
+        const string shop = "my-real-shop";
+        const string timestamp = "1700000000";
+        var hmac = ComputeShopifyHmacHex(clientSecret, code, shop, state, timestamp);
+
+        // A structurally invalid callback — `shop` duplicated — must be
+        // rejected before Nivora's own state-token validation even runs
+        // (§ ValidateCallbackStructure's ordering guarantee), never reaching
+        // token exchange.
+        var callbackUrl = BuildShopifyCallbackUrl(code, hmac, shop, state, timestamp) + $"&shop={Uri.EscapeDataString(shop)}";
+
+        using var noRedirectClient = shopifyFactory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("https://localhost"),
+            AllowAutoRedirect = false,
+        });
+        var callbackResponse = await noRedirectClient.SendAsync(Authed(HttpMethod.Get, callbackUrl, ownerCookie));
+
+        Assert.Equal(HttpStatusCode.Redirect, callbackResponse.StatusCode);
+        Assert.Contains("integrationError=hmac_invalid", callbackResponse.Headers.Location!.ToString());
+
+        await using var scope2 = _factory.Services.CreateAsyncScope();
+        var db = scope2.ServiceProvider.GetRequiredService<AppDbContext>();
+        Assert.False(await db.Integrations.IgnoreQueryFilters().AnyAsync(i => i.BusinessId == businessId));
+
+        await shopifyFactory.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Callback_Shopify_ExchangeFails_RedirectsWithExchangeFailed_NoIntegrationRowCreated()
+    {
+        var (businessId, _, _, ownerCookie) = await SetUpBusinessWithOwnerAsync("Shopify Exchange Failure Business");
+        var (shopifyFactory, _) = NewShopifyFactory(_ => new HttpResponseMessage(HttpStatusCode.InternalServerError));
+
+        using var connectClient = shopifyFactory.CreateClient(new() { BaseAddress = new Uri("https://localhost") });
+        var connectResponse = await connectClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/integrations/shopify/connect", ownerCookie),
+            new ConnectIntegrationRequest("my-real-shop")));
+        var state = await ExtractStateAsync(connectResponse);
+
+        string clientSecret;
+        await using (var scope = shopifyFactory.Services.CreateAsyncScope())
+        {
+            clientSecret = scope.ServiceProvider.GetRequiredService<IOptions<ShopifyOptions>>().Value.ClientSecret;
+        }
+
+        const string code = "shopify-auth-code";
+        const string shop = "my-real-shop";
+        const string timestamp = "1700000000";
+        var hmac = ComputeShopifyHmacHex(clientSecret, code, shop, state, timestamp);
+
+        using var noRedirectClient = shopifyFactory.CreateClient(new WebApplicationFactoryClientOptions
+        {
+            BaseAddress = new Uri("https://localhost"),
+            AllowAutoRedirect = false,
+        });
+        var callbackResponse = await noRedirectClient.SendAsync(Authed(
+            HttpMethod.Get, BuildShopifyCallbackUrl(code, hmac, shop, state, timestamp), ownerCookie));
+
+        Assert.Equal(HttpStatusCode.Redirect, callbackResponse.StatusCode);
+        Assert.Contains("integrationError=exchange_failed", callbackResponse.Headers.Location!.ToString());
+
+        await using var scope2 = _factory.Services.CreateAsyncScope();
+        var db = scope2.ServiceProvider.GetRequiredService<AppDbContext>();
+        Assert.False(await db.Integrations.IgnoreQueryFilters().AnyAsync(i => i.BusinessId == businessId));
+
+        await shopifyFactory.DisposeAsync();
+    }
+
+    [Fact]
+    public async Task Connect_Shopify_InvalidShopName_ReturnsBadRequest_NoIntegrationRowCreated()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Shopify Invalid Shop Business");
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/integrations/shopify/connect", ownerCookie),
+            new ConnectIntegrationRequest("https://not-a-bare-shop-name.myshopify.com")));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        Assert.False(await db.Integrations.IgnoreQueryFilters().AnyAsync(i => i.BusinessId == businessId));
     }
 }

@@ -11,9 +11,14 @@ public class Integration : ITenantOwned
 
     public required string EncryptedAccessToken { get; set; }
 
-    /// <summary>NOT YET IMPLEMENTED — deferred until a refresh-requiring
-    /// platform (Slack/Google/Microsoft) is built. Shopify doesn't need
-    /// this.</summary>
+    /// <summary>Populated for providers whose token model requires it — as
+    /// of Step 19, Shopify (a public/distributed app, subject to Shopify's
+    /// expiring-offline-token model; see ShopifyIntegrationOAuthProvider's
+    /// own doc comment for the evidence trail). Null for providers with no
+    /// refresh concept. This comment previously asserted Shopify didn't need
+    /// this field at all — that was Step 18's stale assumption that Shopify
+    /// offline tokens never expire, corrected by Step 19's verification
+    /// against Shopify's current documentation.</summary>
     public string? EncryptedRefreshToken { get; set; }
 
     public string? ExternalAccountIdentifier { get; set; }

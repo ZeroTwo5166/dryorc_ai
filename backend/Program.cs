@@ -218,6 +218,47 @@ builder.Services.AddSingleton(Options.Create(new IntegrationStateTokenOptions { 
 builder.Services.AddScoped<IIntegrationStateTokenService, IntegrationStateTokenService>();
 builder.Services.AddScoped<IIntegrationTokenProtector, IntegrationTokenProtector>();
 
+// Step 19: Shopify — the first real IIntegrationOAuthProvider registration
+// (see IIntegrationOAuthProvider's own doc comment for why Step 18 shipped
+// none). Fail-fast, not the lazy Anthropic/Voyage pattern above: there is no
+// "integration feature is optional" framing here — IntegrationsController
+// expects exactly one concrete provider once Shopify is wired in.
+//
+// Registered as AddHttpClient<ShopifyIntegrationOAuthProvider> (the concrete
+// type, not the interface) plus a single explicit forwarding registration
+// for IIntegrationOAuthProvider, rather than
+// AddHttpClient<IIntegrationOAuthProvider, ShopifyIntegrationOAuthProvider>
+// directly — this is what lets backend.Tests override just the underlying
+// HttpClient's handler (to fake Shopify's token endpoint) via a second
+// AddHttpClient<ShopifyIntegrationOAuthProvider> call in test host
+// configuration, without ending up with two IIntegrationOAuthProvider
+// registrations in IEnumerable<IIntegrationOAuthProvider>.
+var shopifyClientId = builder.Configuration["Shopify:ClientId"]
+    ?? throw new InvalidOperationException(
+        "Missing Shopify:ClientId. Set it via `dotnet user-secrets set " +
+        "\"Shopify:ClientId\" \"...\"` (Development) or the hosting platform's " +
+        "configuration (production) — never commit it to appsettings.json.");
+var shopifyClientSecret = builder.Configuration["Shopify:ClientSecret"]
+    ?? throw new InvalidOperationException(
+        "Missing Shopify:ClientSecret. Set it via `dotnet user-secrets set " +
+        "\"Shopify:ClientSecret\" \"...\"` (Development) or the hosting platform's " +
+        "configuration (production) — never commit it to appsettings.json.");
+var shopifyRedirectUri = builder.Configuration["Shopify:RedirectUri"]
+    ?? throw new InvalidOperationException(
+        "Missing Shopify:RedirectUri. Set it via `dotnet user-secrets set " +
+        "\"Shopify:RedirectUri\" \"https://<this-backend>/api/integrations/shopify/callback\"` " +
+        "(Development) or the hosting platform's configuration (production) — " +
+        "must exactly match the redirect URL registered for this app in Shopify's " +
+        "Partner Dashboard.");
+builder.Services.AddSingleton(Options.Create(new ShopifyOptions
+{
+    ClientId = shopifyClientId,
+    ClientSecret = shopifyClientSecret,
+    RedirectUri = shopifyRedirectUri,
+}));
+builder.Services.AddHttpClient<ShopifyIntegrationOAuthProvider>();
+builder.Services.AddTransient<IIntegrationOAuthProvider>(sp => sp.GetRequiredService<ShopifyIntegrationOAuthProvider>());
+
 // ─────────────────────────────────────────────────────────────
 // Identity — cookie-based auth for staff/dashboard users.
 //
