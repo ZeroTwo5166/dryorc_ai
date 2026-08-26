@@ -4,6 +4,7 @@ using System.Threading.RateLimiting;
 using Anthropic;
 using Anthropic.Models.Messages;
 using Anthropic.Services;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Options;
 using backend.Auth;
 using backend.Data;
@@ -34,6 +35,26 @@ var neonConnectionUri = builder.Configuration.GetConnectionString("DefaultConnec
 
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(PostgresConnectionString.FromUri(neonConnectionUri), o => o.UseVector()));
+
+// Step 18: persist the Data Protection key ring in Postgres (AppDbContext's
+// own DB) instead of the framework's filesystem default. This is what
+// Integration access/refresh tokens (IIntegrationTokenProtector) are
+// encrypted under, and it's also now what Identity's own cookie protection
+// rides on — a positive side effect (staff cookies survive restarts/
+// scale-out too), not a goal being separately pursued.
+//
+// OPERATIONAL REQUIREMENT, not optional: the resulting DataProtectionKeys
+// table MUST be included in the production database backup scope before any
+// real integration is ever connected. Losing this key ring permanently
+// prevents decryption of every already-stored Integration.EncryptedAccessToken/
+// EncryptedRefreshToken — there is no recovery path other than every
+// affected business reconnecting the integration from scratch. This was
+// chosen over the filesystem default specifically because the deployment
+// target is still undecided (see NIVORA_DEVELOPMENT_PLAN_V2.md) and a
+// filesystem key ring would not durably survive a restart/scale-out on most
+// hosting platforms — recorded as an operational dependency in
+// NIVORA_FULL_PLAN_CHECKLIST_V2.md's Smaller Known Loose Ends.
+builder.Services.AddDataProtection().PersistKeysToDbContext<AppDbContext>();
 
 builder.Services.AddHttpContextAccessor();
 
@@ -177,6 +198,25 @@ builder.Services.AddScoped<IKnowledgeRetrievalService, KnowledgeRetrievalService
 builder.Services.AddScoped<IConversationModeService, ConversationModeService>();
 builder.Services.AddScoped<ITicketSlaService, TicketSlaService>();
 builder.Services.AddScoped<IAuditLogService, AuditLogService>();
+
+// Step 18: Business Integration Framework (generic OAuth connect/callback/
+// disconnect — see Controllers/IntegrationsController.cs). Encryption rides
+// on IDataProtectionProvider (registered via AddDataProtection() above).
+//
+// Deliberately NO IIntegrationOAuthProvider is registered here — Step 18
+// ships the framework only, zero concrete providers. IntegrationsController
+// resolves providers via IEnumerable<IIntegrationOAuthProvider>, which the
+// built-in DI container correctly resolves to an empty sequence with none
+// registered, so every {platform} route responds 404 in production today,
+// by design. Step 19 adds the first real registration (Shopify).
+var integrationStateTokenSigningKey = builder.Configuration["IntegrationStateToken:SigningKey"]
+    ?? throw new InvalidOperationException(
+        "Missing IntegrationStateToken:SigningKey. Set it via `dotnet user-secrets set " +
+        "\"IntegrationStateToken:SigningKey\" \"<random-secret-at-least-32-chars>\"` (Development) or the " +
+        "hosting platform's configuration (production) — never commit it to appsettings.json.");
+builder.Services.AddSingleton(Options.Create(new IntegrationStateTokenOptions { SigningKey = integrationStateTokenSigningKey }));
+builder.Services.AddScoped<IIntegrationStateTokenService, IntegrationStateTokenService>();
+builder.Services.AddScoped<IIntegrationTokenProtector, IntegrationTokenProtector>();
 
 // ─────────────────────────────────────────────────────────────
 // Identity — cookie-based auth for staff/dashboard users.

@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace backend.Tests;
 
@@ -42,6 +43,17 @@ public class NivoraApiFactory : WebApplicationFactory<Program>
         {
             services.AddSingleton<IMessageService, FakeMessageService>();
             services.AddSingleton<IVoyageEmbeddingClient, FakeVoyageEmbeddingClient>();
+
+            // Step 18: Program.cs registers zero IIntegrationOAuthProvider
+            // implementations in production, by design. This is the one
+            // test-only exception — added here (not Program.cs) so
+            // IntegrationsApiTests can prove the full connect/callback/
+            // disconnect flow end-to-end. TryAddEnumerable, not AddSingleton:
+            // adds this as one entry in IEnumerable<IIntegrationOAuthProvider>
+            // without displacing any other registration, mirroring how a
+            // real Step 19 provider registration would coexist with others.
+            services.TryAddEnumerable(
+                ServiceDescriptor.Singleton<IIntegrationOAuthProvider, FakeIntegrationOAuthProvider>());
         });
     }
 }

@@ -2,6 +2,7 @@
 using backend.Constants;
 using backend.Interfaces;
 using backend.Models;
+using Microsoft.AspNetCore.DataProtection.EntityFrameworkCore;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
@@ -9,7 +10,7 @@ using Microsoft.EntityFrameworkCore;
 namespace backend.Data;
 
 public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenantAccessor tenantAccessor)
-    : IdentityDbContext<ApplicationUser, IdentityRole<Guid>, Guid>(options)
+    : IdentityDbContext<ApplicationUser, IdentityRole<Guid>, Guid>(options), IDataProtectionKeyContext
 {
     // Deliberately NOT "private readonly Guid? _currentBusinessId = tenantAccessor.BusinessId;"
     // (a one-time snapshot taken at construction). Identity's own
@@ -61,6 +62,15 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
     public DbSet<ConversationHandoff> ConversationHandoffs => Set<ConversationHandoff>();
     public DbSet<Notification> Notifications => Set<Notification>();
     public DbSet<NotificationRecipient> NotificationRecipients => Set<NotificationRecipient>();
+
+    // Step 18: the ASP.NET Core Data Protection key ring, persisted here
+    // (Postgres) instead of the framework's filesystem default — see
+    // Program.cs's PersistKeysToDbContext registration for the operational
+    // requirement this creates (this table must be in the production backup
+    // scope). Framework-owned shape (DataProtectionKey has no BusinessId —
+    // it is cross-tenant infrastructure, not an ITenantOwned entity, same
+    // category as the inherited AspNetRoles/AspNetUsers tables).
+    public DbSet<DataProtectionKey> DataProtectionKeys => Set<DataProtectionKey>();
 
     protected override void OnModelCreating(ModelBuilder builder)
     {

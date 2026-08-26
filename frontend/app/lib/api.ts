@@ -625,3 +625,44 @@ export function reopenTicket(id: string): Promise<null> {
 export function updateTicketPriority(id: string, priority: TicketPriority): Promise<null> {
   return api.put(`/api/tickets/${id}/priority`, { priority });
 }
+
+// ── Step 18: Business Integration Framework ─────────────────────────────
+
+export type Integration = {
+  id: string;
+  platform: string;
+  externalAccountIdentifier: string | null;
+  scopes: string[];
+  scopesUpdatedAt: string | null;
+  connectedAt: string;
+  disconnectedAt: string | null;
+  isActive: boolean;
+};
+
+export type ConnectIntegrationRequest = {
+  externalAccountIdentifier: string;
+};
+
+export type ConnectIntegrationResponse = {
+  authorizationUrl: string;
+};
+
+// Step 18 ships zero concrete OAuth providers (see
+// backend/Controllers/IntegrationsController.cs) — every {platform} route
+// 404s in production today, and no endpoint exposes which platforms are
+// connectable, so there is nothing yet for a "Connect X" button to offer.
+// No dashboard UI calls these functions yet; they exist so Step 19 (the
+// first real provider, Shopify) can wire a settings page straight into an
+// already-correct client — same deferred-caller precedent as createTicket
+// (Step 16, still unused by the dashboard as of this writing).
+export function listIntegrations(): Promise<Integration[]> {
+  return api.get("/api/integrations");
+}
+
+export function connectIntegration(platform: string, body: ConnectIntegrationRequest): Promise<ConnectIntegrationResponse> {
+  return api.post(`/api/integrations/${platform}/connect`, body);
+}
+
+export function disconnectIntegration(platform: string): Promise<null> {
+  return api.post(`/api/integrations/${platform}/disconnect`);
+}
