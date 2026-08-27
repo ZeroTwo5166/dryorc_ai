@@ -22,4 +22,13 @@
     <PackageReference Include="Pgvector.EntityFrameworkCore" Version="0.3.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Step 20: lets backend.Tests construct VerifiedOrderOwnership directly
+         via its internal constructor, without HTTP mocking, for
+         OrderOwnershipAuthorizationServiceTests. -->
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>backend.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+
 </Project>

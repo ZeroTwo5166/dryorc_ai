@@ -250,14 +250,39 @@ var shopifyRedirectUri = builder.Configuration["Shopify:RedirectUri"]
         "(Development) or the hosting platform's configuration (production) — " +
         "must exactly match the redirect URL registered for this app in Shopify's " +
         "Partner Dashboard.");
+// Step 20: the Admin API version ShopifyOrderLookupService targets.
+// Configuration-driven and fail-fast, same reasoning as ClientId/
+// ClientSecret/RedirectUri above — never guessed or hardcoded in
+// application logic. Confirmed directly against Shopify (two independent
+// live shopify.dev /latest/ documentation-page resolutions, cross-checked
+// against the official @shopify/shopify-api library's own ApiVersion enum)
+// as "2026-07" at the time this was set; re-verify independently before
+// ever changing this value.
+var shopifyAdminApiVersion = builder.Configuration["Shopify:AdminApiVersion"]
+    ?? throw new InvalidOperationException(
+        "Missing Shopify:AdminApiVersion. Set it via `dotnet user-secrets set " +
+        "\"Shopify:AdminApiVersion\" \"2026-07\"` (Development) or the hosting platform's " +
+        "configuration (production) — verify the current stable version directly against " +
+        "Shopify before setting it, never guess.");
 builder.Services.AddSingleton(Options.Create(new ShopifyOptions
 {
     ClientId = shopifyClientId,
     ClientSecret = shopifyClientSecret,
     RedirectUri = shopifyRedirectUri,
+    AdminApiVersion = shopifyAdminApiVersion,
 }));
 builder.Services.AddHttpClient<ShopifyIntegrationOAuthProvider>();
 builder.Services.AddTransient<IIntegrationOAuthProvider>(sp => sp.GetRequiredService<ShopifyIntegrationOAuthProvider>());
+
+// Step 20: order-lookup + ownership-authorization, designed together as one
+// unit but implemented as two separate services (see the Step 20 handoff).
+// Same split-registration pattern as ShopifyIntegrationOAuthProvider above
+// — AddHttpClient<TImpl> plus a single forwarding registration for the
+// interface — so tests can override the HTTP handler without a duplicate
+// IShopifyOrderLookupService registration.
+builder.Services.AddHttpClient<ShopifyOrderLookupService>();
+builder.Services.AddTransient<IShopifyOrderLookupService>(sp => sp.GetRequiredService<ShopifyOrderLookupService>());
+builder.Services.AddScoped<IOrderOwnershipAuthorizationService, OrderOwnershipAuthorizationService>();
 
 // ─────────────────────────────────────────────────────────────
 // Identity — cookie-based auth for staff/dashboard users.

@@ -23,4 +23,14 @@ public class ShopifyOptions
     public required string ClientId { get; set; }
     public required string ClientSecret { get; set; }
     public required string RedirectUri { get; set; }
+
+    /// <summary>
+    /// Step 20. The Shopify Admin API version ShopifyOrderLookupService
+    /// targets (e.g. "2026-07"), used to build the GraphQL endpoint URL.
+    /// Configuration-driven, never hardcoded in application logic — verify
+    /// the current stable version directly against Shopify (Partner
+    /// Dashboard or a live X-Shopify-API-Version response header) before
+    /// changing this value, rather than guessing.
+    /// </summary>
+    public required string AdminApiVersion { get; set; }
 }

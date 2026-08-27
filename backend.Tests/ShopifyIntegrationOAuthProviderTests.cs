@@ -14,11 +14,15 @@ public class ShopifyIntegrationOAuthProviderTests
     private const string ClientId = "test-client-id";
     private const string ClientSecret = "test-client-secret-value";
     private const string RedirectUri = "https://backend.example.com/api/integrations/shopify/callback";
+    private const string AdminApiVersion = "2026-07";
 
     private static ShopifyIntegrationOAuthProvider NewProvider(HttpMessageHandler? handler = null) =>
         new(
             new HttpClient(handler ?? new FakeShopifyHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))),
-            Options.Create(new ShopifyOptions { ClientId = ClientId, ClientSecret = ClientSecret, RedirectUri = RedirectUri }));
+            Options.Create(new ShopifyOptions
+            {
+                ClientId = ClientId, ClientSecret = ClientSecret, RedirectUri = RedirectUri, AdminApiVersion = AdminApiVersion,
+            }));
 
     // Independently implements Shopify's documented HMAC procedure — never
     // calls into ShopifyIntegrationOAuthProvider's own HMAC code — so these
