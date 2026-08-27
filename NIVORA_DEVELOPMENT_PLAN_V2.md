@@ -2,7 +2,9 @@
 
 **Status:** Updated after a full Phase 1 schema restart — every table reviewed and rebuilt table-by-table, several new tables and features added, several architectural decisions locked that weren't in v1. This supersedes `NIVORA_DEVELOPMENT_PLAN.md` (v1) wherever they conflict. Sections unchanged from v1 are summarized; sections that changed are written out in full.
 
-**Current build state (as of this revision):** Step 3 (backend + EF Core global query filters) is complete and verified — `AppDbContext` wired, migration applied cleanly against Neon dev. Step 4 (Auth & Authorization) is now complete and verified: ASP.NET Core Identity (`AddIdentity`, cookie auth), Owner/Admin/Agent role seeding, the `TenantAwareUserStore` login-lookup fix, `ClaimsCurrentTenantAccessor`, the `SameTenant`/role authorization policies, and register/login/logout endpoints are all live. A real cross-tenant integration test (`backend.Tests/CrossTenantIsolationTests.cs`, `WebApplicationFactory<Program>` against the real Neon dev DB) passes, and is now the project's CI-worthy cross-tenant regression test — the "still needs to be written into CI" gap from the previous revision is closed at the test-authoring level (actual CI wiring is a separate, not-yet-done step). Everything from Step 5 onward is not yet built. A prior implementation reportedly reaching Step 20 (per old memory notes) could not be located anywhere in the current `backend/` directory — treat those old notes as unverified until confirmed found or explicitly abandoned.
+**Current build state (as of this revision, reconciled against `git log` up to commit `8684223`):** Steps 1-19 are complete, tested, and committed — see `NIVORA_FULL_PLAN_CHECKLIST_V2.md` for the authoritative, per-step checklist (this paragraph is a summary, not the source of truth). Highlights since the original Step 3/4 state described below: the full Next.js dashboard, embeddable widget, Claude integration, RAG (Steps 10-12), AI guardrails (13A/13B), customer profiles (14), human handoff (15), tickets (16), notifications (17), and the generic OAuth integration framework + Shopify provider (18/19) are all live. Section 14 (new, added in this reconciliation pass) documents the as-built Step 18/19 architecture, which deviates from what this document originally described. Nothing past Step 19 is built. The original text describing Step 3/4's build state and the tenant-filter bug found while building it (below) is preserved as accurate historical record of that period, not a claim about current state.
+
+A prior implementation reportedly reaching Step 20 (per old memory notes, referring to a *separate* codebase — `Nivora old`, a 42-commit sibling directory, see `NIVORA_FULL_PLAN_CHECKLIST_V2.md`'s loose ends) is unrelated to the from-scratch rebuild this document describes, and remains unreconciled — not a claim about the current `Nivora` codebase's own Step 19 status, which is independently verified above.
 
 **Real bug found and fixed while building Step 4's cross-tenant test:** `AppDbContext`'s global query filter originally snapshotted `ICurrentTenantAccessor.BusinessId` **once, in the constructor** (`private readonly Guid? _currentBusinessId = tenantAccessor.BusinessId;`). This is broken under real cookie authentication: ASP.NET Core Identity's `SecurityStampValidator` can resolve `UserManager` (and therefore `AppDbContext`, via `TenantAwareUserStore`) from the *same request's DI scope* **during** `UseAuthentication()` itself — before `HttpContext.User` has been set to the authenticated principal for that request — confirmed via a real, captured stack trace, and via reflecting on the installed `Microsoft.AspNetCore.Identity.dll`: `SecurityStampValidator<TUser>`'s constructor unconditionally requires `SignInManager<TUser>`, so *if* Identity resolves that validator, `AppDbContext` construction is unavoidable. Since `AppDbContext` is Scoped, that same (poisoned) instance would be reused for the rest of the request, including the controller — so a filtered *read* (`db.Customers.ToListAsync()`, etc.) would silently return zero rows, while a *write* (which doesn't go through the filter) would work fine — the exact "list is empty but create works" symptom that surfaced the bug.
 
@@ -164,21 +166,25 @@ v1 described a single conversation-retention clock. That's now understood to be 
 ✅ 2. Database schema — full table-by-table redesign complete (this document, Section 5)
 ✅ 3. ASP.NET Core backend + EF Core global query filters — wired, migration applied
 ✅ 4. Authentication + authorization — Identity cookie auth, role seeding, TenantAwareUserStore, ClaimsCurrentTenantAccessor, SameTenant/role policies, register/login/logout, cross-tenant test passing
-🔲 5. Next.js dashboard
-🔲 6. Embeddable chat widget
-🔲 7. Conversation API + rate limiting
-🔲 8. Claude integration
-🔲 9. Business inbox
+✅ 5. Next.js dashboard
+✅ 6. Embeddable chat widget
+✅ 7. Conversation API + rate limiting
+✅ 8. Claude integration
+✅ 9. Business inbox
      → cross-tenant isolation test written (backend.Tests/CrossTenantIsolationTests.cs, passing against real Neon dev DB) — actual CI pipeline wiring still not done
-     → STOP, verify MVP end-to-end
+     → MVP milestone reached here; build continued past this point (below), not re-verified end-to-end as a discrete gate
 
-Then, in whatever order becomes appropriate:
-   RAG (KnowledgeDocument/Chunk/MessageKnowledgeSource — schema ready)
-   → human handoff (ConversationHandoff — schema ready)
-   → tickets (Ticket/SlaTarget — schema ready, FirstRespondedAt logic not built)
-   → integrations (Integration — schema ready)
-   → AI read tools (getOrder, getCustomer, getProduct, searchProducts, getInventory)
-   → AI write tools (cancelOrder, refundOrder, updateCustomer — schema ready, hard blockers in Section 9 must close first)
+✅ 10-12. RAG (KnowledgeDocument/Chunk chunking+embeddings, KnowledgeRetrievalService, MessageKnowledgeSource citations)
+✅ 13A/13B. AI guardrails — service layer (ConversationModeService/TicketSlaService/AuditLogService) + real-time layer (TicketHub over SignalR)
+✅ 14. Customer profiles / identity linking (backend + dashboard UI)
+✅ 15. Human handoff — ConversationHandoff, both directions (backend + dashboard UI)
+✅ 16. Tickets — creation/lifecycle/SLA (backend + dashboard UI; no "Create Ticket" dashboard entry point yet — see checklist loose ends)
+✅ 17. Notifications infrastructure (see checklist for current production-wiring status)
+✅ 18. Integrations — generic OAuth framework (`IIntegrationOAuthProvider`, not the `ICommerceIntegration`/`CommerceIntegrationResolver` pattern originally sketched here — see Section 14)
+✅ 19. Shopify integration (`ShopifyIntegrationOAuthProvider`, public-app expiring-token model — see Section 14 for architecture and its carried-forward HMAC residual risk)
+
+Then, in whatever order becomes appropriate (previously flattened under one "Step 20" label — see `NIVORA_FULL_PLAN_CHECKLIST_V2.md` Phase 6 for the reorganized, not-yet-ordered, not-yet-started candidate list):
+   idempotency mechanism, Level 2 verification (both halves), refundOrder tool, tool-dispatch loop + design doc, read-tool registration, customer/order ownership cross-check (Section 9 hard blocker), AI Action Safety human-approval pipeline (still unscoped), write-tool registration
    → analytics → AI Business Analyst → reports → automation
    → usage tracking + billing (schema has PlanTier as a loose string, ready for Step 26 to define real tiers)
    → full security/rate-limiting → GDPR documentation finalized (Section 10 retention questions must close)
@@ -200,3 +206,23 @@ For anyone comparing against the original plan directly:
 - **Retention is now understood as six separate clocks**, not one — v1 only described conversation retention.
 - **Multi-tenancy query filter is now actually implemented** (was a stated intention in v1, is now live code, fail-closed).
 - **A documented IUserStore/tenant-filter architectural conflict and its resolution**, not anticipated in v1.
+
+---
+
+## 14. Step 18/19 — Business Integration Framework + Shopify OAuth (implemented — added in this reconciliation pass)
+
+This section exists because this document's original Section 5 "Integrations / commerce" entry, and `NIVORA_FULL_PLAN_CHECKLIST_V2.md`'s original Phase 6 entries, described a planned architecture (`ITokenProtector`, `ICommerceIntegration`, `CommerceIntegrationResolver`, `ShopifyIntegration`) that was **not** what got built. This is a documentation reconciliation, not a redesign — the code was not changed to match the old plan; the plan is corrected to match the code.
+
+**As-built architecture (Step 18, commit `74041df`; Step 19, commit `8684223`):**
+
+- `IIntegrationTokenProtector` / `IntegrationTokenProtector` — encrypts `Integration.EncryptedAccessToken`/`EncryptedRefreshToken` at rest via ASP.NET Core Data Protection, one purpose-strung `IDataProtector` per platform (`"Nivora.Integration.{Platform}"`). This gives cryptographic purpose separation only — it is **not** blast-radius containment; a Data Protection key-ring compromise lets an attacker decrypt every platform's tokens across every tenant.
+- `IIntegrationOAuthProvider` — a generic per-platform OAuth2 abstraction (`Platform`, `BuildAuthorizationUrl`, `ExchangeCodeAsync`, plus the Step-19-added `ValidateCallbackStructure`/`ValidateCallbackAuthenticity` for providers with their own callback-authenticity contract), resolved via `IEnumerable<IIntegrationOAuthProvider>` DI. Zero providers registered means every `{platform}` route 404s — this is how Step 18 shipped with no concrete provider, and how an actually-unregistered platform still behaves correctly today.
+- `IIntegrationStateTokenService` — short-lived (10-minute) signed JWT "state" tokens binding a connect attempt to `(BusinessId, UserId, Platform)`. Cross-checked against the live authenticated staff cookie at callback time; never trusted alone for tenant identity. Has no server-side single-use tracking (a deliberate, bounded residual risk — see the class's own doc comment).
+- `IntegrationsController` — the full connect/callback/disconnect/list framework. Callback ordering is locked: provider resolution → provider-specific structural validation of the raw query (before Nivora's own state-token check, so a tampered/duplicated query shape can never affect which state value gets validated) → Nivora state-token validation → live-cookie↔state binding check → provider-specific authenticity validation (Shopify's HMAC, then post-HMAC shop-syntax revalidation) → token exchange → existing upsert/audit/save/redirect.
+- `ShopifyIntegrationOAuthProvider` — the first (and, as of this writing, only) concrete provider. **Project decision**: Nivora's Shopify app is treated as a public/distributed app (one app installed by many unrelated merchants), so it implements Shopify's **expiring offline-token model**: `expiring=1` on both the authorization and token-exchange requests, 1-hour access tokens, refresh token captured on every successful exchange. This corrected two Step-18 code comments (`Integration.EncryptedRefreshToken`, `IIntegrationOAuthProvider`'s `OAuthTokenResult`) that had asserted the opposite (Shopify tokens don't expire) — that assertion predated this project decision and Shopify's current public-app documentation. Step 19 captures the refresh token but does **not** implement refresh execution or scheduling — deliberately deferred.
+- Shop validation is a two-stage SSRF boundary: at connect time, the caller-supplied shop must be a bare name (no scheme/path/port/whitespace/arbitrary domain) before `.myshopify.com` — hardcoded by Nivora, never caller-supplied — is appended; at callback time, the `shop` query value is untrusted until Shopify's HMAC passes, and is then re-validated against the same bare-name rule before it is used to construct the token-exchange URL.
+- No dashboard UI exists for connecting any integration (Step 18 or Step 19) — `listIntegrations`/`connectIntegration`/`disconnectIntegration` exist in `frontend/app/lib/api.ts` with no caller. Tracked as an open item in the checklist, not folded into either step.
+
+**Residual risk, deliberately not resolved, carried forward into `NIVORA_FULL_PLAN_CHECKLIST_V2.md`'s loose ends and any future Step 20 work:** `ShopifyIntegrationOAuthProvider`'s HMAC canonicalization operates on ASP.NET Core's decoded `Request.Query` values. Shopify's current official documentation confirms the exclusion/sort/join/HMAC-SHA256/hex-digest procedure but does not directly and unambiguously state whether raw percent-encoded query bytes or decoded values are what Shopify's own server-side computation uses. The decoded-query approach is an **explicit, documented project risk acceptance**, not a Shopify-documentation-confirmed fact. The corresponding special-character test (`ShopifyIntegrationOAuthProviderTests.ValidateCallbackAuthenticity_HandlesRealisticUrlEncodedSpecialCharactersInState`) is an internal regression/consistency test only — it proves Nivora's own canonicalization survives a realistic URL-encode/decode round trip without corruption, and it does **not** prove Shopify's production server signs the decoded representation. This can only be externally validated the first time a real merchant completes the Shopify OAuth flow and a genuine Shopify-signed callback is processed. Do not treat a passing test suite as having closed this.
+
+**Also not pinned by Step 19, relevant to any future workstream that calls Shopify's real Admin API (see Section 8):** Step 19 never pins a Shopify Admin API version, because it only calls Shopify's unversioned OAuth endpoints (`/admin/oauth/authorize`, `/admin/oauth/access_token`). The first workstream that calls a versioned Admin API endpoint (e.g. a future `refundOrder` tool) must select and document a current version at that time — Section 8's table should be re-verified against current Shopify documentation before that happens, not assumed still accurate.
