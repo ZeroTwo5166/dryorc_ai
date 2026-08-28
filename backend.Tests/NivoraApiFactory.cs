@@ -1,4 +1,5 @@
 using Anthropic.Services;
+using backend.Email;
 using backend.Services;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -33,6 +34,12 @@ namespace backend.Tests;
 /// pre-Step-11 KnowledgeDocumentsApiTests test) must never incur a real,
 /// billed Voyage call just because Create/Update now indexes synchronously.
 /// No live-Voyage-equivalent factory exists — Step 11 doesn't need one.
+///
+/// Same reasoning again for IEmailSender as of Step 21 — always swapped to
+/// FakeEmailSender, regardless of whether Resend:ApiKey happens to be
+/// configured. The widget OTP request endpoint is the first widget-
+/// reachable path that sends a real email; no live-Resend-equivalent
+/// factory exists here either.
 /// </summary>
 public class NivoraApiFactory : WebApplicationFactory<Program>
 {
@@ -43,6 +50,11 @@ public class NivoraApiFactory : WebApplicationFactory<Program>
         {
             services.AddSingleton<IMessageService, FakeMessageService>();
             services.AddSingleton<IVoyageEmbeddingClient, FakeVoyageEmbeddingClient>();
+
+            // Step 21: overrides the real AddHttpClient<IEmailSender,
+            // ResendEmailSender> registration — same reasoning as the two
+            // lines above, for the OTP request endpoint's email send.
+            services.AddSingleton<IEmailSender, FakeEmailSender>();
 
             // Step 18: Program.cs registers zero IIntegrationOAuthProvider
             // implementations in production, by design. This is the one

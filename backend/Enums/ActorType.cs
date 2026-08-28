@@ -22,5 +22,11 @@ public enum ActorType
 
     /// <summary>Claude, via a tool call within a conversation, triggered
     /// the request.</summary>
-    Ai
+    Ai,
+
+    /// <summary>Step 21: an anonymous widget visitor directly triggered the
+    /// request over HTTP (e.g. an OTP verification attempt) — distinct from
+    /// BusinessInternalSystem, which is the business's own backend system,
+    /// not the end customer themselves.</summary>
+    Customer
 }

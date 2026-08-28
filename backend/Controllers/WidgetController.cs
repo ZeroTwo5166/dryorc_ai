@@ -2,6 +2,7 @@ using System.Security.Claims;
 using backend.Auth;
 using backend.Data;
 using backend.Enums;
+using backend.Models;
 using backend.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Cors;
@@ -43,6 +44,32 @@ public record WidgetPolledMessage(Guid Id, string Role, string Content, DateTime
 public record WidgetMessageCursor(DateTimeOffset CreatedAt, Guid Id);
 
 public record WidgetPollResponse(List<WidgetPolledMessage> Messages, WidgetMessageCursor? NextCursor);
+
+/// <summary>
+/// Step 21 (OTP half). ConversationId is required and explicit — the widget
+/// JWT carries BusinessId/WidgetId/VisitorSessionId only, never
+/// ConversationId, so RequestVerificationCode/VerifyVerificationCode must
+/// take it from the body and independently cross-check it against the
+/// JWT's own claims before doing anything else.
+/// </summary>
+public record WidgetVerificationRequestRequest(Guid ConversationId, string Email);
+
+/// <summary>
+/// Deliberately the SAME shape/status regardless of whether the email
+/// matched zero, one, or multiple existing customers — enumeration
+/// resistance (design doc Section 6). Sent is always true for any
+/// non-throttled request; callers must not infer customer existence from
+/// this response.
+/// </summary>
+public record WidgetVerificationRequestResponse(bool Sent);
+
+/// <summary>Email must be re-submitted alongside Code — see
+/// IVerificationCodeService.VerifyCodeAsync's own doc comment for why.</summary>
+public record WidgetVerificationVerifyRequest(Guid ConversationId, string Email, string Code);
+
+/// <summary>Reason is null on success; otherwise the raw
+/// VerificationFailureReason name (never the raw code or raw email).</summary>
+public record WidgetVerificationVerifyResponse(bool Verified, string? Reason);
 
 /// <summary>
 /// Public, widget-facing endpoints — no staff cookie involved anywhere
@@ -248,6 +275,109 @@ public class WidgetController(AppDbContext db, IWidgetTokenService tokenService)
             : new WidgetMessageCursor(cursorCreatedAt, cursorId);
 
         return Ok(new WidgetPollResponse(polled, nextCursor));
+    }
+
+    /// <summary>
+    /// Step 21 (OTP half). Uniform response regardless of match count
+    /// (enumeration resistance) — Sent/AmbiguousCustomerMatch collapse to
+    /// the same 200 body; only the resend cooldown/limit (a normal,
+    /// expected throttle, not a customer-existence oracle) surfaces
+    /// distinctly, as 429.
+    /// </summary>
+    [HttpPost("verification/request")]
+    [Authorize(Policy = NivoraPolicies.Widget)]
+    [EnableRateLimiting("WidgetOtpRequest")]
+    public async Task<IActionResult> RequestVerificationCode(
+        [FromBody] WidgetVerificationRequestRequest request,
+        [FromServices] IVerificationCodeService verificationCodeService)
+    {
+        if (string.IsNullOrWhiteSpace(request.Email) || !IsPlausibleEmail(request.Email))
+        {
+            return BadRequest();
+        }
+
+        var conversation = await ResolveOwnConversationAsync(request.ConversationId);
+        if (conversation is null)
+        {
+            return NotFound();
+        }
+
+        var result = await verificationCodeService.RequestCodeAsync(
+            conversation.BusinessId, conversation.Id, conversation.Channel, request.Email,
+            HttpContext.RequestAborted);
+
+        return result.Outcome switch
+        {
+            RequestCodeOutcome.Issued or RequestCodeOutcome.AmbiguousCustomerMatch
+                => Ok(new WidgetVerificationRequestResponse(true)),
+            RequestCodeOutcome.ResendCooldownActive or RequestCodeOutcome.ResendLimitExceeded
+                => StatusCode(StatusCodes.Status429TooManyRequests),
+            _ => StatusCode(StatusCodes.Status500InternalServerError),
+        };
+    }
+
+    [HttpPost("verification/verify")]
+    [Authorize(Policy = NivoraPolicies.Widget)]
+    [EnableRateLimiting("WidgetOtpVerify")]
+    public async Task<IActionResult> VerifyVerificationCode(
+        [FromBody] WidgetVerificationVerifyRequest request,
+        [FromServices] IVerificationCodeService verificationCodeService)
+    {
+        if (string.IsNullOrWhiteSpace(request.Email) || !IsPlausibleEmail(request.Email)
+            || string.IsNullOrWhiteSpace(request.Code))
+        {
+            return BadRequest();
+        }
+
+        var conversation = await ResolveOwnConversationAsync(request.ConversationId);
+        if (conversation is null)
+        {
+            return NotFound();
+        }
+
+        var result = await verificationCodeService.VerifyCodeAsync(
+            conversation.BusinessId, conversation.Id, conversation.Channel, request.Email, request.Code,
+            HttpContext.RequestAborted);
+
+        return Ok(new WidgetVerificationVerifyResponse(result.Success, result.Success ? null : result.Reason.ToString()));
+    }
+
+    /// <summary>
+    /// Resolves the caller's own Conversation, cross-checked against the
+    /// widget JWT's own (BusinessId, WidgetId, VisitorSessionId) claims —
+    /// the same identity-binding requirement PostMessage/PollMessages
+    /// enforce for their own implicitly-resolved conversation, applied here
+    /// to a client-supplied ConversationId instead (design doc Section 3:
+    /// the JWT carries no ConversationId, so a verification request must
+    /// supply one explicitly and this must independently confirm it
+    /// belongs to the same visitor session).
+    /// </summary>
+    private async Task<Conversation?> ResolveOwnConversationAsync(Guid conversationId)
+    {
+        var businessId = Guid.Parse(User.FindFirstValue(NivoraClaimTypes.BusinessId)!);
+        var widgetId = Guid.Parse(User.FindFirstValue(NivoraClaimTypes.WidgetId)!);
+        var visitorSessionId = User.FindFirstValue(NivoraClaimTypes.VisitorSessionId)!;
+
+        return await db.Conversations
+            .IgnoreQueryFilters()
+            .FirstOrDefaultAsync(c => c.Id == conversationId
+                && c.BusinessId == businessId
+                && c.WidgetId == widgetId
+                && c.VisitorSessionId == visitorSessionId
+                && !c.IsAnonymized);
+    }
+
+    /// <summary>
+    /// Minimal format validation only — no existing email-validation
+    /// convention exists anywhere else in this codebase to match. Not a
+    /// substitute for the normalization VerificationCodeService itself
+    /// performs; just rejects obviously-malformed input before it reaches
+    /// customer resolution.
+    /// </summary>
+    private static bool IsPlausibleEmail(string email)
+    {
+        var at = email.IndexOf('@');
+        return at > 0 && at < email.Length - 1 && !email.Contains(' ');
     }
 
     private static bool OriginIsAllowed(string origin, List<string> allowedDomains)

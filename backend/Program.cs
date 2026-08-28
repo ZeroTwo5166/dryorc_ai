@@ -406,6 +406,28 @@ builder.Services.AddRateLimiter(options =>
             PermitLimit = 20,
             Window = TimeSpan.FromMinutes(1),
         }));
+
+    // Step 21 (OTP half). Complementary, coarse volumetric controls —
+    // VisitorSessionId-partitioned like the policies above, NOT the actual
+    // resend-cooldown/resend-limit security boundary (that's the
+    // scope-keyed check inside VerificationCodeService, since a fresh
+    // Init call trivially gets a fresh VisitorSessionId and a fresh
+    // partition here). Placeholder limits, same as the policies above.
+    options.AddPolicy("WidgetOtpRequest", httpContext => RateLimitPartition.GetFixedWindowLimiter(
+        partitionKey: httpContext.User.FindFirst(NivoraClaimTypes.VisitorSessionId)?.Value ?? "unauthenticated",
+        factory: _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 10,
+            Window = TimeSpan.FromMinutes(1),
+        }));
+
+    options.AddPolicy("WidgetOtpVerify", httpContext => RateLimitPartition.GetFixedWindowLimiter(
+        partitionKey: httpContext.User.FindFirst(NivoraClaimTypes.VisitorSessionId)?.Value ?? "unauthenticated",
+        factory: _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 20,
+            Window = TimeSpan.FromMinutes(1),
+        }));
 });
 
 // Resend (https://resend.com) — transactional email for the account
@@ -425,6 +447,25 @@ builder.Services.AddHttpClient<IEmailSender, ResendEmailSender>(client =>
             "(Development) or the hosting platform's configuration (production) — never commit it.");
     client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", resendApiKey);
 });
+
+// ─────────────────────────────────────────────────────────────
+// Step 21 (OTP half): Level 2 verification. HashingPepper follows the same
+// fail-fast-at-startup, never-in-appsettings.json rule as
+// WidgetToken:SigningKey/Resend:ApiKey above. Depends on IEmailSender
+// (registered immediately above) for OTP delivery.
+// ─────────────────────────────────────────────────────────────
+var verificationHashingPepper = builder.Configuration["Verification:HashingPepper"]
+    ?? throw new InvalidOperationException(
+        "Missing Verification:HashingPepper. Set it via `dotnet user-secrets set " +
+        "\"Verification:HashingPepper\" \"<random-secret-at-least-32-chars>\"` (Development) or the " +
+        "hosting platform's configuration (production) — never commit it to appsettings.json.");
+builder.Services.Configure<VerificationOptions>(options =>
+{
+    builder.Configuration.GetSection(VerificationOptions.SectionName).Bind(options);
+    options.HashingPepper = verificationHashingPepper;
+});
+builder.Services.AddScoped<IVerificationCodeService, VerificationCodeService>();
+builder.Services.AddScoped<ILevel2VerificationChecker, Level2VerificationChecker>();
 
 builder.Services.ConfigureApplicationCookie(options =>
 {

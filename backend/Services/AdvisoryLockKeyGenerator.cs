@@ -70,6 +70,19 @@ public static class AdvisoryLockKeyGenerator
     public static long ForConversationNotification(Guid businessId, Guid conversationId) =>
         PackToLong($"{businessId:D}:notification:{conversationId:D}");
 
+    /// <summary>
+    /// Step 21 (OTP half). Scopes a lock to one (BusinessId, CustomerId,
+    /// ConversationId, Channel) verification scope's atomic
+    /// supersede-then-insert step — VerificationCode's own doc comment
+    /// mandates this so two concurrent resend requests for the same scope
+    /// can never leave two simultaneously active codes. A resend for one
+    /// customer/conversation/channel scope must never affect an active code
+    /// in a different scope, including a different CustomerId within the
+    /// same conversation (e.g. two different emails attempted in sequence).
+    /// </summary>
+    public static long ForVerificationCode(Guid businessId, Guid customerId, Guid conversationId, string channel) =>
+        PackToLong($"{businessId:D}:verification:{customerId:D}:{conversationId:D}:{channel}");
+
     private static long PackToLong(string canonical)
     {
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
