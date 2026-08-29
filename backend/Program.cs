@@ -283,6 +283,8 @@ builder.Services.AddTransient<IIntegrationOAuthProvider>(sp => sp.GetRequiredSer
 builder.Services.AddHttpClient<ShopifyOrderLookupService>();
 builder.Services.AddTransient<IShopifyOrderLookupService>(sp => sp.GetRequiredService<ShopifyOrderLookupService>());
 builder.Services.AddScoped<IOrderOwnershipAuthorizationService, OrderOwnershipAuthorizationService>();
+builder.Services.AddScoped<IOrderCancellationService, OrderCancellationService>();
+builder.Services.AddScoped<ICustomerUpdateActionService, CustomerUpdateActionService>();
 
 // ─────────────────────────────────────────────────────────────
 // Identity — cookie-based auth for staff/dashboard users.
