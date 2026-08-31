@@ -62,6 +62,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
     public DbSet<ConversationHandoff> ConversationHandoffs => Set<ConversationHandoff>();
     public DbSet<Notification> Notifications => Set<Notification>();
     public DbSet<NotificationRecipient> NotificationRecipients => Set<NotificationRecipient>();
+    public DbSet<BusinessSigningKey> BusinessSigningKeys => Set<BusinessSigningKey>();
+    public DbSet<ConsumedSignedIdentityToken> ConsumedSignedIdentityTokens => Set<ConsumedSignedIdentityToken>();
 
     // Step 18: the ASP.NET Core Data Protection key ring, persisted here
     // (Postgres) instead of the framework's filesystem default — see
@@ -367,6 +369,42 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
             i.HasOne<ApplicationUser>().WithMany()
                 .HasForeignKey(x => x.RevokedByUserId)
                 .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        // ─────────────────────────────────────────────────────────────
+        // BusinessSigningKey (Step 21, signed-token half)
+        // ─────────────────────────────────────────────────────────────
+        builder.Entity<BusinessSigningKey>(k =>
+        {
+            k.Property(x => x.Algorithm).HasMaxLength(16);
+
+            // Non-unique — multiple concurrently-active keys per business
+            // are legal and expected during rotation.
+            k.HasIndex(x => x.BusinessId);
+
+            k.HasOne<Business>().WithMany()
+                .HasForeignKey(x => x.BusinessId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            k.HasOne<ApplicationUser>().WithMany()
+                .HasForeignKey(x => x.CreatedByUserId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        // ─────────────────────────────────────────────────────────────
+        // ConsumedSignedIdentityToken (Step 21, signed-token half)
+        // ─────────────────────────────────────────────────────────────
+        builder.Entity<ConsumedSignedIdentityToken>(t =>
+        {
+            t.Property(x => x.Jti).HasMaxLength(256);
+
+            // The sole replay-protection arbiter — see
+            // SignedIdentityTokenService's insert-first sequencing.
+            t.HasIndex(x => new { x.BusinessId, x.Jti }).IsUnique();
+
+            t.HasOne<Business>().WithMany()
+                .HasForeignKey(x => x.BusinessId)
+                .OnDelete(DeleteBehavior.Restrict);
         });
 
         // ─────────────────────────────────────────────────────────────

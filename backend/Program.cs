@@ -33,6 +33,19 @@ var neonConnectionUri = builder.Configuration.GetConnectionString("DefaultConnec
         "\"ConnectionStrings:DefaultConnection\" \"postgresql://...\"` (Development) or the " +
         "hosting platform's configuration (production) — never commit it to appsettings.json.");
 
+// TRANSACTION/SAVEPOINT DEPENDENCY (Step 21, signed-token half — see
+// docs/handoffs/step-21-signed-token-implementation-ready.md §4B):
+// SignedIdentityTokenService's jti-replay + Customer/ExternalIdentity
+// atomicity relies on EF Core's default automatic-savepoint behavior
+// across multiple SaveChangesAsync calls inside one BeginTransactionAsync
+// block — active ONLY because no resilient/retrying execution strategy is
+// configured below. Do not add EnableRetryOnFailure (or any other
+// execution strategy) to this UseNpgsql call without first re-reviewing
+// SignedIdentityTokenService's transaction handling — doing so silently
+// could change or disable that savepoint behavior and reopen the replay/
+// atomicity guarantee it depends on. The regression guard for this is
+// SignedIdentityTokenServiceTests.ValidateAndResolveAsync_FailureAfterJtiInsert_RollsBackJti_TokenRetryableAfterward
+// — a failure there means this exact dependency broke.
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseNpgsql(PostgresConnectionString.FromUri(neonConnectionUri), o => o.UseVector()));
 
@@ -492,6 +505,19 @@ builder.Services.Configure<VerificationOptions>(options =>
 });
 builder.Services.AddScoped<IVerificationCodeService, VerificationCodeService>();
 builder.Services.AddScoped<ILevel2VerificationChecker, Level2VerificationChecker>();
+
+// Step 21 (signed-token half). Unlike VerificationOptions above, nothing
+// here is a secret — Nivora only ever stores per-business PUBLIC keys
+// (BusinessSigningKey), never a private signing key — so a plain
+// configuration-section bind is sufficient, no dotnet user-secrets value
+// to inject. No production trigger for BusinessSigningKey registration
+// exists yet (manual/staff-mediated provisioning for v1, per the approved
+// design) — ISignedIdentityTokenService itself is fully wired into
+// WidgetController.Init below and is real, tested infrastructure, not
+// dormant like ToolDispatchService.
+builder.Services.Configure<SignedTokenOptions>(builder.Configuration.GetSection(SignedTokenOptions.SectionName));
+builder.Services.AddScoped<ISignedIdentityTokenService, SignedIdentityTokenService>();
+builder.Services.AddScoped<IConsumedSignedIdentityTokenCleanupService, ConsumedSignedIdentityTokenCleanupService>();
 
 builder.Services.ConfigureApplicationCookie(options =>
 {

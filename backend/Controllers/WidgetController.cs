@@ -12,7 +12,11 @@ using Microsoft.EntityFrameworkCore;
 
 namespace backend.Controllers;
 
-public record WidgetInitRequest(string PublicKey, string? VisitorSessionId);
+/// <summary>SignedIdentityToken (Step 21, signed-token half) is optional
+/// and additive — an absent or invalid value never fails Init itself, it
+/// only means the resulting session starts without a resolved CustomerId.
+/// See ISignedIdentityTokenService.</summary>
+public record WidgetInitRequest(string PublicKey, string? VisitorSessionId, string? SignedIdentityToken = null);
 
 public record WidgetInitResponse(string VisitorSessionId, string Token);
 
@@ -85,7 +89,8 @@ public record WidgetVerificationVerifyResponse(bool Verified, string? Reason);
 [ApiController]
 [Route("api/widget")]
 [EnableCors("Widget")]
-public class WidgetController(AppDbContext db, IWidgetTokenService tokenService) : ControllerBase
+public class WidgetController(
+    AppDbContext db, IWidgetTokenService tokenService, ISignedIdentityTokenService signedIdentityTokenService) : ControllerBase
 {
     [HttpPost("init")]
     [EnableRateLimiting("WidgetInit")]
@@ -144,7 +149,23 @@ public class WidgetController(AppDbContext db, IWidgetTokenService tokenService)
         // client-supplied id.
         visitorSessionId ??= Guid.NewGuid().ToString("N");
 
-        var token = tokenService.IssueToken(widget.BusinessId, widget.Id, visitorSessionId);
+        // Step 21 (signed-token half) — optional and additive. A missing or
+        // invalid token never fails Init; it just means customerId stays
+        // null and the session starts anonymous, same as today. Nivora's
+        // own specific rejection reason is never surfaced to the caller —
+        // see ISignedIdentityTokenService's own fail-closed discipline.
+        Guid? customerId = null;
+        if (!string.IsNullOrWhiteSpace(request.SignedIdentityToken))
+        {
+            var result = await signedIdentityTokenService.ValidateAndResolveAsync(
+                widget.BusinessId, request.SignedIdentityToken, HttpContext.RequestAborted);
+            if (result.Outcome == SignedIdentityTokenOutcome.Verified)
+            {
+                customerId = result.CustomerId;
+            }
+        }
+
+        var token = tokenService.IssueToken(widget.BusinessId, widget.Id, visitorSessionId, customerId);
 
         return Ok(new WidgetInitResponse(visitorSessionId, token));
     }
@@ -169,8 +190,13 @@ public class WidgetController(AppDbContext db, IWidgetTokenService tokenService)
         var businessId = Guid.Parse(User.FindFirstValue(NivoraClaimTypes.BusinessId)!);
         var widgetId = Guid.Parse(User.FindFirstValue(NivoraClaimTypes.WidgetId)!);
         var visitorSessionId = User.FindFirstValue(NivoraClaimTypes.VisitorSessionId)!;
+        // Step 21 (signed-token half) — present only if Init already
+        // successfully validated a signed identity token for this session.
+        Guid? customerId = Guid.TryParse(User.FindFirstValue(NivoraClaimTypes.CustomerId), out var claimCustomerId)
+            ? claimCustomerId
+            : null;
 
-        var message = await conversationService.PostMessageAsync(businessId, widgetId, visitorSessionId, request.Content);
+        var message = await conversationService.PostMessageAsync(businessId, widgetId, visitorSessionId, request.Content, customerId);
 
         // Deliberately called after the above has already committed — see
         // ClaudeReplyService's own doc comment for why. A null reply here

@@ -14,9 +14,13 @@ public interface IWidgetConversationService
     /// Persists a customer message, lazily creating the conversation if the
     /// visitor has no currently-Open one. Race-safe under concurrent first
     /// messages from the same visitor — see AdvisoryLockKeyGenerator.
+    /// customerId (Step 21, signed-token half) is set on the Conversation
+    /// only when it is newly created here — an already-existing
+    /// conversation's CustomerId is never overwritten by a later message,
+    /// regardless of what this call's customerId argument is.
     /// </summary>
     Task<Message> PostMessageAsync(
-        Guid businessId, Guid widgetId, string visitorSessionId, string content,
+        Guid businessId, Guid widgetId, string visitorSessionId, string content, Guid? customerId = null,
         CancellationToken cancellationToken = default);
 }
 
@@ -100,7 +104,7 @@ public interface IWidgetConversationService
 public class WidgetConversationService(AppDbContext db, INotificationService notificationService, ILogger<WidgetConversationService> logger) : IWidgetConversationService
 {
     public async Task<Message> PostMessageAsync(
-        Guid businessId, Guid widgetId, string visitorSessionId, string content,
+        Guid businessId, Guid widgetId, string visitorSessionId, string content, Guid? customerId = null,
         CancellationToken cancellationToken = default)
     {
         var lockKey = AdvisoryLockKeyGenerator.ForVisitorSession(businessId, widgetId, visitorSessionId);
@@ -137,6 +141,7 @@ public class WidgetConversationService(AppDbContext db, INotificationService not
                     VisitorSessionId = visitorSessionId,
                     Channel = ConversationChannels.Website,
                     HandledBy = HandledBy.Ai,
+                    CustomerId = customerId,
                     CreatedAt = now,
                     UpdatedAt = now,
                 };

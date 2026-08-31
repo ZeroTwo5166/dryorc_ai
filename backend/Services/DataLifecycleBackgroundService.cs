@@ -4,12 +4,14 @@ using Microsoft.Extensions.Hosting;
 namespace backend.Services;
 
 /// <summary>
-/// Periodic scheduler for the two age-based cleanup clocks (conversation
-/// retention, VerificationCode expiry) — deliberately thin. All the actual
-/// logic lives in RetentionEnforcementService/VerificationCodeCleanupService,
-/// which are tested directly by calling their methods, not by running this
-/// timer loop — a BackgroundService is host-lifecycle glue, not something
-/// worth exercising through its own timer in a test.
+/// Periodic scheduler for the age-based cleanup clocks (conversation
+/// retention, VerificationCode expiry, ConsumedSignedIdentityToken expiry —
+/// Step 21 signed-token half) — deliberately thin. All the actual logic
+/// lives in RetentionEnforcementService/VerificationCodeCleanupService/
+/// ConsumedSignedIdentityTokenCleanupService, each tested directly by
+/// calling its own methods, not by running this timer loop — a
+/// BackgroundService is host-lifecycle glue, not something worth
+/// exercising through its own timer in a test.
 ///
 /// AppDbContext is Scoped, so a fresh DI scope is created per tick rather
 /// than resolving the two services once at startup.
@@ -27,9 +29,11 @@ public class DataLifecycleBackgroundService(IServiceProvider serviceProvider) : 
             await using var scope = serviceProvider.CreateAsyncScope();
             var retention = scope.ServiceProvider.GetRequiredService<IRetentionEnforcementService>();
             var verificationCodeCleanup = scope.ServiceProvider.GetRequiredService<IVerificationCodeCleanupService>();
+            var signedIdentityTokenCleanup = scope.ServiceProvider.GetRequiredService<IConsumedSignedIdentityTokenCleanupService>();
 
             await retention.EnforceRetentionAsync(stoppingToken);
             await verificationCodeCleanup.CleanupExpiredAsync(stoppingToken);
+            await signedIdentityTokenCleanup.CleanupExpiredAsync(stoppingToken);
         } while (await timer.WaitForNextTickAsync(stoppingToken));
     }
 }

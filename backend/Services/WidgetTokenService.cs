@@ -10,8 +10,11 @@ namespace backend.Services;
 public interface IWidgetTokenService
 {
     /// <summary>Issues a fresh widget session token bound to this exact
-    /// (BusinessId, WidgetId, VisitorSessionId) tuple.</summary>
-    string IssueToken(Guid businessId, Guid widgetId, string visitorSessionId);
+    /// (BusinessId, WidgetId, VisitorSessionId) tuple. customerId is
+    /// Step 21 (signed-token half) — non-null only when Init already
+    /// successfully validated a signed identity token; embeds
+    /// NivoraClaimTypes.CustomerId when present, omits it otherwise.</summary>
+    string IssueToken(Guid businessId, Guid widgetId, string visitorSessionId, Guid? customerId = null);
 }
 
 /// <summary>
@@ -32,19 +35,23 @@ public class WidgetTokenService(IOptions<WidgetTokenOptions> options) : IWidgetT
     public const string Audience = "nivora-widget";
     public static readonly TimeSpan Lifetime = TimeSpan.FromHours(24);
 
-    public string IssueToken(Guid businessId, Guid widgetId, string visitorSessionId)
+    public string IssueToken(Guid businessId, Guid widgetId, string visitorSessionId, Guid? customerId = null)
     {
         var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(options.Value.SigningKey));
         var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
 
-        var claims = new[]
+        var claims = new List<Claim>
         {
-            new Claim(NivoraClaimTypes.BusinessId, businessId.ToString()),
-            new Claim(NivoraClaimTypes.WidgetId, widgetId.ToString()),
-            new Claim(NivoraClaimTypes.VisitorSessionId, visitorSessionId),
-            new Claim(JwtRegisteredClaimNames.Sub, visitorSessionId),
-            new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
+            new(NivoraClaimTypes.BusinessId, businessId.ToString()),
+            new(NivoraClaimTypes.WidgetId, widgetId.ToString()),
+            new(NivoraClaimTypes.VisitorSessionId, visitorSessionId),
+            new(JwtRegisteredClaimNames.Sub, visitorSessionId),
+            new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
         };
+        if (customerId is { } resolvedCustomerId)
+        {
+            claims.Add(new Claim(NivoraClaimTypes.CustomerId, resolvedCustomerId.ToString()));
+        }
 
         var token = new JwtSecurityToken(
             issuer: Issuer,

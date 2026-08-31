@@ -376,6 +376,67 @@ namespace backend.Migrations
                         });
                 });
 
+            modelBuilder.Entity("backend.Models.BusinessSigningKey", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("Algorithm")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
+                    b.Property<Guid>("BusinessId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTimeOffset>("CreatedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<Guid>("CreatedByUserId")
+                        .HasColumnType("uuid");
+
+                    b.Property<string>("PublicKeyPem")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<DateTimeOffset?>("RevokedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("BusinessId");
+
+                    b.HasIndex("CreatedByUserId");
+
+                    b.ToTable("BusinessSigningKeys");
+                });
+
+            modelBuilder.Entity("backend.Models.ConsumedSignedIdentityToken", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid>("BusinessId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTimeOffset>("ConsumedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Jti")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("BusinessId", "Jti")
+                        .IsUnique();
+
+                    b.ToTable("ConsumedSignedIdentityTokens");
+                });
+
             modelBuilder.Entity("backend.Models.Conversation", b =>
                 {
                     b.Property<Guid>("Id")
@@ -1642,6 +1703,30 @@ namespace backend.Migrations
                         .WithMany()
                         .HasForeignKey("ConversationId")
                         .OnDelete(DeleteBehavior.SetNull);
+                });
+
+            modelBuilder.Entity("backend.Models.BusinessSigningKey", b =>
+                {
+                    b.HasOne("backend.Models.Business", null)
+                        .WithMany()
+                        .HasForeignKey("BusinessId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.HasOne("backend.Models.ApplicationUser", null)
+                        .WithMany()
+                        .HasForeignKey("CreatedByUserId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("backend.Models.ConsumedSignedIdentityToken", b =>
+                {
+                    b.HasOne("backend.Models.Business", null)
+                        .WithMany()
+                        .HasForeignKey("BusinessId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
                 });
 
             modelBuilder.Entity("backend.Models.Conversation", b =>
