@@ -274,42 +274,69 @@ public class VerificationCodeService(
     private async Task<(CustomerMatchOutcome Outcome, Customer? Customer)> ResolveCustomerAsync(
         Guid businessId, string normalizedEmail, bool autoCreateIfMissing, CancellationToken cancellationToken)
     {
+        if (!autoCreateIfMissing)
+        {
+            // VerifyCodeAsync's call — never creates a Customer, so there is
+            // no race to serialize against here.
+            return ToOutcome(await MatchCustomersAsync(businessId, normalizedEmail, cancellationToken));
+        }
+
+        // RequestCodeAsync's call. Two concurrent requests for the same
+        // not-yet-existing email could otherwise both observe zero matches
+        // and both create a Customer — serialize the whole match+create
+        // decision under an advisory lock keyed by (BusinessId,
+        // normalizedEmail), re-reading matches fresh once the lock is held
+        // rather than trusting a pre-lock read. Deliberately a lock, not a
+        // (BusinessId, Email) unique-index/DB-constraint arbiter — see
+        // AdvisoryLockKeyGenerator.ForCustomerEmailResolution's own doc
+        // comment for why a DB constraint here would be wrong (it would
+        // outlaw the legitimate, already-supported case of multiple
+        // Customer rows sharing an email, which CustomerMatchOutcome.Ambiguous
+        // exists specifically to handle safely).
+        var lockKey = AdvisoryLockKeyGenerator.ForCustomerEmailResolution(businessId, normalizedEmail);
+
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+        await db.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock({lockKey})", cancellationToken);
+
+        var matches = await MatchCustomersAsync(businessId, normalizedEmail, cancellationToken);
+
+        if (matches.Count != 0)
+        {
+            await transaction.CommitAsync(cancellationToken);
+            return ToOutcome(matches);
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var newCustomer = new Customer
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            Email = normalizedEmail,
+            CreatedAt = now,
+            UpdatedAt = now,
+        };
+        db.Customers.Add(newCustomer);
+        await db.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return (CustomerMatchOutcome.SingleMatch, newCustomer);
+    }
+
+    private async Task<List<Customer>> MatchCustomersAsync(
+        Guid businessId, string normalizedEmail, CancellationToken cancellationToken) =>
         // c.Email != null both guards ToLower() and, as a side effect,
         // structurally excludes anonymized customers — Customer.cs's own
         // doc comment confirms Email is nulled on anonymization.
-        var matches = await db.Customers
+        await db.Customers
             .IgnoreQueryFilters()
             .Where(c => c.BusinessId == businessId && c.Email != null && c.Email.Trim().ToLower() == normalizedEmail)
             .ToListAsync(cancellationToken);
 
-        switch (matches.Count)
-        {
-            case 0:
-                if (!autoCreateIfMissing)
-                {
-                    return (CustomerMatchOutcome.ZeroMatches, null);
-                }
-
-                var now = DateTimeOffset.UtcNow;
-                var newCustomer = new Customer
-                {
-                    Id = Guid.NewGuid(),
-                    BusinessId = businessId,
-                    Email = normalizedEmail,
-                    CreatedAt = now,
-                    UpdatedAt = now,
-                };
-                db.Customers.Add(newCustomer);
-                await db.SaveChangesAsync(cancellationToken);
-                return (CustomerMatchOutcome.SingleMatch, newCustomer);
-
-            case 1:
-                return (CustomerMatchOutcome.SingleMatch, matches[0]);
-
-            default:
-                return (CustomerMatchOutcome.Ambiguous, null);
-        }
-    }
+    private static (CustomerMatchOutcome, Customer?) ToOutcome(List<Customer> matches) => matches.Count switch
+    {
+        0 => (CustomerMatchOutcome.ZeroMatches, null),
+        1 => (CustomerMatchOutcome.SingleMatch, matches[0]),
+        _ => (CustomerMatchOutcome.Ambiguous, null),
+    };
 
     /// <summary>
     /// Step 21 Finding A remediation. Fire-and-forget, deliberately detached

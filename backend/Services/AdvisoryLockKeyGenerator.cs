@@ -83,6 +83,28 @@ public static class AdvisoryLockKeyGenerator
     public static long ForVerificationCode(Guid businessId, Guid customerId, Guid conversationId, string channel) =>
         PackToLong($"{businessId:D}:verification:{customerId:D}:{conversationId:D}:{channel}");
 
+    /// <summary>
+    /// Scopes a lock to one (BusinessId, normalized email) pair's
+    /// zero-match Customer auto-create decision in
+    /// VerificationCodeService.ResolveCustomerAsync — serializes two
+    /// concurrent RequestCodeAsync calls for the same not-yet-existing
+    /// email so at most one Customer row is ever created for it. This is
+    /// deliberately a lock, not a unique-index/DB-constraint arbiter: a
+    /// (BusinessId, Email) unique index would make it impossible to ever
+    /// have more than one Customer sharing an email within a business —
+    /// but that is explicitly legal, intended schema state (a shared
+    /// family inbox, a role account), which is exactly what
+    /// CustomerMatchOutcome.Ambiguous exists to handle safely. This lock
+    /// only closes the race between two concurrent auto-creates; it does
+    /// not, and must not, change what counts as legal Customer data.
+    /// normalizedEmail must already be the same normalized form
+    /// ResolveCustomerAsync compares/stores (trim+lowercase) — two
+    /// differently-cased inputs for the same address must derive the same
+    /// key, matching NormalizeEmail's own case-insensitivity.
+    /// </summary>
+    public static long ForCustomerEmailResolution(Guid businessId, string normalizedEmail) =>
+        PackToLong($"{businessId:D}:customer-email:{normalizedEmail}");
+
     private static long PackToLong(string canonical)
     {
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));

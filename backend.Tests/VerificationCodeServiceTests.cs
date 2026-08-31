@@ -1037,6 +1037,94 @@ public class VerificationCodeServiceTests : IAsyncLifetime
         Assert.True(freshVerify.Success);
     }
 
+    /// <summary>
+    /// Same forced-pg_locks-interleaving convention as the resend-
+    /// supersession proof above, reused verbatim (barrier connection +
+    /// pg_locks waiter count + deterministic release) — not a bare
+    /// Task.WhenAll approximation. Proves the duplicate-Customer race an
+    /// independent audit found in ResolveCustomerAsync's zero-match
+    /// auto-create branch (two concurrent RequestCodeAsync calls for the
+    /// same brand-new email both observing zero matches and both creating
+    /// a Customer) is now closed by AdvisoryLockKeyGenerator.ForCustomerEmailResolution,
+    /// not by a (BusinessId, Email) unique-index/DB-constraint — see that
+    /// method's own doc comment for why a DB constraint would be the wrong
+    /// fix here (it would outlaw the legitimate, already-tested
+    /// Ambiguous-match scenario). Two different conversations in the same
+    /// business are used so the later, per-(customer,conversation,channel)
+    /// verification-code lock never contends between the two callers —
+    /// this test isolates the customer-resolution race specifically.
+    /// </summary>
+    [Fact]
+    public async Task RequestCodeAsync_ConcurrentZeroMatchRequestsForSameNewEmail_CreatesExactlyOneCustomer()
+    {
+        var (businessId, conversationA) = await SeedConversationAsync();
+        Conversation conversationB;
+        await using (var seedScope = _provider.CreateAsyncScope())
+        {
+            var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var widgetId = await CreateWidgetAsync(seedDb, businessId);
+            conversationB = await CreateConversationAsync(seedDb, businessId, widgetId);
+        }
+
+        var email = $"race-new-customer-{Guid.NewGuid():N}@example.com";
+        var normalizedEmail = email.Trim().ToLowerInvariant();
+        var lockKey = AdvisoryLockKeyGenerator.ForCustomerEmailResolution(businessId, normalizedEmail);
+
+        var (barrierConnection, barrierTransaction) = await AcquireBarrierAsync(lockKey);
+        await using var _bc = barrierConnection;
+        await using var _bt = barrierTransaction;
+
+        var task1 = Task.Run(async () =>
+        {
+            await using var scope = _provider.CreateAsyncScope();
+            var service = scope.ServiceProvider.GetRequiredService<IVerificationCodeService>();
+            return await service.RequestCodeAsync(businessId, conversationA.Id, conversationA.Channel, email, CancellationToken.None);
+        });
+        var task2 = Task.Run(async () =>
+        {
+            await using var scope = _provider.CreateAsyncScope();
+            var service = scope.ServiceProvider.GetRequiredService<IVerificationCodeService>();
+            return await service.RequestCodeAsync(businessId, conversationB.Id, conversationB.Channel, email, CancellationToken.None);
+        });
+
+        // Deterministic proof of genuine contention — both real callers
+        // (each on its own scope/DbContext/connection) are provably
+        // blocked on this exact advisory lock key before we ever let
+        // either proceed.
+        await WaitForAdvisoryLockWaitersAsync(barrierConnection, lockKey, 2, "customer-email-resolution");
+        await barrierTransaction.RollbackAsync();
+
+        var results = await Task.WhenAll(task1, task2);
+
+        // Both requests succeed — the second (lock-serialized) caller
+        // recovers by resolving to the first's already-committed Customer
+        // row, never creating a second identity and never surfacing an
+        // unhandled exception/500.
+        Assert.All(results, r => Assert.Equal(RequestCodeOutcome.Issued, r.Outcome));
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var customers = await verifyDb.Customers.IgnoreQueryFilters()
+            .Where(c => c.BusinessId == businessId && c.Email == normalizedEmail)
+            .ToListAsync();
+        Assert.Single(customers);
+
+        // Both conversations' issued codes resolved to the SAME Customer
+        // identity, not two different ones — checked via VerificationCode
+        // rather than Conversation.CustomerId, since RequestCodeAsync alone
+        // never attaches Conversation.CustomerId (see
+        // RequestCodeAsync_DoesNotAttachConversationCustomerId).
+        var codeCustomerIds = await verifyDb.VerificationCodes.IgnoreQueryFilters()
+            .Where(v => v.BusinessId == businessId
+                && (v.ConversationId == conversationA.Id || v.ConversationId == conversationB.Id))
+            .Select(v => v.CustomerId)
+            .Distinct()
+            .ToListAsync();
+        Assert.Single(codeCustomerIds);
+        Assert.Equal(customers[0].Id, codeCustomerIds[0]);
+    }
+
     private class FixedTenantAccessor(Guid? businessId) : ICurrentTenantAccessor
     {
         public Guid? BusinessId => businessId;
