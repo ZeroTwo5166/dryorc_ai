@@ -160,6 +160,18 @@ else
 }
 builder.Services.AddScoped<IClaudeReplyService, ClaudeReplyService>();
 
+// Step 19: tool-dispatch infrastructure only — see
+// docs/handoffs/step-19-tool-dispatch-design-approved.md and
+// docs/handoffs/step-19-idempotency-key-derivation-approved.md. Resolves
+// IEnumerable<IDispatchTool> the same way IntegrationsController already
+// resolves IEnumerable<IIntegrationOAuthProvider> above: correctly an empty
+// sequence with zero tools registered, which is the current state — no
+// concrete tool (read-only or write) is implemented or wired anywhere yet.
+// Not called from ClaudeReplyService or any controller; exists as
+// standalone, tested infrastructure pending future, separately authorized
+// tool implementations.
+builder.Services.AddScoped<IToolDispatchService, ToolDispatchService>();
+
 // Step 11: Voyage embeddings for KnowledgeDocument chunking/indexing — same
 // lazy pattern as Anthropic above. Startup must succeed whether or not
 // Voyage:ApiKey is configured; IKnowledgeIndexingService is always
