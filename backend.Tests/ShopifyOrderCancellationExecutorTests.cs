@@ -320,13 +320,23 @@ public class ShopifyOrderCancellationExecutorTests : IAsyncLifetime
         Assert.Equal(0, refundMethod.EnumerateObject().Count());
     }
 
-    [Fact]
-    public async Task ExecuteAsync_SendsMappedShopifyReasonString()
+    // Payment -> "DECLINED" and StaffError -> "STAFF" (not "PAYMENT"/
+    // "STAFF_ERROR") per Shopify's actual OrderCancelReason enum values,
+    // independently verified against shopify.dev — a prior version of this
+    // mapping/test asserted the wrong wire strings for both.
+    [Theory]
+    [InlineData(OrderCancelReason.Customer, "CUSTOMER")]
+    [InlineData(OrderCancelReason.Payment, "DECLINED")]
+    [InlineData(OrderCancelReason.Fraud, "FRAUD")]
+    [InlineData(OrderCancelReason.Inventory, "INVENTORY")]
+    [InlineData(OrderCancelReason.StaffError, "STAFF")]
+    [InlineData(OrderCancelReason.Other, "OTHER")]
+    public async Task ExecuteAsync_SendsMappedShopifyReasonString(OrderCancelReason reason, string expectedShopifyValue)
     {
         await using var scope = _provider.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var (businessId, customerId) = await CreateBusinessWithIntegrationAsync(db, scope.ServiceProvider);
-        var rowId = await CreatePendingRowAsync(scope.ServiceProvider, businessId, customerId, reason: OrderCancelReason.StaffError);
+        var rowId = await CreatePendingRowAsync(scope.ServiceProvider, businessId, customerId, reason: reason);
 
         string? capturedBody = null;
         var executor = NewExecutor(scope.ServiceProvider, req =>
@@ -337,7 +347,7 @@ public class ShopifyOrderCancellationExecutorTests : IAsyncLifetime
         await executor.ExecuteAsync(rowId, CancellationToken.None);
 
         using var doc = JsonDocument.Parse(capturedBody!);
-        Assert.Equal("STAFF_ERROR", doc.RootElement.GetProperty("variables").GetProperty("reason").GetString());
+        Assert.Equal(expectedShopifyValue, doc.RootElement.GetProperty("variables").GetProperty("reason").GetString());
     }
 
     [Fact]

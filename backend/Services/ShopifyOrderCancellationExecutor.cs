@@ -165,10 +165,10 @@ public class ShopifyOrderCancellationExecutor(
     private static string ToShopifyReason(OrderCancelReason reason) => reason switch
     {
         OrderCancelReason.Customer => "CUSTOMER",
-        OrderCancelReason.Payment => "PAYMENT",
+        OrderCancelReason.Payment => "DECLINED",
         OrderCancelReason.Fraud => "FRAUD",
         OrderCancelReason.Inventory => "INVENTORY",
-        OrderCancelReason.StaffError => "STAFF_ERROR",
+        OrderCancelReason.StaffError => "STAFF",
         OrderCancelReason.Other => "OTHER",
         _ => throw new ArgumentOutOfRangeException(nameof(reason), reason, "Unmapped OrderCancelReason value."),
     };
