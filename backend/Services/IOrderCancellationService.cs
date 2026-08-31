@@ -1,3 +1,5 @@
+using backend.Enums;
+
 namespace backend.Services;
 
 public record OrderCancellationResult(
@@ -9,9 +11,11 @@ public record OrderCancellationResult(
 /// Idempotency mechanism half of the OrderCancellation workflow — see the
 /// idempotency-mechanism handoff for the full design. Does not call Shopify
 /// itself; RequestCancellationAsync only ever leaves a Pending row behind on
-/// a fresh request. Actually invoking Shopify's orderCancel, interpreting
-/// its response/async job outcome, and deciding when to call
-/// MarkConfirmedAsync/MarkFailedAsync are a future pass's responsibility.
+/// a fresh request. ShopifyOrderCancellationExecutor actually invokes
+/// Shopify's orderCancel and calls MarkFailedAsync on orderCancelUserErrors;
+/// OrderCancellationReconciliationService is the only caller of
+/// MarkConfirmedAsync, via polling Order.cancelledAt — see
+/// docs/handoffs/pending-reconciliation-design-scoping.md.
 /// </summary>
 public interface IOrderCancellationService
 {
@@ -26,7 +30,7 @@ public interface IOrderCancellationService
     Task<OrderCancellationResult> RequestCancellationAsync(
         Guid businessId, Guid customerId, Guid? conversationId,
         string externalOrderId, string? customerReason,
-        string idempotencyKey, bool restock, bool refund,
+        string idempotencyKey, bool restock, RefundMethod? refundMethod, OrderCancelReason reason,
         CancellationToken cancellationToken);
 
     /// <summary>

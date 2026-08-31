@@ -12,11 +12,15 @@ namespace backend.Tests;
 /// <summary>
 /// Service-level tests for OrderCancellationService — real Postgres, same
 /// convention as OrderOwnershipAuthorizationServiceTests. Exercises only the
-/// idempotency mechanism itself: no Shopify call exists yet to exercise.
+/// idempotency mechanism itself: ShopifyOrderCancellationExecutorTests and
+/// OrderCancellationReconciliationServiceTests cover the Shopify-calling
+/// half.
 /// </summary>
 public class OrderCancellationServiceTests : IAsyncLifetime
 {
     private const string OrderId = "gid://shopify/Order/1";
+    private const RefundMethod DefaultRefundMethod = RefundMethod.OriginalPaymentMethod;
+    private const OrderCancelReason DefaultReason = OrderCancelReason.Customer;
 
     private ServiceProvider _provider = null!;
     private readonly List<Guid> _businessIdsToClean = [];
@@ -98,8 +102,8 @@ public class OrderCancellationServiceTests : IAsyncLifetime
         var key = Guid.NewGuid().ToString("N");
 
         var result = await service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, "changed mind", key, restock: true, refund: true,
-            CancellationToken.None);
+            businessId, customerId, null, OrderId, "changed mind", key, restock: true,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
 
         Assert.Equal(IdempotentOperationOutcome.InProgress, result.Outcome);
         Assert.Null(result.FailureReason);
@@ -108,8 +112,28 @@ public class OrderCancellationServiceTests : IAsyncLifetime
         Assert.Equal(OrderCancellationStatus.Pending, row.Status);
         Assert.Null(row.CompletedAt);
         Assert.True(row.Restock);
-        Assert.True(row.Refund);
+        Assert.Equal(DefaultRefundMethod, row.Method);
+        Assert.Equal(DefaultReason, row.Reason);
         Assert.Equal(OrderId, row.ExternalOrderId);
+    }
+
+    [Fact]
+    public async Task RequestCancellationAsync_NullRefundMethod_MeansNoRefund()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var service = scope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
+
+        var businessId = await CreateBusinessAsync(db);
+        var customerId = await CreateCustomerAsync(db, businessId);
+        var key = Guid.NewGuid().ToString("N");
+
+        var result = await service.RequestCancellationAsync(
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            refundMethod: null, DefaultReason, CancellationToken.None);
+
+        var row = await db.OrderCancellations.IgnoreQueryFilters().SingleAsync(x => x.Id == result.OrderCancellationId);
+        Assert.Null(row.Method);
     }
 
     [Fact]
@@ -124,9 +148,11 @@ public class OrderCancellationServiceTests : IAsyncLifetime
         var key = Guid.NewGuid().ToString("N");
 
         var first = await service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, null, key, restock: false, refund: true, CancellationToken.None);
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
         var second = await service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, null, key, restock: false, refund: true, CancellationToken.None);
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
 
         Assert.Equal(IdempotentOperationOutcome.InProgress, second.Outcome);
         Assert.Equal(first.OrderCancellationId, second.OrderCancellationId);
@@ -148,11 +174,13 @@ public class OrderCancellationServiceTests : IAsyncLifetime
         var key = Guid.NewGuid().ToString("N");
 
         var first = await service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, null, key, restock: false, refund: true, CancellationToken.None);
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
         await service.MarkConfirmedAsync(first.OrderCancellationId, CancellationToken.None);
 
         var second = await service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, null, key, restock: false, refund: true, CancellationToken.None);
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
 
         Assert.Equal(IdempotentOperationOutcome.Confirmed, second.Outcome);
         Assert.Equal(first.OrderCancellationId, second.OrderCancellationId);
@@ -170,11 +198,13 @@ public class OrderCancellationServiceTests : IAsyncLifetime
         var key = Guid.NewGuid().ToString("N");
 
         var first = await service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, null, key, restock: false, refund: true, CancellationToken.None);
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
         await service.MarkFailedAsync(first.OrderCancellationId, "Shopify rejected the mutation", CancellationToken.None);
 
         var second = await service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, null, key, restock: false, refund: true, CancellationToken.None);
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
 
         Assert.Equal(IdempotentOperationOutcome.Failed, second.Outcome);
         Assert.Equal("Shopify rejected the mutation", second.FailureReason);
@@ -192,10 +222,11 @@ public class OrderCancellationServiceTests : IAsyncLifetime
         var key = Guid.NewGuid().ToString("N");
 
         var first = await service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, null, key, restock: false, refund: true, CancellationToken.None);
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
         var second = await service.RequestCancellationAsync(
             businessId, customerId, null, "gid://shopify/Order/DIFFERENT", null, key,
-            restock: false, refund: true, CancellationToken.None);
+            restock: false, DefaultRefundMethod, DefaultReason, CancellationToken.None);
 
         Assert.Equal(IdempotentOperationOutcome.KeyReusedWithDifferentIntent, second.Outcome);
         Assert.Equal(first.OrderCancellationId, second.OrderCancellationId);
@@ -217,9 +248,53 @@ public class OrderCancellationServiceTests : IAsyncLifetime
         var key = Guid.NewGuid().ToString("N");
 
         await service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, null, key, restock: false, refund: true, CancellationToken.None);
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
         var second = await service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, null, key, restock: true, refund: true, CancellationToken.None);
+            businessId, customerId, null, OrderId, null, key, restock: true,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
+
+        Assert.Equal(IdempotentOperationOutcome.KeyReusedWithDifferentIntent, second.Outcome);
+    }
+
+    [Fact]
+    public async Task RequestCancellationAsync_SameKeyDifferentRefundMethod_ReturnsKeyReusedWithDifferentIntent()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var service = scope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
+
+        var businessId = await CreateBusinessAsync(db);
+        var customerId = await CreateCustomerAsync(db, businessId);
+        var key = Guid.NewGuid().ToString("N");
+
+        await service.RequestCancellationAsync(
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            RefundMethod.OriginalPaymentMethod, DefaultReason, CancellationToken.None);
+        var second = await service.RequestCancellationAsync(
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            RefundMethod.StoreCredit, DefaultReason, CancellationToken.None);
+
+        Assert.Equal(IdempotentOperationOutcome.KeyReusedWithDifferentIntent, second.Outcome);
+    }
+
+    [Fact]
+    public async Task RequestCancellationAsync_SameKeyDifferentReason_ReturnsKeyReusedWithDifferentIntent()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var service = scope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
+
+        var businessId = await CreateBusinessAsync(db);
+        var customerId = await CreateCustomerAsync(db, businessId);
+        var key = Guid.NewGuid().ToString("N");
+
+        await service.RequestCancellationAsync(
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, OrderCancelReason.Customer, CancellationToken.None);
+        var second = await service.RequestCancellationAsync(
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, OrderCancelReason.Fraud, CancellationToken.None);
 
         Assert.Equal(IdempotentOperationOutcome.KeyReusedWithDifferentIntent, second.Outcome);
     }
@@ -236,15 +311,16 @@ public class OrderCancellationServiceTests : IAsyncLifetime
         var key = Guid.NewGuid().ToString("N");
 
         var first = await service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, "reason A", key, restock: false, refund: true,
-            CancellationToken.None);
+            businessId, customerId, null, OrderId, "reason A", key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
         var second = await service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, "reason B (different)", key, restock: false, refund: true,
-            CancellationToken.None);
+            businessId, customerId, null, OrderId, "reason B (different)", key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
 
         // CustomerReason is explicitly excluded from the operation-defining
-        // intent (Section 3 of the handoff) — a duplicate with a different
-        // reason string must still be treated as the same logical request.
+        // intent (Section 3 of the idempotency handoff) — a duplicate with
+        // a different reason string must still be treated as the same
+        // logical request.
         Assert.Equal(IdempotentOperationOutcome.InProgress, second.Outcome);
         Assert.Equal(first.OrderCancellationId, second.OrderCancellationId);
     }
@@ -268,8 +344,8 @@ public class OrderCancellationServiceTests : IAsyncLifetime
             await using var callScope = _provider.CreateAsyncScope();
             var callService = callScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
             return await callService.RequestCancellationAsync(
-                businessId, customerId, null, OrderId, null, key, restock: false, refund: true,
-                CancellationToken.None);
+                businessId, customerId, null, OrderId, null, key, restock: false,
+                DefaultRefundMethod, DefaultReason, CancellationToken.None);
         }
 
         var results = await Task.WhenAll(CallAsync(), CallAsync());
@@ -296,9 +372,11 @@ public class OrderCancellationServiceTests : IAsyncLifetime
         var key = Guid.NewGuid().ToString("N");
 
         var first = await service.RequestCancellationAsync(
-            businessId1, customerId1, null, OrderId, null, key, restock: false, refund: true, CancellationToken.None);
+            businessId1, customerId1, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
         var second = await service.RequestCancellationAsync(
-            businessId2, customerId2, null, OrderId, null, key, restock: false, refund: true, CancellationToken.None);
+            businessId2, customerId2, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
 
         Assert.Equal(IdempotentOperationOutcome.InProgress, first.Outcome);
         Assert.Equal(IdempotentOperationOutcome.InProgress, second.Outcome);
@@ -318,7 +396,8 @@ public class OrderCancellationServiceTests : IAsyncLifetime
         var customerId = await CreateCustomerAsync(db, businessId);
 
         await Assert.ThrowsAsync<ArgumentException>(() => service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, null, key, restock: false, refund: true, CancellationToken.None));
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None));
     }
 
     [Fact]
@@ -333,7 +412,8 @@ public class OrderCancellationServiceTests : IAsyncLifetime
         var key = new string('k', 257);
 
         await Assert.ThrowsAsync<ArgumentException>(() => service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, null, key, restock: false, refund: true, CancellationToken.None));
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None));
     }
 
     [Fact]
@@ -348,7 +428,8 @@ public class OrderCancellationServiceTests : IAsyncLifetime
         var key = Guid.NewGuid().ToString("N");
 
         var created = await service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, null, key, restock: false, refund: true, CancellationToken.None);
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
         await service.MarkConfirmedAsync(created.OrderCancellationId, CancellationToken.None);
 
         var row = await db.OrderCancellations.IgnoreQueryFilters()
@@ -370,7 +451,8 @@ public class OrderCancellationServiceTests : IAsyncLifetime
         var key = Guid.NewGuid().ToString("N");
 
         var created = await service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, null, key, restock: false, refund: true, CancellationToken.None);
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
         await service.MarkFailedAsync(created.OrderCancellationId, "orderCancelUserErrors: already cancelled", CancellationToken.None);
 
         var row = await db.OrderCancellations.IgnoreQueryFilters()
@@ -393,7 +475,8 @@ public class OrderCancellationServiceTests : IAsyncLifetime
         var key = Guid.NewGuid().ToString("N");
 
         var created = await service.RequestCancellationAsync(
-            businessId, customerId, null, OrderId, null, key, restock: false, refund: true, CancellationToken.None);
+            businessId, customerId, null, OrderId, null, key, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
         await service.MarkFailedAsync(created.OrderCancellationId, "first failure", CancellationToken.None);
 
         // Row is now Failed (terminal) — a later MarkConfirmedAsync call

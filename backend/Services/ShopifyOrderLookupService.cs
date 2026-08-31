@@ -127,6 +127,119 @@ public class ShopifyOrderLookupService(
         return new VerifiedOrderOwnership(order.Id, order.Customer?.Id);
     }
 
+    private const string OrderCancellationStateQuery = """
+        query OrderCancellationStateLookup($id: ID!) {
+          order(id: $id) {
+            id
+            cancelledAt
+          }
+        }
+        """;
+
+    /// <summary>
+    /// New method, added alongside LookupOrderOwnerAsync without modifying
+    /// it — its own private response DTOs and its own inline credential
+    /// resolution (deliberately not factored out into a shared helper this
+    /// pass, to avoid touching LookupOrderOwnerAsync's already-audited,
+    /// already-tested body). See IShopifyOrderLookupService for the
+    /// rationale (Order.cancelledAt as reconciliation ground truth).
+    /// </summary>
+    public async Task<ShopifyOrderCancellationState> GetCancellationStateAsync(
+        Guid businessId, string externalOrderId, CancellationToken cancellationToken)
+    {
+        var integration = await db.Integrations
+            .IgnoreQueryFilters()
+            .FirstOrDefaultAsync(
+                i => i.BusinessId == businessId
+                    && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName
+                    && i.IsActive,
+                cancellationToken);
+
+        if (integration is null)
+        {
+            throw new InvalidOperationException(
+                $"No active Shopify integration found for business {businessId}.");
+        }
+
+        if (string.IsNullOrEmpty(integration.ExternalAccountIdentifier))
+        {
+            throw new InvalidOperationException(
+                $"Shopify integration for business {businessId} has no shop (ExternalAccountIdentifier) recorded.");
+        }
+
+        string accessToken;
+        try
+        {
+            accessToken = tokenProtector.Unprotect(
+                ShopifyIntegrationOAuthProvider.PlatformName, integration.EncryptedAccessToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new InvalidOperationException(
+                $"Failed to decrypt the Shopify access token for business {businessId}.", ex);
+        }
+
+        var shop = integration.ExternalAccountIdentifier;
+        var requestUri = $"https://{shop}.myshopify.com/admin/api/{options.Value.AdminApiVersion}/graphql.json";
+        var requestJson = JsonSerializer.Serialize(
+            new { query = OrderCancellationStateQuery, variables = new { id = externalOrderId } });
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, requestUri)
+        {
+            Content = new StringContent(requestJson, Encoding.UTF8, "application/json"),
+        };
+        request.Headers.Add("X-Shopify-Access-Token", accessToken);
+
+        using var response = await httpClient.SendAsync(request, cancellationToken);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException(
+                $"Shopify order cancellation-state lookup returned a non-success status ({(int)response.StatusCode}).");
+        }
+
+        ShopifyOrderCancellationStateResponse? body;
+        try
+        {
+            body = await response.Content.ReadFromJsonAsync<ShopifyOrderCancellationStateResponse>(JsonOptions, cancellationToken);
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidOperationException("Shopify order cancellation-state lookup returned malformed JSON.", ex);
+        }
+
+        if (body is null)
+        {
+            throw new InvalidOperationException("Shopify order cancellation-state lookup returned an empty response body.");
+        }
+
+        if (body.Errors is { Count: > 0 })
+        {
+            var messages = string.Join("; ", body.Errors.Select(e => e.Message));
+            throw new InvalidOperationException($"Shopify order cancellation-state lookup returned GraphQL errors: {messages}");
+        }
+
+        var order = body.Data?.Order;
+        if (order is null)
+        {
+            throw new InvalidOperationException(
+                $"Shopify reported no order for id '{externalOrderId}' during cancellation-state reconciliation.");
+        }
+
+        return new ShopifyOrderCancellationState(order.Id, order.CancelledAt);
+    }
+
+    private sealed record ShopifyOrderCancellationStateResponse(
+        [property: JsonPropertyName("data")] ShopifyOrderCancellationStateData? Data,
+        [property: JsonPropertyName("errors")] List<ShopifyGraphQlError>? Errors);
+
+    private sealed record ShopifyOrderCancellationStateData(
+        [property: JsonPropertyName("order")] ShopifyOrderCancellationStateOrderData? Order);
+
+    private sealed record ShopifyOrderCancellationStateOrderData(
+        [property: JsonPropertyName("id")] string Id,
+        [property: JsonPropertyName("cancelledAt")] DateTimeOffset? CancelledAt);
+
     private sealed record ShopifyOrderLookupResponse(
         [property: JsonPropertyName("data")] ShopifyOrderLookupData? Data,
         [property: JsonPropertyName("errors")] List<ShopifyGraphQlError>? Errors);

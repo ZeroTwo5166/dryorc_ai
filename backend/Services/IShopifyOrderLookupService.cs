@@ -47,6 +47,30 @@ public sealed class VerifiedOrderOwnership
 }
 
 /// <summary>
+/// Shopify's own authoritative cancellation state for an order — used by
+/// OrderCancellationReconciliationService as ground truth, in preference to
+/// tracking/polling the orderCancel mutation's own async Job id (see the
+/// pending-reconciliation design handoff for why: Order.cancelledAt answers
+/// "is this order actually cancelled" directly, without needing a stored
+/// job reference or inferring success from Job.done, which does not by
+/// itself distinguish a successful cancellation from a failed one).
+/// Same internal-constructor discipline as VerifiedOrderOwnership.
+/// </summary>
+public sealed class ShopifyOrderCancellationState
+{
+    public string ExternalOrderId { get; }
+
+    /// <summary>Null if Shopify reports the order has not been cancelled.</summary>
+    public DateTimeOffset? CancelledAt { get; }
+
+    internal ShopifyOrderCancellationState(string externalOrderId, DateTimeOffset? cancelledAt)
+    {
+        ExternalOrderId = externalOrderId;
+        CancelledAt = cancelledAt;
+    }
+}
+
+/// <summary>
 /// Step 20. Resolves a business's Shopify order to its authoritative owner
 /// via the Shopify Admin GraphQL API, using Nivora's own authenticated
 /// integration credentials — never a caller-supplied owner identity.
@@ -79,6 +103,16 @@ public interface IShopifyOrderLookupService
     /// ever constructs a VerifiedOrderOwnership.
     /// </summary>
     Task<VerifiedOrderOwnership> LookupOrderOwnerAsync(
+        Guid businessId,
+        string externalOrderId,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Same caller-input contract and same fail-closed-via-throw discipline
+    /// as LookupOrderOwnerAsync — added for OrderCancellationReconciliationService,
+    /// does not modify or share code with LookupOrderOwnerAsync's own query.
+    /// </summary>
+    Task<ShopifyOrderCancellationState> GetCancellationStateAsync(
         Guid businessId,
         string externalOrderId,
         CancellationToken cancellationToken);

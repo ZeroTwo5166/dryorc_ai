@@ -4,23 +4,30 @@ using backend.Interfaces;
 namespace backend.Models;
 
 /// <summary>
-/// Idempotency-tracked record of a Shopify orderCancel call. Refund and
-/// Restock are both parameters of the same orderCancel mutation (not
+/// Idempotency-tracked record of a Shopify orderCancel call. Method/Reason/
+/// Restock are all parameters of the same orderCancel mutation (not
 /// separate actions) — a standalone refund-without-cancellation goes
-/// through a separate refundOrder tool/table, not yet designed.
+/// through a separate refundOrder tool/table (Refund/RefundItem), not yet
+/// wired to any execution code.
 ///
-/// Refund/Restock reflect Nivora's own policy default at the moment this
-/// cancellation executed, translated into Shopify's orderCancel
-/// parameters — Shopify does not require a refund on cancellation;
-/// cancellation-without-refund is a fully valid Shopify state. Refund
-/// defaulting true is a Nivora policy choice, not a Shopify requirement.
+/// Method/Restock/Reason reflect Nivora's own policy default at the moment
+/// this cancellation executed, translated into Shopify's current (verified
+/// against shopify.dev this session — the plain `refund: Boolean` argument
+/// was deprecated in API version 2025-07) orderCancel parameters: `reason`
+/// is a required enum, `refundMethod` is a structured object, not a bool.
+/// Shopify does not require a refund on cancellation — Method == null is a
+/// fully valid Shopify state (cancellation-without-refund), not an error.
 ///
 /// orderCancel is ASYNCHRONOUS — Shopify returns a job, not an immediate
-/// result. Do not mark Status = Confirmed just because Shopify accepted
-/// the mutation; wait for job completion (poll or webhook) before
-/// confirming. FailureReason must capture both immediate mutation-level
-/// validation errors (orderCancelUserErrors) and later async job
-/// failures — these are two different failure points in the same flow.
+/// result. Do not mark Status = Confirmed just because Shopify accepted the
+/// mutation (job.done doesn't by itself prove success). ShopifyOrderCancellationExecutor
+/// never itself calls MarkConfirmedAsync — only OrderCancellationReconciliationService
+/// does, by polling Shopify's own Order.cancelledAt as ground truth, so
+/// exactly one code path ever performs that transition. FailureReason must
+/// capture immediate mutation-level validation errors (orderCancelUserErrors)
+/// recorded by the executor — async job failures with no corresponding
+/// orderCancelUserErrors surface only as a row that never reaches
+/// Order.cancelledAt, flagged (not auto-resolved) by reconciliation.
 ///
 /// CompletedAt is set only on successful confirmation — remains null on
 /// Failed (use FailureReason + UpdatedAt to determine when a failure was
@@ -50,7 +57,21 @@ public class OrderCancellation : ITenantOwned
     public OrderCancellationStatus Status { get; set; } = OrderCancellationStatus.Pending;
 
     public bool Restock { get; set; } = false;
-    public bool Refund { get; set; } = true;
+
+    /// <summary>
+    /// Shopify's own required orderCancel argument — not to be confused
+    /// with CustomerReason (free text, excluded from idempotency intent).
+    /// </summary>
+    public OrderCancelReason Reason { get; set; } = OrderCancelReason.Customer;
+
+    /// <summary>
+    /// Null means no refund. Non-null selects how Shopify's orderCancel
+    /// refundMethod argument is built — see ShopifyOrderCancellationExecutor.
+    /// Reuses the same enum as Refund.Method (a separate, still-unbuilt
+    /// standalone refund feature) since both represent the identical
+    /// Shopify-level choice.
+    /// </summary>
+    public RefundMethod? Method { get; set; } = Enums.RefundMethod.OriginalPaymentMethod;
 
     public string? FailureReason { get; set; }
 

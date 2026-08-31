@@ -514,6 +514,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
         builder.Entity<OrderCancellation>(o =>
         {
             o.Property(x => x.Status).HasConversion<string>().HasMaxLength(32);
+            o.Property(x => x.Reason).HasConversion<string>().HasMaxLength(32);
+            o.Property(x => x.Method).HasConversion<string>().HasMaxLength(32);
             o.Property(x => x.ExternalOrderId).HasMaxLength(256);
             o.Property(x => x.IdempotencyKey).HasMaxLength(256);
 

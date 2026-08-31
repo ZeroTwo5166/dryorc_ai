@@ -28,7 +28,7 @@ public class OrderCancellationService(AppDbContext db) : IOrderCancellationServi
     public async Task<OrderCancellationResult> RequestCancellationAsync(
         Guid businessId, Guid customerId, Guid? conversationId,
         string externalOrderId, string? customerReason,
-        string idempotencyKey, bool restock, bool refund,
+        string idempotencyKey, bool restock, RefundMethod? refundMethod, OrderCancelReason reason,
         CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 256)
@@ -49,7 +49,8 @@ public class OrderCancellationService(AppDbContext db) : IOrderCancellationServi
             IdempotencyKey = idempotencyKey,
             Status = OrderCancellationStatus.Pending,
             Restock = restock,
-            Refund = refund,
+            Method = refundMethod,
+            Reason = reason,
             RequestedAt = now,
             UpdatedAt = now,
         };
@@ -88,7 +89,8 @@ public class OrderCancellationService(AppDbContext db) : IOrderCancellationServi
 
             var sameIntent = existing.ExternalOrderId == externalOrderId
                 && existing.Restock == restock
-                && existing.Refund == refund;
+                && existing.Method == refundMethod
+                && existing.Reason == reason;
 
             if (!sameIntent)
             {

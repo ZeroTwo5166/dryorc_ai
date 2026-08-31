@@ -298,6 +298,18 @@ builder.Services.AddScoped<IOrderOwnershipAuthorizationService, OrderOwnershipAu
 builder.Services.AddScoped<IOrderCancellationService, OrderCancellationService>();
 builder.Services.AddScoped<ICustomerUpdateActionService, CustomerUpdateActionService>();
 
+// Pending-reconciliation design pass: ShopifyOrderCancellationExecutor
+// actually calls orderCancel (no production trigger yet — deliberate, see
+// docs/handoffs/pending-reconciliation-design-scoping.md; exercised only
+// by tests). OrderCancellationReconciliationBackgroundService runs for
+// real in every environment, same as DataLifecycleBackgroundService below
+// — harmless when there are zero Pending rows, which is the current state
+// since nothing production-facing creates one yet.
+builder.Services.AddHttpClient<ShopifyOrderCancellationExecutor>();
+builder.Services.AddTransient<IOrderCancellationExecutor>(sp => sp.GetRequiredService<ShopifyOrderCancellationExecutor>());
+builder.Services.AddScoped<IOrderCancellationReconciliationService, OrderCancellationReconciliationService>();
+builder.Services.AddHostedService<OrderCancellationReconciliationBackgroundService>();
+
 // ─────────────────────────────────────────────────────────────
 // Identity — cookie-based auth for staff/dashboard users.
 //
