@@ -8,15 +8,17 @@ namespace backend.Services;
 
 /// <summary>
 /// The concrete IApprovedActionExecutor implementation for cancelOrder.
-/// Implements steps 3–8 of the execution ordering in
+/// Implements steps 3–9 of the execution ordering in
 /// docs/handoffs/step-22z-approval-proposal-approval-lifecycle-design.md
 /// §10: the Approval load + tenant binding + ApprovalNotFound refusal
-/// (Step 29), and — added by this pass, per
-/// docs/handoffs/step-38-cancelorder-execute-next-slice-design.md §6 — the
-/// Status/ExpiresAt/CustomerId checks (steps 6/7/8). Every step past that
-/// — Level 2, ownership, hash recompute, the atomic claim, and the Shopify
-/// call — is explicitly NOT implemented by this pass and throws
-/// NotImplementedException if reached. See step-38 for the full design
+/// (Step 29), the Status/ExpiresAt/CustomerId checks (steps 6/7/8, per
+/// docs/handoffs/step-38-cancelorder-execute-next-slice-design.md §6), and
+/// — added by this pass, per
+/// docs/handoffs/step-39-cancelorder-execute-steps-9-16-next-slice-design.md
+/// §7 — the Level 2 verification check (step 9). Every step past that —
+/// ownership, hash recompute, the atomic claim, and the Shopify call — is
+/// explicitly NOT implemented by this pass and throws
+/// NotImplementedException if reached. See step-39 for the full design
 /// this class will eventually satisfy in full.
 ///
 /// The Approval-load query below deliberately does NOT call
@@ -29,7 +31,8 @@ namespace backend.Services;
 /// refusal, independently confirmed by docs/handoffs/step-24/25/26. Adding
 /// IgnoreQueryFilters() here would silently reopen a cross-tenant read.
 /// </summary>
-public class OrderCancelApprovedActionExecutor(AppDbContext db, IAuditLogService auditLogService) : IApprovedActionExecutor
+public class OrderCancelApprovedActionExecutor(
+    AppDbContext db, IAuditLogService auditLogService, ILevel2VerificationChecker level2Checker) : IApprovedActionExecutor
 {
     public async Task<ExecutionOutcome> ExecuteApprovedActionAsync(
         Guid approvalId, CancellationToken cancellationToken)
@@ -97,14 +100,34 @@ public class OrderCancelApprovedActionExecutor(AppDbContext db, IAuditLogService
                 "Conversation no longer has a resolved customer.");
         }
 
+        // Step 9 — Level 2 verification, execution-time only per Decision 2
+        // (ADOPTED, docs/handoffs/step-22-ai-action-safety-model-owner-decisions.md
+        // §0 item 2). A pure read (ILevel2VerificationChecker performs only
+        // local DB reads, no external call, no infra-failure branch to
+        // classify — step-39 §2). AuditLog write required — DECIDED by
+        // explicit owner decision, not source-derived, per step-39 §5a: no
+        // shared mechanical gate, no draft naming, and no standalone
+        // confirming statement exists for this refusal the way steps 6/7/11
+        // each have one, but the owner chose parity with steps 6/7 anyway.
+        var level2Verified = await level2Checker.IsVerifiedAsync(
+            approval.BusinessId, approval.ConversationId, cancellationToken);
+        if (!level2Verified)
+        {
+            await WriteUnauthorizedExecutionBlockedAsync(approval, "Level2VerificationFailed", cancellationToken);
+
+            return new ExecutionOutcome.Refused(
+                ExecutionRefusalReason.Level2VerificationFailed,
+                "Conversation is not currently Level 2 verified.");
+        }
+
         throw new NotImplementedException(
-            "OrderCancelApprovedActionExecutor implements steps 3-8 of the execution ordering so far " +
+            "OrderCancelApprovedActionExecutor implements steps 3-9 of the execution ordering so far " +
             "(Approval load/ApprovalNotFound + tenant binding, status/expiry checks with AuditLog " +
-            "writes, customer re-derivation). Every step beyond that — Level 2 verification, ownership " +
-            "verification, action-hash recomputation, the atomic Approved->Consumed claim, and the " +
-            "Shopify orderCancel call — is deliberately not yet implemented. See " +
-            "docs/handoffs/step-38-cancelorder-execute-next-slice-design.md for the full design this " +
-            "method will eventually satisfy.");
+            "writes, customer re-derivation, Level 2 verification with an AuditLog write). Every step " +
+            "beyond that — ownership verification, action-hash recomputation, the atomic " +
+            "Approved->Consumed claim, and the Shopify orderCancel call — is deliberately not yet " +
+            "implemented. See docs/handoffs/step-39-cancelorder-execute-steps-9-16-next-slice-design.md " +
+            "for the full design this method will eventually satisfy.");
     }
 
     /// <summary>

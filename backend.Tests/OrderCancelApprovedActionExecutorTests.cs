@@ -14,15 +14,18 @@ namespace backend.Tests;
 /// <summary>
 /// Service-level tests for OrderCancelApprovedActionExecutor, run against
 /// the real Neon dev DB via a bare ServiceProvider, same pattern as
-/// OrderCancelProposalToolTests. Covers steps 3-8 of the execution ordering
+/// OrderCancelProposalToolTests. Covers steps 3-9 of the execution ordering
 /// (docs/handoffs/step-22z-approval-proposal-approval-lifecycle-design.md
 /// §10): the Approval load, ApprovalNotFound refusal (including the
 /// tenant-fold-in property independently confirmed by
 /// docs/handoffs/step-24/25/26), the Status/ExpiresAt/CustomerId checks
 /// added by docs/handoffs/step-38-cancelorder-execute-next-slice-design.md
 /// §6 (steps 6/7/8, with an AuditLog write required for steps 6/7 but
-/// deliberately not for step 8), plus one boundary test documenting that
-/// everything past step 8 still throws NotImplementedException.
+/// deliberately not for step 8), the Level 2 verification check added by
+/// docs/handoffs/step-39-cancelorder-execute-steps-9-16-next-slice-design.md
+/// §7 (step 9, with an AuditLog write per the explicit owner decision
+/// recorded in that document's §5a), plus one boundary test documenting
+/// that everything past step 9 still throws NotImplementedException.
 ///
 /// Uses a MutableTenantAccessor (same shape as AppDbContextTenantFilterTests'
 /// own private nested class — not shared, per this codebase's established
@@ -48,6 +51,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
                 PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()))
             .AddScoped<IAuditLogService, AuditLogService>()
+            .AddScoped<ILevel2VerificationChecker, Level2VerificationChecker>()
             .BuildServiceProvider();
 
         return Task.CompletedTask;
@@ -79,17 +83,23 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
 
     /// <summary>
     /// Seeds one Business/Widget/Customer/Conversation/Approval graph.
-    /// `status`/`expiresAt`/`customerResolved` let each test target exactly
-    /// one of steps 6/7/8's own branches without touching the others —
-    /// defaults (Approved, 15 minutes out, resolved customer) are the
-    /// "everything passes" case the existing NotImplementedException test
-    /// relies on.
+    /// `status`/`expiresAt`/`customerResolved`/`level2Verified` let each
+    /// test target exactly one of steps 6/7/8/9's own branches without
+    /// touching the others — defaults (Approved, 15 minutes out, resolved
+    /// customer, Level 2 verified) are the "everything passes" case the
+    /// existing NotImplementedException test relies on. `level2Verified`
+    /// sets `Conversation.Level2VerifiedUntil` to one hour in the future
+    /// when true (matching `Level2VerificationChecker.IsVerifiedAsync`'s
+    /// own `until > now` check), or leaves it null when false — no
+    /// `ExternalIdentity` row is seeded either way, so a false value always
+    /// fails verification via both of that checker's own paths.
     /// </summary>
     private async Task<(Business Business, Approval Approval)> SeedApprovalAsync(
         AppDbContext db,
         ApprovalStatus status = ApprovalStatus.Approved,
         DateTimeOffset? expiresAt = null,
-        bool customerResolved = true)
+        bool customerResolved = true,
+        bool level2Verified = true)
     {
         var now = DateTimeOffset.UtcNow;
         var business = new Business
@@ -127,6 +137,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
             VisitorSessionId = Guid.NewGuid().ToString("N"),
             Channel = "Website",
             Status = ConversationStatus.Open,
+            Level2VerifiedUntil = level2Verified ? now.AddHours(1) : null,
             CreatedAt = now,
             UpdatedAt = now,
         };
@@ -201,7 +212,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         await using var readScope = _provider.CreateAsyncScope();
         var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
-        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService);
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService, level2Checker);
 
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
 
@@ -223,7 +235,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         await using var readScope = _provider.CreateAsyncScope();
         var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
-        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService);
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService, level2Checker);
 
         var outcome = await executor.ExecuteApprovedActionAsync(Guid.NewGuid(), CancellationToken.None);
 
@@ -257,7 +270,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         await using var readScope = _provider.CreateAsyncScope();
         var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
-        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService);
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService, level2Checker);
 
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
 
@@ -294,7 +308,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         await using var readScope = _provider.CreateAsyncScope();
         var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
-        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService);
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService, level2Checker);
 
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
 
@@ -329,7 +344,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         await using var readScope = _provider.CreateAsyncScope();
         var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
-        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService);
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService, level2Checker);
 
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
 
@@ -341,17 +357,60 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Step 9 — a currently-unverified Conversation (no
+    /// `Level2VerifiedUntil` in the future, no `ExternalIdentity` row) must
+    /// refuse with `Level2VerificationFailed` and write exactly one durable
+    /// `AuditLog` row, matching steps 6/7's exact shape — per the explicit
+    /// owner decision recorded in
+    /// docs/handoffs/step-39-cancelorder-execute-steps-9-16-next-slice-design.md
+    /// §5a (source itself did not settle this; the owner decided parity
+    /// with steps 6/7 anyway). Also proves ordering: this Approval is
+    /// Approved, unexpired, and has a resolved customer, so if steps
+    /// 6/7/8 incorrectly fired first this test would fail on the wrong
+    /// `ExecutionRefusalReason`.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteApprovedActionAsync_Level2VerificationFailed_ReturnsLevel2VerificationFailedAndWritesAuditLog()
+    {
+        var tenant = (MutableTenantAccessor)_provider.GetRequiredService<ICurrentTenantAccessor>();
+
+        await using var seedScope = _provider.CreateAsyncScope();
+        var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, approval) = await SeedApprovalAsync(seedDb, level2Verified: false);
+
+        tenant.CurrentBusinessId = business.Id;
+        await using var readScope = _provider.CreateAsyncScope();
+        var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService, level2Checker);
+
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
+
+        var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
+        Assert.Equal(ExecutionRefusalReason.Level2VerificationFailed, refused.Reason);
+
+        var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
+        var entry = Assert.Single(auditLogs);
+        Assert.Equal(AuditEventTypes.UnauthorizedActionBlocked, entry.EventType);
+        Assert.Equal(ActorType.NivoraSystem, entry.Actor);
+        Assert.Null(entry.ChangedByUserId);
+        Assert.Equal("Level2VerificationFailed", entry.NewValue);
+    }
+
+    /// <summary>
     /// Deliberate scope-boundary test, same convention as
     /// OrderCancelProposalToolTests' own explicit-refusal tests: documents,
     /// rather than merely leaves implicit, exactly where this session's
     /// implementation stops. Must be updated (not deleted) by whichever
-    /// future session extends ExecuteApprovedActionAsync past step 8 — a
+    /// future session extends ExecuteApprovedActionAsync past step 9 — a
     /// passing NotImplementedException here after that point would mean the
     /// new step's logic was never reached. Also proves the adjacent-case
-    /// negative: a valid Approved+unexpired+resolved-customer Approval does
-    /// NOT trigger any of steps 6/7/8's refusals, and writes NO AuditLog row
-    /// — steps 6/7's writes are conditional on their own refusal firing,
-    /// not unconditional on every ExecuteApprovedActionAsync call.
+    /// negative: a valid Approved+unexpired+resolved-customer+Level2-verified
+    /// Approval does NOT trigger any of steps 6/7/8/9's refusals, and writes
+    /// NO AuditLog row — steps 6/7/9's writes are conditional on their own
+    /// refusal firing, not unconditional on every ExecuteApprovedActionAsync
+    /// call.
     /// </summary>
     [Fact]
     public async Task ExecuteApprovedActionAsync_ApprovalExistsForCurrentTenant_ThrowsNotImplementedAndWritesNoAuditLog()
@@ -366,7 +425,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         await using var readScope = _provider.CreateAsyncScope();
         var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
-        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService);
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService, level2Checker);
 
         await Assert.ThrowsAsync<NotImplementedException>(
             () => executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None));
