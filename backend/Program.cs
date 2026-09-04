@@ -323,6 +323,13 @@ builder.Services.AddTransient<IOrderCancellationExecutor>(sp => sp.GetRequiredSe
 builder.Services.AddScoped<IOrderCancellationReconciliationService, OrderCancellationReconciliationService>();
 builder.Services.AddHostedService<OrderCancellationReconciliationBackgroundService>();
 
+// IApprovedActionExecutor's implementation, still deliberately partial —
+// steps 3-8 of the execution ordering exist so far (Approval load,
+// ApprovalNotFound refusal, status/expiry checks with AuditLog writes,
+// customer re-derivation; see docs/handoffs/step-38-cancelorder-execute-next-slice-design.md).
+// No staff-facing endpoint calls this yet.
+builder.Services.AddScoped<IApprovedActionExecutor, OrderCancelApprovedActionExecutor>();
+
 // ─────────────────────────────────────────────────────────────
 // Identity — cookie-based auth for staff/dashboard users.
 //

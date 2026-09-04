@@ -18,4 +18,5 @@ public static class AuditEntityTypes
     public const string ExternalIdentity = "ExternalIdentity";
     public const string TagModeMapping = "TagModeMapping";
     public const string ApplicationUser = "ApplicationUser";
+    public const string Approval = "Approval";
 }
