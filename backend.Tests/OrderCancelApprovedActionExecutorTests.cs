@@ -59,7 +59,6 @@ namespace backend.Tests;
 public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
 {
     private const string AdminApiVersion = "2026-07";
-    private const string Shop = "test-shop";
     private const string AccessToken = "test-access-token";
 
     private ServiceProvider _provider = null!;
@@ -232,7 +231,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
             BusinessId = businessId,
             Platform = ShopifyIntegrationOAuthProvider.PlatformName,
             EncryptedAccessToken = tokenProtector.Protect(ShopifyIntegrationOAuthProvider.PlatformName, AccessToken),
-            ExternalAccountIdentifier = Shop,
+            ExternalAccountIdentifier = $"test-shop-{Guid.NewGuid():N}",
             IsActive = true,
             ConnectedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow,

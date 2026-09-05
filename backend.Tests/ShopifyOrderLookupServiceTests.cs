@@ -22,7 +22,7 @@ namespace backend.Tests;
 public class ShopifyOrderLookupServiceTests : IAsyncLifetime
 {
     private const string AdminApiVersion = "2026-07";
-    private const string Shop = "test-shop";
+    private readonly string Shop = $"test-shop-{Guid.NewGuid():N}";
     private const string AccessToken = "test-access-token";
 
     private ServiceProvider _provider = null!;
@@ -64,7 +64,7 @@ public class ShopifyOrderLookupServiceTests : IAsyncLifetime
     }
 
     private async Task<Guid> CreateBusinessWithIntegrationAsync(
-        bool isActive = true, string? externalAccountIdentifier = Shop, string? encryptedAccessTokenOverride = null)
+        bool isActive = true, string? externalAccountIdentifier = null, string? encryptedAccessTokenOverride = null)
     {
         await using var scope = _provider.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -87,7 +87,7 @@ public class ShopifyOrderLookupServiceTests : IAsyncLifetime
             Platform = ShopifyIntegrationOAuthProvider.PlatformName,
             EncryptedAccessToken = encryptedAccessTokenOverride
                 ?? tokenProtector.Protect(ShopifyIntegrationOAuthProvider.PlatformName, AccessToken),
-            ExternalAccountIdentifier = externalAccountIdentifier,
+            ExternalAccountIdentifier = externalAccountIdentifier ?? Shop,
             IsActive = isActive,
             ConnectedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow,
