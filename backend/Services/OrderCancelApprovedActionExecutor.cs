@@ -44,6 +44,24 @@ namespace backend.Services;
 /// constructor is internal to IShopifyOrderLookupService, so AuthorizeAsync
 /// cannot be invoked without first calling LookupOrderOwnerAsync — there is
 /// no ownership-verification path that avoids the Shopify call entirely.
+///
+/// Steps 11 (action-hash recompute) and 12 (execution-leg key derivation),
+/// added by docs/handoffs/step-42-cancelorder-execute-steps-11-12-classification-and-identity-collapse-analysis.md
+/// §8: ActionHasher.Derive is recomputed from the same six-value tuple
+/// ProposeAsync originally hashed (five fields read back unchanged from
+/// the immutable Approval row, plus the freshly re-derived customerId from
+/// step 8) and compared byte-for-byte to Approval.ActionHash — on mismatch,
+/// refused and audited identically whether the drift is legitimate
+/// (customer identity changed) or a genuine tampering attempt (step-22z
+/// §13: "a legitimate state-drift denial and a genuine tampering attempt
+/// are handled identically"). ApprovalExecutionKeyDeriver.Derive is a pure,
+/// always-succeeding function (re-confirmed: zero throw/validation
+/// branches) with no refusal path and no audit-write requirement of its
+/// own (step-42 §2) — its result is held for step 13 (not yet implemented)
+/// to consume. The two derivations share four of their inputs but must
+/// never be conflated: see the naming discipline and inline warning at
+/// their call sites below, and step-42 §7 for the exact collapse risk this
+/// guards against.
 /// </summary>
 public class OrderCancelApprovedActionExecutor(
     AppDbContext db,
@@ -172,14 +190,52 @@ public class OrderCancelApprovedActionExecutor(
                 $"Order ownership verification failed: {ownershipResult.Reason}.");
         }
 
+        // Step 11 — recompute the action hash from the same six-value tuple
+        // ProposeAsync originally hashed: five fields read back unchanged
+        // from the immutable Approval row, plus the freshly re-derived
+        // customerId (step 8) — never approval.CustomerId, which may have
+        // drifted since proposal time. Compared byte-for-byte to the
+        // stored Approval.ActionHash. On mismatch, refuse unconditionally
+        // and audit identically regardless of cause — step-22z §13: "a
+        // legitimate state-drift denial and a genuine tampering attempt
+        // are handled identically (fail closed)." No special-casing by
+        // cause is introduced here.
+        var recomputedActionHash = ActionHasher.Derive(
+            approval.BusinessId, approval.ConversationId, customerId,
+            approval.ToolName, approval.ResourceId, approval.CanonicalArguments);
+        if (recomputedActionHash != approval.ActionHash)
+        {
+            await WriteUnauthorizedExecutionBlockedAsync(approval, "ActionHashMismatch", cancellationToken);
+
+            return new ExecutionOutcome.Refused(
+                ExecutionRefusalReason.ActionHashMismatch,
+                "Recomputed action hash does not match the approved hash.");
+        }
+
+        // Step 12 — derive this execution attempt's own identity key, for
+        // step 13 (not yet implemented) to consume as
+        // OrderCancellation.IdempotencyKey. A pure, always-succeeding
+        // function (ApprovalExecutionKeyDeriver.Derive has zero throw/
+        // validation branches) — no refusal path, no AuditLog write, both
+        // confirmed source-side (step-42 §2), not merely assumed.
+        //
+        // Do NOT reuse recomputedActionHash (step 11's output) as an
+        // idempotency key input for step 13 — they serve different
+        // purposes and mixing them produces a silent, hard-to-detect bug
+        // (the wrong uniqueness guard fires without error). See step-42
+        // §7 for the exact collapse risk this guards against.
+        var approvalExecutionKey = ApprovalExecutionKeyDeriver.Derive(
+            approval.BusinessId, approval.ToolName, approval.ResourceId,
+            approval.CanonicalArguments, approval.Id);
+
         throw new NotImplementedException(
-            "OrderCancelApprovedActionExecutor implements steps 3-10 of the execution ordering so far " +
+            "OrderCancelApprovedActionExecutor implements steps 3-12 of the execution ordering so far " +
             "(Approval load/ApprovalNotFound + tenant binding, status/expiry checks with AuditLog " +
             "writes, customer re-derivation, Level 2 verification with an AuditLog write, ownership " +
-            "verification with an AuditLog write). Every step beyond that — action-hash recomputation, " +
-            "the atomic Approved->Consumed claim, and the Shopify orderCancel mutation call — is " +
-            "deliberately not yet implemented. See " +
-            "docs/handoffs/step-41-cancelorder-execute-steps-10-16-classification-and-atomic-claim-design.md " +
+            "verification with an AuditLog write, action-hash recomputation with an AuditLog write, " +
+            "execution-leg key derivation). Every step beyond that — the atomic Approved->Consumed " +
+            "claim, and the Shopify orderCancel mutation call — is deliberately not yet implemented. " +
+            "See docs/handoffs/step-42-cancelorder-execute-steps-11-12-classification-and-identity-collapse-analysis.md " +
             "for the full design this method will eventually satisfy.");
     }
 

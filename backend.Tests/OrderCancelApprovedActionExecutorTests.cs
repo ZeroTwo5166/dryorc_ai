@@ -15,7 +15,7 @@ namespace backend.Tests;
 /// <summary>
 /// Service-level tests for OrderCancelApprovedActionExecutor, run against
 /// the real Neon dev DB via a bare ServiceProvider, same pattern as
-/// OrderCancelProposalToolTests. Covers steps 3-10 of the execution ordering
+/// OrderCancelProposalToolTests. Covers steps 3-12 of the execution ordering
 /// (docs/handoffs/step-22z-approval-proposal-approval-lifecycle-design.md
 /// §10): the Approval load, ApprovalNotFound refusal (including the
 /// tenant-fold-in property independently confirmed by
@@ -29,8 +29,12 @@ namespace backend.Tests;
 /// by docs/handoffs/step-41-cancelorder-execute-steps-10-16-classification-and-atomic-claim-design.md
 /// §6 (step 10, with an AuditLog write, endorsing
 /// docs/handoffs/step-40-cancelorder-execute-step-10-ownership-design.md
-/// §4/§5), plus one boundary test documenting that everything past step 10
-/// still throws NotImplementedException.
+/// §4/§5), the action-hash recompute and execution-leg key derivation added
+/// by docs/handoffs/step-42-cancelorder-execute-steps-11-12-classification-and-identity-collapse-analysis.md
+/// §8 (steps 11/12, step 11 with an AuditLog write, step 12 with none —
+/// it is a pure, always-succeeding derivation with no observable output in
+/// this slice), plus one boundary test documenting that everything past
+/// step 12 still throws NotImplementedException.
 ///
 /// Uses a MutableTenantAccessor (same shape as AppDbContextTenantFilterTests'
 /// own private nested class — not shared, per this codebase's established
@@ -121,6 +125,16 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
     /// `customerExternalId`, added for step 10, sets `Customer.ExternalId`
     /// (null by default — CustomerNotLinkedToExternalIdentity would fire if
     /// a step-10 test reached AuthorizeAsync without setting this).
+    /// `actionHashCustomerIdOverride`, added for step 11, lets a test store
+    /// an `Approval.ActionHash` computed against a *different* CustomerId
+    /// than the one actually linked to the Conversation — simulating the
+    /// one genuine drift step 11's recompute can detect (per step-24 §2a:
+    /// with `Execute`'s locked, `approvalId`-only signature, `CustomerId`
+    /// is the only one of the six hash inputs ever re-derived from a live
+    /// source, so a mismatch can only ever mean customer-identity drift
+    /// since proposal time). `null` (default) means the hash is computed
+    /// against the real `customer.Id`, matching what `Execute` will
+    /// recompute — the "everything passes" case every other test relies on.
     /// </summary>
     private async Task<(Business Business, Approval Approval, Customer Customer)> SeedApprovalAsync(
         AppDbContext db,
@@ -128,7 +142,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         DateTimeOffset? expiresAt = null,
         bool customerResolved = true,
         bool level2Verified = true,
-        string? customerExternalId = null)
+        string? customerExternalId = null,
+        Guid? actionHashCustomerIdOverride = null)
     {
         var now = DateTimeOffset.UtcNow;
         var business = new Business
@@ -184,7 +199,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
             ResourceId = "gid://shopify/Order/12345",
             CanonicalArguments = canonicalArguments,
             ActionHash = ActionHasher.Derive(
-                business.Id, conversation.Id, customer.Id, "cancelOrder", "gid://shopify/Order/12345", canonicalArguments),
+                business.Id, conversation.Id, actionHashCustomerIdOverride ?? customer.Id,
+                "cancelOrder", "gid://shopify/Order/12345", canonicalArguments),
             DisplaySummary = "Cancel order gid://shopify/Order/12345 (Customer, restocking inventory, refund to original payment method).",
             Status = status,
             CreatedAt = now,
@@ -614,21 +630,121 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Step 11 — the stored Approval.ActionHash was computed against a
+    /// customer identity that no longer matches the Conversation's current
+    /// CustomerId (the one genuine drift step 11's recompute can detect,
+    /// per step-24 §2a — see SeedApprovalAsync's own doc comment). Must
+    /// refuse with ActionHashMismatch and write exactly one durable
+    /// AuditLog row, handled identically to a genuine tampering attempt
+    /// (step-22z §13: "a legitimate state-drift denial and a genuine
+    /// tampering attempt are handled identically") — no special-casing by
+    /// cause. Also proves no mutation, no consumption: the Approval is
+    /// left untouched by a step 11 refusal, same as every earlier
+    /// pre-claim refusal.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteApprovedActionAsync_ActionHashMismatch_ReturnsActionHashMismatchAndWritesAuditLog()
+    {
+        var tenant = (MutableTenantAccessor)_provider.GetRequiredService<ICurrentTenantAccessor>();
+        const string customerExternalId = "gid://shopify/Customer/AAA";
+
+        await using var seedScope = _provider.CreateAsyncScope();
+        var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var tokenProtector = seedScope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
+        var (business, approval, _) = await SeedApprovalAsync(
+            seedDb, customerExternalId: customerExternalId, actionHashCustomerIdOverride: Guid.NewGuid());
+        await AddIntegrationAsync(seedDb, tokenProtector, business.Id);
+
+        tenant.CurrentBusinessId = business.Id;
+        await using var readScope = _provider.CreateAsyncScope();
+        var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        // Ownership (step 10) must still pass so execution actually reaches
+        // step 11 — the real customer's ExternalId matches Shopify's
+        // reported owner; only the stored ActionHash's own CustomerId
+        // input was overridden to something else at seed time.
+        var orderLookupService = NewOrderLookupService(
+            readScope.ServiceProvider,
+            _ => JsonResponse(OrderOwnerResponse(approval.ResourceId, customerExternalId)));
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService);
+
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
+
+        var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
+        Assert.Equal(ExecutionRefusalReason.ActionHashMismatch, refused.Reason);
+
+        var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
+        var entry = Assert.Single(auditLogs);
+        Assert.Equal(AuditEventTypes.UnauthorizedActionBlocked, entry.EventType);
+        Assert.Equal(ActorType.NivoraSystem, entry.Actor);
+        Assert.Null(entry.ChangedByUserId);
+        Assert.Equal("ActionHashMismatch", entry.NewValue);
+
+        Assert.Equal(ApprovalStatus.Approved, await ReadApprovalStatusAsync(approval.Id));
+    }
+
+    /// <summary>
+    /// Steps 11/12 — the stored ActionHash matches what Execute recomputes
+    /// (the ordinary case: no customer-identity drift since proposal time)
+    /// -> step 11 does not refuse, step 12's execution-leg key derivation
+    /// runs (a pure, always-succeeding computation with no refusal path
+    /// and no AuditLog write of its own, per step-42 §2), and execution
+    /// falls through to the NotImplementedException boundary. Writes NO
+    /// AuditLog row. Proves the negative case explicitly, distinct from
+    /// the general boundary test below, same convention as every earlier
+    /// step's dedicated success-path assertion.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteApprovedActionAsync_ActionHashMatches_FallsThroughToNotImplementedAndWritesNoAuditLog()
+    {
+        var tenant = (MutableTenantAccessor)_provider.GetRequiredService<ICurrentTenantAccessor>();
+        const string customerExternalId = "gid://shopify/Customer/AAA";
+
+        await using var seedScope = _provider.CreateAsyncScope();
+        var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var tokenProtector = seedScope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
+        var (business, approval, _) = await SeedApprovalAsync(seedDb, customerExternalId: customerExternalId);
+        await AddIntegrationAsync(seedDb, tokenProtector, business.Id);
+
+        tenant.CurrentBusinessId = business.Id;
+        await using var readScope = _provider.CreateAsyncScope();
+        var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var orderLookupService = NewOrderLookupService(
+            readScope.ServiceProvider,
+            _ => JsonResponse(OrderOwnerResponse(approval.ResourceId, customerExternalId)));
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService);
+
+        await Assert.ThrowsAsync<NotImplementedException>(
+            () => executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None));
+
+        var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
+        Assert.Empty(auditLogs);
+        Assert.Equal(ApprovalStatus.Approved, await ReadApprovalStatusAsync(approval.Id));
+    }
+
+    /// <summary>
     /// Deliberate scope-boundary test, same convention as
     /// OrderCancelProposalToolTests' own explicit-refusal tests: documents,
     /// rather than merely leaves implicit, exactly where this session's
     /// implementation stops. Must be updated (not deleted) by whichever
-    /// future session extends ExecuteApprovedActionAsync past step 10 — a
+    /// future session extends ExecuteApprovedActionAsync past step 12 — a
     /// passing NotImplementedException here after that point would mean the
     /// new step's logic was never reached. Extended by this pass (was
-    /// previously the steps-3-9 boundary) to also seed a Shopify Integration
-    /// and a matching ownership response, since step 10 now sits between
-    /// step 9 and the NotImplementedException throw. Also proves the
-    /// adjacent-case negative: a valid Approved+unexpired+resolved-customer+
-    /// Level2-verified+ownership-matching Approval does NOT trigger any of
-    /// steps 6/7/8/9/10's refusals, and writes NO AuditLog row — none of
-    /// their writes are unconditional on every ExecuteApprovedActionAsync
-    /// call.
+    /// previously the steps-3-10 boundary) — no new seeding is required,
+    /// since steps 11/12 introduce no new external dependency and the
+    /// default seed's ActionHash already matches what Execute recomputes.
+    /// Also proves the adjacent-case negative: a valid Approved+unexpired+
+    /// resolved-customer+Level2-verified+ownership-matching+hash-matching
+    /// Approval does NOT trigger any of steps 6/7/8/9/10/11's refusals, and
+    /// writes NO AuditLog row — none of their writes are unconditional on
+    /// every ExecuteApprovedActionAsync call.
     /// </summary>
     [Fact]
     public async Task ExecuteApprovedActionAsync_ApprovalExistsForCurrentTenant_ThrowsNotImplementedAndWritesNoAuditLog()
