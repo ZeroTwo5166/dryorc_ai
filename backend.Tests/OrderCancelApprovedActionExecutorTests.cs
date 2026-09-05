@@ -7,6 +7,7 @@ using backend.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using Xunit;
 
 namespace backend.Tests;
@@ -14,7 +15,7 @@ namespace backend.Tests;
 /// <summary>
 /// Service-level tests for OrderCancelApprovedActionExecutor, run against
 /// the real Neon dev DB via a bare ServiceProvider, same pattern as
-/// OrderCancelProposalToolTests. Covers steps 3-9 of the execution ordering
+/// OrderCancelProposalToolTests. Covers steps 3-10 of the execution ordering
 /// (docs/handoffs/step-22z-approval-proposal-approval-lifecycle-design.md
 /// §10): the Approval load, ApprovalNotFound refusal (including the
 /// tenant-fold-in property independently confirmed by
@@ -24,8 +25,12 @@ namespace backend.Tests;
 /// deliberately not for step 8), the Level 2 verification check added by
 /// docs/handoffs/step-39-cancelorder-execute-steps-9-16-next-slice-design.md
 /// §7 (step 9, with an AuditLog write per the explicit owner decision
-/// recorded in that document's §5a), plus one boundary test documenting
-/// that everything past step 9 still throws NotImplementedException.
+/// recorded in that document's §5a), the ownership verification check added
+/// by docs/handoffs/step-41-cancelorder-execute-steps-10-16-classification-and-atomic-claim-design.md
+/// §6 (step 10, with an AuditLog write, endorsing
+/// docs/handoffs/step-40-cancelorder-execute-step-10-ownership-design.md
+/// §4/§5), plus one boundary test documenting that everything past step 10
+/// still throws NotImplementedException.
 ///
 /// Uses a MutableTenantAccessor (same shape as AppDbContextTenantFilterTests'
 /// own private nested class — not shared, per this codebase's established
@@ -34,9 +39,25 @@ namespace backend.Tests;
 /// non-null value and a *different* real, non-null value within the same
 /// test — the exact scenario the executor's cross-tenant guarantee is
 /// about.
+///
+/// Step 10 requires IShopifyOrderLookupService, which needs
+/// IIntegrationTokenProtector (real data-protection stack, same convention
+/// as ShopifyOrderLookupServiceTests) and an HttpClient — a
+/// FakeShopifyHttpMessageHandler (same class ShopifyOrderCancellationExecutorTests/
+/// ShopifyOrderLookupServiceTests already use) is wired in per test via
+/// NewOrderLookupService, never a real network call. Tests that must never
+/// reach step 10 (every step 6-9 refusal, plus ApprovalNotFound/cross-tenant)
+/// are given a lookup service whose handler throws if invoked at all
+/// (ThrowingOrderLookupService) — this both satisfies the constructor's now-
+/// mandatory parameter and affirmatively proves no Shopify call happens on
+/// those paths, since a real invocation would fail the test.
 /// </summary>
 public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
 {
+    private const string AdminApiVersion = "2026-07";
+    private const string Shop = "test-shop";
+    private const string AccessToken = "test-access-token";
+
     private ServiceProvider _provider = null!;
     private readonly List<Guid> _businessIdsToClean = [];
 
@@ -46,13 +67,15 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var connectionUri = configuration.GetConnectionString("DefaultConnection")
             ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
 
-        _provider = new ServiceCollection()
+        var services = new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new MutableTenantAccessor())
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
                 PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()))
             .AddScoped<IAuditLogService, AuditLogService>()
-            .AddScoped<ILevel2VerificationChecker, Level2VerificationChecker>()
-            .BuildServiceProvider();
+            .AddScoped<ILevel2VerificationChecker, Level2VerificationChecker>();
+        services.AddDataProtection();
+        services.AddScoped<IIntegrationTokenProtector, IntegrationTokenProtector>();
+        _provider = services.BuildServiceProvider();
 
         return Task.CompletedTask;
     }
@@ -70,9 +93,11 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
             // block the Businesses delete below with a FK violation.
             // Conversations next — Approval's own ConversationId FK is
             // Cascade, so any Approval row is removed automatically when
-            // its Conversation is. Customers/Widgets before Businesses.
+            // its Conversation is. Integrations/Customers/Widgets before
+            // Businesses.
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AuditLogs\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({ids})");
+            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Integrations\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Customers\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Widgets\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = ANY({ids})");
@@ -93,13 +118,17 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
     /// own `until > now` check), or leaves it null when false — no
     /// `ExternalIdentity` row is seeded either way, so a false value always
     /// fails verification via both of that checker's own paths.
+    /// `customerExternalId`, added for step 10, sets `Customer.ExternalId`
+    /// (null by default — CustomerNotLinkedToExternalIdentity would fire if
+    /// a step-10 test reached AuthorizeAsync without setting this).
     /// </summary>
-    private async Task<(Business Business, Approval Approval)> SeedApprovalAsync(
+    private async Task<(Business Business, Approval Approval, Customer Customer)> SeedApprovalAsync(
         AppDbContext db,
         ApprovalStatus status = ApprovalStatus.Approved,
         DateTimeOffset? expiresAt = null,
         bool customerResolved = true,
-        bool level2Verified = true)
+        bool level2Verified = true,
+        string? customerExternalId = null)
     {
         var now = DateTimeOffset.UtcNow;
         var business = new Business
@@ -125,6 +154,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
             BusinessId = business.Id,
             Name = "Test Customer",
             Email = "test.customer@marker-test.invalid",
+            ExternalId = customerExternalId,
             CreatedAt = now,
             UpdatedAt = now,
         };
@@ -169,8 +199,68 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         await db.SaveChangesAsync();
         _businessIdsToClean.Add(business.Id);
 
-        return (business, approval);
+        return (business, approval, customer);
     }
+
+    /// <summary>
+    /// Seeds an active Shopify Integration for the business — required
+    /// before IShopifyOrderLookupService.LookupOrderOwnerAsync can succeed
+    /// (it throws InvalidOperationException otherwise). Same shape as
+    /// ShopifyOrderLookupServiceTests.CreateBusinessWithIntegrationAsync.
+    /// </summary>
+    private static async Task AddIntegrationAsync(AppDbContext db, IIntegrationTokenProtector tokenProtector, Guid businessId)
+    {
+        db.Integrations.Add(new Integration
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            Platform = ShopifyIntegrationOAuthProvider.PlatformName,
+            EncryptedAccessToken = tokenProtector.Protect(ShopifyIntegrationOAuthProvider.PlatformName, AccessToken),
+            ExternalAccountIdentifier = Shop,
+            IsActive = true,
+            ConnectedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        });
+        await db.SaveChangesAsync();
+    }
+
+    /// <summary>
+    /// Constructs a real ShopifyOrderLookupService wired to
+    /// FakeShopifyHttpMessageHandler — never a real network call. Same
+    /// pattern as ShopifyOrderLookupServiceTests.NewService.
+    /// </summary>
+    private static ShopifyOrderLookupService NewOrderLookupService(
+        IServiceProvider scopedProvider, Func<HttpRequestMessage, HttpResponseMessage> respond) =>
+        new(
+            new HttpClient(new FakeShopifyHttpMessageHandler(respond)),
+            scopedProvider.GetRequiredService<AppDbContext>(),
+            scopedProvider.GetRequiredService<IIntegrationTokenProtector>(),
+            Options.Create(new ShopifyOptions
+            {
+                ClientId = "unused", ClientSecret = "unused", RedirectUri = "unused", AdminApiVersion = AdminApiVersion,
+            }));
+
+    /// <summary>
+    /// For every test whose refusal must fire strictly before step 10 (or
+    /// that never reaches step 10 at all) — a lookup service whose handler
+    /// throws if the executor ever actually sends an HTTP request through
+    /// it, proving step 10's Shopify call is genuinely never made on these
+    /// paths, not merely untested.
+    /// </summary>
+    private static ShopifyOrderLookupService ThrowingOrderLookupService(IServiceProvider scopedProvider) =>
+        NewOrderLookupService(scopedProvider, _ => throw new InvalidOperationException(
+            "Step 10 must not be reached — this test's Approval should refuse at an earlier step."));
+
+    private static string OrderOwnerResponse(string orderId, string? customerId) =>
+        customerId is null
+            ? $$"""{ "data": { "order": { "id": "{{orderId}}", "customer": null } } }"""
+            : $$"""{ "data": { "order": { "id": "{{orderId}}", "customer": { "id": "{{customerId}}" } } } }""";
+
+    private static HttpResponseMessage JsonResponse(string json) =>
+        new(System.Net.HttpStatusCode.OK)
+        {
+            Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json"),
+        };
 
     private async Task<List<AuditLog>> ReadAuditLogsAsync(Guid businessId, Guid entityId)
     {
@@ -184,6 +274,15 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
             .ToListAsync();
     }
 
+    private async Task<ApprovalStatus> ReadApprovalStatusAsync(Guid approvalId)
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var approval = await db.Approvals.IgnoreQueryFilters().AsNoTracking()
+            .FirstAsync(a => a.Id == approvalId);
+        return approval.Status;
+    }
+
     [Fact]
     public async Task ExecuteApprovedActionAsync_ApprovalBelongsToDifferentTenant_ReturnsApprovalNotFound()
     {
@@ -191,7 +290,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
 
         await using var seedScope = _provider.CreateAsyncScope();
         var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
-        var (owningBusiness, approval) = await SeedApprovalAsync(seedDb);
+        var (owningBusiness, approval, _) = await SeedApprovalAsync(seedDb);
 
         // A second, real, independently-seeded tenant -- not the approval's
         // own BusinessId -- proving this is a genuine cross-tenant read,
@@ -213,7 +312,10 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
         var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
-        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService, level2Checker);
+        var orderLookupService = ThrowingOrderLookupService(readScope.ServiceProvider);
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService);
 
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
 
@@ -229,14 +331,17 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
 
         await using var seedScope = _provider.CreateAsyncScope();
         var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
-        var (business, _) = await SeedApprovalAsync(seedDb);
+        var (business, _, _) = await SeedApprovalAsync(seedDb);
 
         tenant.CurrentBusinessId = business.Id;
         await using var readScope = _provider.CreateAsyncScope();
         var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
         var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
-        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService, level2Checker);
+        var orderLookupService = ThrowingOrderLookupService(readScope.ServiceProvider);
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService);
 
         var outcome = await executor.ExecuteApprovedActionAsync(Guid.NewGuid(), CancellationToken.None);
 
@@ -264,14 +369,17 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
 
         await using var seedScope = _provider.CreateAsyncScope();
         var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
-        var (business, approval) = await SeedApprovalAsync(seedDb, status: status);
+        var (business, approval, _) = await SeedApprovalAsync(seedDb, status: status);
 
         tenant.CurrentBusinessId = business.Id;
         await using var readScope = _provider.CreateAsyncScope();
         var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
         var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
-        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService, level2Checker);
+        var orderLookupService = ThrowingOrderLookupService(readScope.ServiceProvider);
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService);
 
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
 
@@ -301,7 +409,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
 
         await using var seedScope = _provider.CreateAsyncScope();
         var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
-        var (business, approval) = await SeedApprovalAsync(
+        var (business, approval, _) = await SeedApprovalAsync(
             seedDb, expiresAt: DateTimeOffset.UtcNow.AddMinutes(-1));
 
         tenant.CurrentBusinessId = business.Id;
@@ -309,7 +417,10 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
         var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
-        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService, level2Checker);
+        var orderLookupService = ThrowingOrderLookupService(readScope.ServiceProvider);
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService);
 
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
 
@@ -338,14 +449,17 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
 
         await using var seedScope = _provider.CreateAsyncScope();
         var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
-        var (business, approval) = await SeedApprovalAsync(seedDb, customerResolved: false);
+        var (business, approval, _) = await SeedApprovalAsync(seedDb, customerResolved: false);
 
         tenant.CurrentBusinessId = business.Id;
         await using var readScope = _provider.CreateAsyncScope();
         var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
         var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
-        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService, level2Checker);
+        var orderLookupService = ThrowingOrderLookupService(readScope.ServiceProvider);
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService);
 
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
 
@@ -376,14 +490,17 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
 
         await using var seedScope = _provider.CreateAsyncScope();
         var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
-        var (business, approval) = await SeedApprovalAsync(seedDb, level2Verified: false);
+        var (business, approval, _) = await SeedApprovalAsync(seedDb, level2Verified: false);
 
         tenant.CurrentBusinessId = business.Id;
         await using var readScope = _provider.CreateAsyncScope();
         var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
         var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
-        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService, level2Checker);
+        var orderLookupService = ThrowingOrderLookupService(readScope.ServiceProvider);
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService);
 
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
 
@@ -399,34 +516,143 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// Deliberate scope-boundary test, same convention as
-    /// OrderCancelProposalToolTests' own explicit-refusal tests: documents,
-    /// rather than merely leaves implicit, exactly where this session's
-    /// implementation stops. Must be updated (not deleted) by whichever
-    /// future session extends ExecuteApprovedActionAsync past step 9 — a
-    /// passing NotImplementedException here after that point would mean the
-    /// new step's logic was never reached. Also proves the adjacent-case
-    /// negative: a valid Approved+unexpired+resolved-customer+Level2-verified
-    /// Approval does NOT trigger any of steps 6/7/8/9's refusals, and writes
-    /// NO AuditLog row — steps 6/7/9's writes are conditional on their own
-    /// refusal firing, not unconditional on every ExecuteApprovedActionAsync
-    /// call.
+    /// Step 10 — Shopify reports a different order owner than the
+    /// Approval's resolved Customer (OwnerMismatch, one of
+    /// OwnershipCheckFailureReason's eight members) must refuse with
+    /// OwnershipVerificationFailed and write exactly one durable AuditLog
+    /// row whose NewValue distinctly names both the step and the specific
+    /// sub-reason ("OwnershipVerificationFailed:OwnerMismatch") — not
+    /// copy-pasted wording from any prior step's NewValue. Also proves the
+    /// Approval itself is left completely untouched: no mutation occurs and
+    /// no Approval is ever consumed on a step 10 refusal, since Status is
+    /// re-read fresh from the DB afterward and asserted unchanged.
     /// </summary>
     [Fact]
-    public async Task ExecuteApprovedActionAsync_ApprovalExistsForCurrentTenant_ThrowsNotImplementedAndWritesNoAuditLog()
+    public async Task ExecuteApprovedActionAsync_OwnershipVerificationFails_ReturnsOwnershipVerificationFailedAndWritesAuditLog()
     {
         var tenant = (MutableTenantAccessor)_provider.GetRequiredService<ICurrentTenantAccessor>();
 
         await using var seedScope = _provider.CreateAsyncScope();
         var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
-        var (business, approval) = await SeedApprovalAsync(seedDb);
+        var tokenProtector = seedScope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
+        var (business, approval, _) = await SeedApprovalAsync(
+            seedDb, customerExternalId: "gid://shopify/Customer/AAA");
+        await AddIntegrationAsync(seedDb, tokenProtector, business.Id);
 
         tenant.CurrentBusinessId = business.Id;
         await using var readScope = _provider.CreateAsyncScope();
         var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
         var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
-        var executor = new OrderCancelApprovedActionExecutor(readDb, auditLogService, level2Checker);
+        // Shopify reports a DIFFERENT owning customer ("BBB") than the one
+        // linked to this Approval's Customer ("AAA") -> OwnerMismatch.
+        var orderLookupService = NewOrderLookupService(
+            readScope.ServiceProvider,
+            _ => JsonResponse(OrderOwnerResponse(approval.ResourceId, "gid://shopify/Customer/BBB")));
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService);
+
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
+
+        var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
+        Assert.Equal(ExecutionRefusalReason.OwnershipVerificationFailed, refused.Reason);
+
+        var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
+        var entry = Assert.Single(auditLogs);
+        Assert.Equal(AuditEventTypes.UnauthorizedActionBlocked, entry.EventType);
+        Assert.Equal(ActorType.NivoraSystem, entry.Actor);
+        Assert.Null(entry.ChangedByUserId);
+        Assert.Equal("OwnershipVerificationFailed:OwnerMismatch", entry.NewValue);
+
+        // No mutation, no consumption: the Approval is untouched by a step
+        // 10 refusal, unlike step 13's (not yet implemented) atomic claim.
+        Assert.Equal(ApprovalStatus.Approved, await ReadApprovalStatusAsync(approval.Id));
+    }
+
+    /// <summary>
+    /// Step 10 — Shopify confirms the SAME owning customer as the
+    /// Approval's resolved Customer -> ownership verification succeeds,
+    /// writes NO AuditLog row, and execution falls through toward step 11,
+    /// which is not yet implemented -> NotImplementedException. Proves the
+    /// negative case explicitly, distinct from the general "everything
+    /// passes" boundary test below (which this test overlaps with by
+    /// design, for the same reason step-38/step-39 each added their own
+    /// dedicated success-path assertion alongside the general boundary
+    /// test rather than relying on the boundary test alone).
+    /// </summary>
+    [Fact]
+    public async Task ExecuteApprovedActionAsync_OwnershipVerificationSucceeds_FallsThroughToNotImplementedAndWritesNoAuditLog()
+    {
+        var tenant = (MutableTenantAccessor)_provider.GetRequiredService<ICurrentTenantAccessor>();
+        const string customerExternalId = "gid://shopify/Customer/AAA";
+
+        await using var seedScope = _provider.CreateAsyncScope();
+        var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var tokenProtector = seedScope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
+        var (business, approval, _) = await SeedApprovalAsync(seedDb, customerExternalId: customerExternalId);
+        await AddIntegrationAsync(seedDb, tokenProtector, business.Id);
+
+        tenant.CurrentBusinessId = business.Id;
+        await using var readScope = _provider.CreateAsyncScope();
+        var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var orderLookupService = NewOrderLookupService(
+            readScope.ServiceProvider,
+            _ => JsonResponse(OrderOwnerResponse(approval.ResourceId, customerExternalId)));
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService);
+
+        await Assert.ThrowsAsync<NotImplementedException>(
+            () => executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None));
+
+        var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
+        Assert.Empty(auditLogs);
+        Assert.Equal(ApprovalStatus.Approved, await ReadApprovalStatusAsync(approval.Id));
+    }
+
+    /// <summary>
+    /// Deliberate scope-boundary test, same convention as
+    /// OrderCancelProposalToolTests' own explicit-refusal tests: documents,
+    /// rather than merely leaves implicit, exactly where this session's
+    /// implementation stops. Must be updated (not deleted) by whichever
+    /// future session extends ExecuteApprovedActionAsync past step 10 — a
+    /// passing NotImplementedException here after that point would mean the
+    /// new step's logic was never reached. Extended by this pass (was
+    /// previously the steps-3-9 boundary) to also seed a Shopify Integration
+    /// and a matching ownership response, since step 10 now sits between
+    /// step 9 and the NotImplementedException throw. Also proves the
+    /// adjacent-case negative: a valid Approved+unexpired+resolved-customer+
+    /// Level2-verified+ownership-matching Approval does NOT trigger any of
+    /// steps 6/7/8/9/10's refusals, and writes NO AuditLog row — none of
+    /// their writes are unconditional on every ExecuteApprovedActionAsync
+    /// call.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteApprovedActionAsync_ApprovalExistsForCurrentTenant_ThrowsNotImplementedAndWritesNoAuditLog()
+    {
+        var tenant = (MutableTenantAccessor)_provider.GetRequiredService<ICurrentTenantAccessor>();
+        const string customerExternalId = "gid://shopify/Customer/AAA";
+
+        await using var seedScope = _provider.CreateAsyncScope();
+        var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var tokenProtector = seedScope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
+        var (business, approval, _) = await SeedApprovalAsync(seedDb, customerExternalId: customerExternalId);
+        await AddIntegrationAsync(seedDb, tokenProtector, business.Id);
+
+        tenant.CurrentBusinessId = business.Id;
+        await using var readScope = _provider.CreateAsyncScope();
+        var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var orderLookupService = NewOrderLookupService(
+            readScope.ServiceProvider,
+            _ => JsonResponse(OrderOwnerResponse(approval.ResourceId, customerExternalId)));
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService);
 
         await Assert.ThrowsAsync<NotImplementedException>(
             () => executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None));

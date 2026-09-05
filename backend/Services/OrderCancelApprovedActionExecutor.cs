@@ -30,9 +30,27 @@ namespace backend.Services;
 /// binding (step 4 of the ordering) into this same ApprovalNotFound
 /// refusal, independently confirmed by docs/handoffs/step-24/25/26. Adding
 /// IgnoreQueryFilters() here would silently reopen a cross-tenant read.
+///
+/// Step 10 (ownership verification), added by
+/// docs/handoffs/step-41-cancelorder-execute-steps-10-16-classification-and-atomic-claim-design.md
+/// §6 (endorsing docs/handoffs/step-40-cancelorder-execute-step-10-ownership-design.md
+/// §5): IShopifyOrderLookupService.LookupOrderOwnerAsync is called first —
+/// it throws uncaught on every infra failure (no Integration, token
+/// decrypt, non-2xx, malformed JSON, GraphQL errors, order not found),
+/// consistent with the infra-failure-stays-exception convention steps
+/// 14/15 already use — then IOrderOwnershipAuthorizationService.AuthorizeAsync
+/// (a pure DB read against Customers, no Shopify call of its own) is the
+/// only source of a refusal for this step. VerifiedOrderOwnership's
+/// constructor is internal to IShopifyOrderLookupService, so AuthorizeAsync
+/// cannot be invoked without first calling LookupOrderOwnerAsync — there is
+/// no ownership-verification path that avoids the Shopify call entirely.
 /// </summary>
 public class OrderCancelApprovedActionExecutor(
-    AppDbContext db, IAuditLogService auditLogService, ILevel2VerificationChecker level2Checker) : IApprovedActionExecutor
+    AppDbContext db,
+    IAuditLogService auditLogService,
+    ILevel2VerificationChecker level2Checker,
+    IShopifyOrderLookupService orderLookupService,
+    IOrderOwnershipAuthorizationService ownershipService) : IApprovedActionExecutor
 {
     public async Task<ExecutionOutcome> ExecuteApprovedActionAsync(
         Guid approvalId, CancellationToken cancellationToken)
@@ -100,6 +118,12 @@ public class OrderCancelApprovedActionExecutor(
                 "Conversation no longer has a resolved customer.");
         }
 
+        // Named capture of the value step 8's own check already validated
+        // above (not a new check, not a behavior change) — step 10 needs
+        // this value by name; step 8's existing refusal condition and its
+        // return statement are both left untouched.
+        var customerId = conversation!.CustomerId!.Value;
+
         // Step 9 — Level 2 verification, execution-time only per Decision 2
         // (ADOPTED, docs/handoffs/step-22-ai-action-safety-model-owner-decisions.md
         // §0 item 2). A pure read (ILevel2VerificationChecker performs only
@@ -120,13 +144,42 @@ public class OrderCancelApprovedActionExecutor(
                 "Conversation is not currently Level 2 verified.");
         }
 
+        // Step 10 — ownership verification. LookupOrderOwnerAsync throws
+        // uncaught on infra failure (missing/inactive Integration, token
+        // decrypt failure, non-2xx, malformed JSON, GraphQL errors, order
+        // not found) — that throw is intentionally allowed to propagate out
+        // of this method, matching the same infra-failure-stays-exception
+        // convention steps 14/15 already use (step-40 §5/§9, step-41 §2).
+        // AuthorizeAsync is a pure DB read against Customers (no Shopify
+        // call of its own — IOrderOwnershipAuthorizationService's own doc
+        // comment) and is the only source of a refusal for this step.
+        // VerifiedOrderOwnership's constructor is internal to
+        // IShopifyOrderLookupService, so AuthorizeAsync cannot be invoked
+        // without first calling LookupOrderOwnerAsync — there is no
+        // ownership-verification path that avoids the Shopify call
+        // entirely.
+        var ownership = await orderLookupService.LookupOrderOwnerAsync(
+            approval.BusinessId, approval.ResourceId, cancellationToken);
+        var ownershipResult = await ownershipService.AuthorizeAsync(
+            approval.BusinessId, customerId, ownership, cancellationToken);
+        if (!ownershipResult.IsAuthorized)
+        {
+            await WriteUnauthorizedExecutionBlockedAsync(
+                approval, $"OwnershipVerificationFailed:{ownershipResult.Reason}", cancellationToken);
+
+            return new ExecutionOutcome.Refused(
+                ExecutionRefusalReason.OwnershipVerificationFailed,
+                $"Order ownership verification failed: {ownershipResult.Reason}.");
+        }
+
         throw new NotImplementedException(
-            "OrderCancelApprovedActionExecutor implements steps 3-9 of the execution ordering so far " +
+            "OrderCancelApprovedActionExecutor implements steps 3-10 of the execution ordering so far " +
             "(Approval load/ApprovalNotFound + tenant binding, status/expiry checks with AuditLog " +
-            "writes, customer re-derivation, Level 2 verification with an AuditLog write). Every step " +
-            "beyond that — ownership verification, action-hash recomputation, the atomic " +
-            "Approved->Consumed claim, and the Shopify orderCancel call — is deliberately not yet " +
-            "implemented. See docs/handoffs/step-39-cancelorder-execute-steps-9-16-next-slice-design.md " +
+            "writes, customer re-derivation, Level 2 verification with an AuditLog write, ownership " +
+            "verification with an AuditLog write). Every step beyond that — action-hash recomputation, " +
+            "the atomic Approved->Consumed claim, and the Shopify orderCancel mutation call — is " +
+            "deliberately not yet implemented. See " +
+            "docs/handoffs/step-41-cancelorder-execute-steps-10-16-classification-and-atomic-claim-design.md " +
             "for the full design this method will eventually satisfy.");
     }
 
