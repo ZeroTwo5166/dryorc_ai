@@ -27,6 +27,9 @@ public static class AuditEventTypes
     public const string Level2VerificationFailed = "Level2VerificationFailed";
     public const string UnauthorizedActionBlocked = "UnauthorizedActionBlocked";
 
+    // Step 22 AI Action Safety Model — Approval lifecycle
+    public const string ExecutionClaimed = "ExecutionClaimed";
+
     // Staff / access
     public const string RoleChanged = "RoleChanged";
     public const string StaffAccessRevoked = "StaffAccessRevoked";

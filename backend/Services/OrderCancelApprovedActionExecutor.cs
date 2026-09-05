@@ -62,13 +62,29 @@ namespace backend.Services;
 /// never be conflated: see the naming discipline and inline warning at
 /// their call sites below, and step-42 §7 for the exact collapse risk this
 /// guards against.
+///
+/// Step 13 (atomic claim + OrderCancellation row creation), added per
+/// docs/handoffs/step-43-cancelorder-execute-step-13-atomic-claim-design.md:
+/// a single DB transaction containing, in order, the guarded
+/// Approved→Consumed ExecuteUpdateAsync (re-checking ExpiresAt a second
+/// time, independently of step 7 — step-43 §5), the "execution claimed"
+/// AuditLog write (added to the tracked context but not flushed here —
+/// step-43 §15a), IOrderCancellationService.RequestCancellationAsync
+/// (creating the OrderCancellation row, called unmodified — step-43 §9/§11),
+/// and the OrderCancellationId back-write. Zero network/Shopify I/O occurs
+/// inside this transaction (step-43 §3). A 0-row claim result and a
+/// DuplicatePendingOrderCancellationException are the only two refusal
+/// paths, mapping to ApprovalClaimLost and DuplicatePendingCancellation
+/// respectively (step-43 §12 addendum) — neither writes an AuditLog row
+/// (step-43 §15b).
 /// </summary>
 public class OrderCancelApprovedActionExecutor(
     AppDbContext db,
     IAuditLogService auditLogService,
     ILevel2VerificationChecker level2Checker,
     IShopifyOrderLookupService orderLookupService,
-    IOrderOwnershipAuthorizationService ownershipService) : IApprovedActionExecutor
+    IOrderOwnershipAuthorizationService ownershipService,
+    IOrderCancellationService orderCancellationService) : IApprovedActionExecutor
 {
     public async Task<ExecutionOutcome> ExecuteApprovedActionAsync(
         Guid approvalId, CancellationToken cancellationToken)
@@ -83,14 +99,15 @@ public class OrderCancelApprovedActionExecutor(
         }
 
         // Step 6 — Approval.Status must currently be Approved. Distinct from
-        // step 13's own (not yet implemented) TOCTOU claim-race-loss, which
-        // returns this same ApprovalNotApproved value from a different code
-        // location (the atomic claim) and must NOT receive the AuditLog write
-        // below — that later path is ordinary concurrency handling between
-        // two legitimate callers racing on an otherwise-valid Approval, not a
-        // security refusal. This check, here, is the only place in this
-        // class that writes AuditEventTypes.UnauthorizedActionBlocked for
-        // ApprovalNotApproved (step-38 §2a/§6).
+        // step 13's own claim-race-loss (0 rows affected by the atomic
+        // claim), which returns the separate ApprovalClaimLost value, not
+        // this one (step-43 addendum owner decision) — that later path is
+        // ordinary concurrency handling between two legitimate callers
+        // racing on an otherwise-valid Approval, not a security refusal, and
+        // deliberately does NOT receive the AuditLog write below. This
+        // check, here, is the only place in this class that writes
+        // AuditEventTypes.UnauthorizedActionBlocked for ApprovalNotApproved
+        // (step-38 §2a/§6).
         if (approval.Status != ApprovalStatus.Approved)
         {
             await WriteUnauthorizedExecutionBlockedAsync(approval, approval.Status.ToString(), cancellationToken);
@@ -228,14 +245,112 @@ public class OrderCancelApprovedActionExecutor(
             approval.BusinessId, approval.ToolName, approval.ResourceId,
             approval.CanonicalArguments, approval.Id);
 
+        // Step 13 — ATOMIC: claim the Approval (Approved->Consumed) and
+        // create the OrderCancellation execution-intent row in one DB
+        // transaction, per
+        // docs/handoffs/step-43-cancelorder-execute-step-13-atomic-claim-design.md.
+        // Zero network/Shopify I/O occurs inside this transaction (§3 of
+        // that document) — RequestCancellationAsync only ever performs a
+        // local DB write on this same scoped AppDbContext (§3a), enlisting
+        // in the ambient transaction opened below.
+        //
+        // The claim's own WHERE clause re-checks ExpiresAt > now a second
+        // time, independently of step 7's earlier check — reusing the same
+        // `now` captured at step 7, which is safe because reusing an older
+        // timestamp can only make this predicate harder to satisfy, never
+        // easier (step-43 §5). If this affects 0 rows, either a concurrent
+        // Execute call won the claim first or the Approval's ExpiresAt
+        // column changed to a value at or before `now` in the interim —
+        // the two causes are indistinguishable from the affected-row count
+        // alone, so both map to the single ApprovalClaimLost value
+        // (step-43 §4/§12 addendum), never ApprovalNotApproved.
+        //
+        // customerId (step 8) and approvalExecutionKey (step 12) are reused
+        // here, never re-derived or recomputed — re-deriving customerId
+        // would bind a value step 11 never actually hash-verified (step-43
+        // §6); recomputing an idempotency key from recomputedActionHash
+        // instead of approvalExecutionKey would collapse two distinct
+        // identity concepts (step-42 §7, restated step-43 §8) and must
+        // never happen.
+        Guid orderCancellationId;
+        await using (var tx = await db.Database.BeginTransactionAsync(cancellationToken))
+        {
+            var claimed = await db.Approvals
+                .Where(a => a.Id == approvalId && a.Status == ApprovalStatus.Approved && a.ExpiresAt > now)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(a => a.Status, ApprovalStatus.Consumed)
+                    .SetProperty(a => a.ConsumedAt, now), cancellationToken);
+
+            if (claimed == 0)
+            {
+                await tx.RollbackAsync(cancellationToken);
+                return new ExecutionOutcome.Refused(
+                    ExecutionRefusalReason.ApprovalClaimLost, "ApprovalClaimLost");
+            }
+
+            // "Execution claimed" — required durable AuditLog row (step-22z
+            // §18). Added to the same tracked scoped AppDbContext but NOT
+            // flushed here: RequestCancellationAsync's own internal
+            // SaveChangesAsync call below flushes this row together with
+            // the new OrderCancellation row, in the same round trip, still
+            // inside this open transaction (step-43 §15a) — so a
+            // DuplicatePendingOrderCancellationException on that same call
+            // rolls both back together; no stray audit row survives a
+            // refused attempt.
+            await auditLogService.LogAsync(
+                approval.BusinessId, AuditEntityTypes.Approval, approval.Id.ToString(),
+                AuditEventTypes.ExecutionClaimed, ActorType.NivoraSystem,
+                changedByUserId: null, cancellationToken: cancellationToken);
+
+            // Parsed once at proposal time (Step 23N); Execute re-derives
+            // only what OrderCancelProposalTool.ParseInput originally
+            // captured in CanonicalArguments, not any live AI input
+            // (Execute has none).
+            var (restock, method, reason) =
+                ToolArgumentCanonicalizer.DecodeOrderCancellationArgs(approval.CanonicalArguments);
+
+            try
+            {
+                var result = await orderCancellationService.RequestCancellationAsync(
+                    approval.BusinessId, customerId, approval.ConversationId,
+                    approval.ResourceId, customerReason: null,
+                    approvalExecutionKey, restock, method, reason, cancellationToken);
+                orderCancellationId = result.OrderCancellationId;
+            }
+            catch (DuplicatePendingOrderCancellationException ex)
+            {
+                // No AuditLog write on this path (step-43 addendum owner
+                // decision, §15b) — a different, independently-legitimate
+                // Approval already has an unresolved attempt for this same
+                // order; this is ordinary concurrency handling between two
+                // legitimate callers, not a security refusal.
+                await tx.RollbackAsync(cancellationToken);
+                return new ExecutionOutcome.Refused(
+                    ExecutionRefusalReason.DuplicatePendingCancellation,
+                    $"DuplicatePendingCancellation:{ex.ExternalOrderId}");
+            }
+
+            // Unconditional — no status predicate needed beyond Id, since
+            // the claim's own UPDATE above already holds a row-level lock
+            // on this exact Approval for the remainder of this transaction
+            // under PostgreSQL READ COMMITTED (step-24 §4b).
+            await db.Approvals
+                .Where(a => a.Id == approvalId)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(a => a.OrderCancellationId, orderCancellationId), cancellationToken);
+
+            await tx.CommitAsync(cancellationToken);
+        }
+
         throw new NotImplementedException(
-            "OrderCancelApprovedActionExecutor implements steps 3-12 of the execution ordering so far " +
+            "OrderCancelApprovedActionExecutor implements steps 3-13 of the execution ordering so far " +
             "(Approval load/ApprovalNotFound + tenant binding, status/expiry checks with AuditLog " +
             "writes, customer re-derivation, Level 2 verification with an AuditLog write, ownership " +
             "verification with an AuditLog write, action-hash recomputation with an AuditLog write, " +
-            "execution-leg key derivation). Every step beyond that — the atomic Approved->Consumed " +
-            "claim, and the Shopify orderCancel mutation call — is deliberately not yet implemented. " +
-            "See docs/handoffs/step-42-cancelorder-execute-steps-11-12-classification-and-identity-collapse-analysis.md " +
+            "execution-leg key derivation, the atomic Approved->Consumed claim, and OrderCancellation " +
+            "row creation with an AuditLog write). Every step beyond that — the pre-execution " +
+            "ground-truth check and the Shopify orderCancel mutation call — is deliberately not yet " +
+            "implemented. See docs/handoffs/step-43-cancelorder-execute-step-13-atomic-claim-design.md " +
             "for the full design this method will eventually satisfy.");
     }
 
