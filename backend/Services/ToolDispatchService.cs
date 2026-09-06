@@ -160,6 +160,20 @@ public class ToolDispatchService(
                 }
                 case IReadOnlyDispatchTool readOnlyTool:
                     return await readOnlyTool.ExecuteAsync(context, toolUse.Input, cancellationToken);
+                case IActionProposalTool proposalTool:
+                {
+                    // Step 23J: no idempotency-key derivation belongs here,
+                    // unlike the IWriteDispatchTool branch above —
+                    // ProposeAsync takes no externally-supplied key at all,
+                    // since action-hash/dedup derivation happens entirely
+                    // inside it (ActionHasher.Derive, called internally).
+                    // ApprovalId is deliberately discarded here — nothing in
+                    // ToolDispatchOutcome/ToolExecutionResult has a slot for
+                    // it, and audit logging for Approval creation is
+                    // ProposeAsync's own internal responsibility.
+                    var result = await proposalTool.ProposeAsync(context, toolUse.Input, cancellationToken);
+                    return result.DispatchResult;
+                }
                 default:
                     // Structural safeguard, not expected to be reachable —
                     // every IDispatchTool implementation must be one of the
