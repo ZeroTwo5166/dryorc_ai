@@ -63,6 +63,7 @@ public class ClaudeReplyService(
     AppDbContext db,
     IMessageService messageService,
     IKnowledgeRetrievalService retrievalService,
+    IToolDispatchService toolDispatchService,
     ILogger<ClaudeReplyService> logger) : IClaudeReplyService
 {
     private const int MaxReplyTokens = 1024;
@@ -164,61 +165,106 @@ public class ClaudeReplyService(
         }
 
         string replyText;
-        try
+
+        // Step 23K: tools are offered only when a customer is actually
+        // resolved on this conversation — ToolDispatchContext.CustomerId is
+        // non-nullable (IDispatchTool.cs), so a conversation with no
+        // resolved customer cannot construct one at all. This does not
+        // resolve the broader open question 23H/23I flagged (how
+        // IActionProposalTool's own proposal-time customer-null refusal,
+        // 22Z §8, should interact with this same nullability) — it only
+        // avoids constructing an invalid context here, for this one
+        // read-only tool. When no customer is resolved, behavior is
+        // completely unchanged from before this pass: the original,
+        // direct, tool-free Claude call below still runs exactly as it did.
+        if (conversation.CustomerId is Guid customerId)
         {
-            var response = await messageService.Create(new MessageCreateParams
-            {
-                Model = "claude-sonnet-5",
-                MaxTokens = MaxReplyTokens,
-                System = BuildSystemPrompt(business.Name, retrievedChunks),
-                Messages = messages,
-            }, cancellationToken);
+            var dispatchContext = new ToolDispatchContext(businessId, customerId, conversationId);
 
-            replyText = string.Concat(response.Content.Select(b => b.Value).OfType<TextBlock>().Select(t => t.Text));
+            // Only added in this branch — the base prompt's own blanket "no
+            // actions" disclaimer was written for a zero-tool world and
+            // doesn't mention read-only lookups at all; without this, a
+            // model reading it has no reason to expect a tool exists to
+            // call. Not added to the no-tools branch below, which
+            // genuinely has nothing to offer.
+            var toolAwareSystemPrompt = BuildSystemPrompt(business.Name, retrievedChunks) +
+                "\n\nYou have a getCustomer tool that looks up the customer's name and email on file. " +
+                "Use it whenever the customer asks about their own account/profile details.";
+            var outcome = await toolDispatchService.RunAsync(
+                dispatchContext, toolAwareSystemPrompt, messages, cancellationToken);
 
-            if (string.IsNullOrWhiteSpace(replyText))
+            // ToolDispatchService.RunAsync already internally catches the
+            // same Anthropic exception types the inline path below handles,
+            // converting them to ClaudeCallFailed — no duplicate catch chain
+            // needed here. AnthropicNotConfiguredException still propagates
+            // uncaught either way (RunAsync's own doc comment states the
+            // identical policy this method's own removed catch chain used
+            // to state directly).
+            if (outcome.Status != ToolDispatchStatus.Completed)
             {
                 return null;
             }
+
+            replyText = outcome.ResponseText!;
         }
-        // Most-specific-first, matching the SDK's own hierarchy
-        // (AnthropicRateLimitException : Anthropic4xxException : ...
-        // : AnthropicApiException : AnthropicServiceException) — the
-        // AnthropicApiException catch below would already catch the two
-        // above it too, kept separate only for clarity/intent, not because
-        // it changes behavior (all three do the same thing here).
-        catch (AnthropicRateLimitException)
+        else
+        {
+            try
+            {
+                var response = await messageService.Create(new MessageCreateParams
+                {
+                    Model = "claude-sonnet-5",
+                    MaxTokens = MaxReplyTokens,
+                    System = BuildSystemPrompt(business.Name, retrievedChunks),
+                    Messages = messages,
+                }, cancellationToken);
+
+                replyText = string.Concat(response.Content.Select(b => b.Value).OfType<TextBlock>().Select(t => t.Text));
+            }
+            // Most-specific-first, matching the SDK's own hierarchy
+            // (AnthropicRateLimitException : Anthropic4xxException : ...
+            // : AnthropicApiException : AnthropicServiceException) — the
+            // AnthropicApiException catch below would already catch the two
+            // above it too, kept separate only for clarity/intent, not because
+            // it changes behavior (all three do the same thing here).
+            catch (AnthropicRateLimitException)
+            {
+                return null;
+            }
+            catch (Anthropic5xxException)
+            {
+                return null;
+            }
+            catch (AnthropicApiException)
+            {
+                return null;
+            }
+            // Genuine network-level failures reaching Anthropic at all
+            // (DNS/connection refused/etc.) or a request timeout — distinct
+            // from the SDK's own typed API-error hierarchy above, but still an
+            // external failure, not a configuration/programming error.
+            catch (HttpRequestException)
+            {
+                return null;
+            }
+            catch (TaskCanceledException)
+            {
+                return null;
+            }
+            // Deliberately NOT a bare `catch (Exception)` anymore — an
+            // AnthropicNotConfiguredException (thrown by
+            // MissingAnthropicApiKeyMessageService when Anthropic:ApiKey isn't
+            // configured) must propagate out of this method uncaught. It's a
+            // programming/deployment error, not "Claude declined to reply
+            // this turn" — silently folding it into a null return here would
+            // make a missing API key indistinguishable from a normal, expected
+            // external failure, which is exactly what must not happen.
+        }
+
+        if (string.IsNullOrWhiteSpace(replyText))
         {
             return null;
         }
-        catch (Anthropic5xxException)
-        {
-            return null;
-        }
-        catch (AnthropicApiException)
-        {
-            return null;
-        }
-        // Genuine network-level failures reaching Anthropic at all
-        // (DNS/connection refused/etc.) or a request timeout — distinct
-        // from the SDK's own typed API-error hierarchy above, but still an
-        // external failure, not a configuration/programming error.
-        catch (HttpRequestException)
-        {
-            return null;
-        }
-        catch (TaskCanceledException)
-        {
-            return null;
-        }
-        // Deliberately NOT a bare `catch (Exception)` anymore — an
-        // AnthropicNotConfiguredException (thrown by
-        // MissingAnthropicApiKeyMessageService when Anthropic:ApiKey isn't
-        // configured) must propagate out of this method uncaught. It's a
-        // programming/deployment error, not "Claude declined to reply
-        // this turn" — silently folding it into a null return here would
-        // make a missing API key indistinguishable from a normal, expected
-        // external failure, which is exactly what must not happen.
 
         var now = DateTimeOffset.UtcNow;
         var aiMessage = new backend.Models.Message // Anthropic.Models.Messages also defines a Message type — qualify to disambiguate

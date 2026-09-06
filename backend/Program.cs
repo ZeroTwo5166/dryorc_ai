@@ -173,17 +173,21 @@ else
 }
 builder.Services.AddScoped<IClaudeReplyService, ClaudeReplyService>();
 
-// Step 19: tool-dispatch infrastructure only — see
+// Step 19: tool-dispatch infrastructure — see
 // docs/handoffs/step-19-tool-dispatch-design-approved.md and
 // docs/handoffs/step-19-idempotency-key-derivation-approved.md. Resolves
 // IEnumerable<IDispatchTool> the same way IntegrationsController already
-// resolves IEnumerable<IIntegrationOAuthProvider> above: correctly an empty
-// sequence with zero tools registered, which is the current state — no
-// concrete tool (read-only or write) is implemented or wired anywhere yet.
-// Not called from ClaudeReplyService or any controller; exists as
-// standalone, tested infrastructure pending future, separately authorized
-// tool implementations.
+// resolves IEnumerable<IIntegrationOAuthProvider> above.
+//
+// [Step 23K] No longer dormant/unreachable — ClaudeReplyService now calls
+// RunAsync (for conversations with a resolved CustomerId; see
+// ClaudeReplyService's own doc comment) and one concrete read-only tool
+// (GetCustomerTool) is registered below. Still no write tool anywhere in
+// this codebase — every write-tool workstream remains exactly as blocked as
+// before (see docs/handoffs/step-23k-dispatch-wiring-proof.md for the full
+// scope of what this pass proved vs. did not).
 builder.Services.AddScoped<IToolDispatchService, ToolDispatchService>();
+builder.Services.AddScoped<IDispatchTool, GetCustomerTool>();
 
 // Step 11: Voyage embeddings for KnowledgeDocument chunking/indexing — same
 // lazy pattern as Anthropic above. Startup must succeed whether or not
