@@ -359,6 +359,75 @@ public class OrderCancellationServiceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task RequestCancellationAsync_DifferentKeysSameOrder_SecondThrowsDuplicatePendingException()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var service = scope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
+
+        var businessId = await CreateBusinessAsync(db);
+        var customerId = await CreateCustomerAsync(db, businessId);
+        var firstKey = Guid.NewGuid().ToString("N");
+        var secondKey = Guid.NewGuid().ToString("N");
+
+        // Two different idempotency keys, deliberately — this exercises the
+        // NEW (BusinessId, ExternalOrderId) WHERE Status='Pending' guard
+        // specifically, not the pre-existing (BusinessId, IdempotencyKey)
+        // unique index already covered by
+        // RequestCancellationAsync_ConcurrentIdenticalRequests_... above.
+        // Mirrors the exact scenario Step 22R's design exists to close: two
+        // different Approvals, hence two different derived execution-leg
+        // keys, both targeting the same order.
+        var first = await service.RequestCancellationAsync(
+            businessId, customerId, null, OrderId, null, firstKey, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
+        Assert.Equal(IdempotentOperationOutcome.InProgress, first.Outcome);
+
+        var exception = await Assert.ThrowsAsync<DuplicatePendingOrderCancellationException>(() =>
+            service.RequestCancellationAsync(
+                businessId, customerId, null, OrderId, null, secondKey, restock: false,
+                DefaultRefundMethod, DefaultReason, CancellationToken.None));
+
+        Assert.Equal(businessId, exception.BusinessId);
+        Assert.Equal(OrderId, exception.ExternalOrderId);
+
+        // Exactly one row for this order — the second attempt's INSERT
+        // never committed (the whole transaction rolled back on the 23505).
+        var count = await db.OrderCancellations.IgnoreQueryFilters()
+            .CountAsync(x => x.BusinessId == businessId && x.ExternalOrderId == OrderId);
+        Assert.Equal(1, count);
+    }
+
+    [Fact]
+    public async Task RequestCancellationAsync_DifferentKeysSameOrder_AfterFirstResolved_SecondSucceeds()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var service = scope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
+
+        var businessId = await CreateBusinessAsync(db);
+        var customerId = await CreateCustomerAsync(db, businessId);
+        var firstKey = Guid.NewGuid().ToString("N");
+        var secondKey = Guid.NewGuid().ToString("N");
+
+        var first = await service.RequestCancellationAsync(
+            businessId, customerId, null, OrderId, null, firstKey, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
+        await service.MarkFailedAsync(first.OrderCancellationId, "first attempt genuinely failed", CancellationToken.None);
+
+        // Once the first row leaves Pending (a terminal value), the partial
+        // index's WHERE clause no longer matches it — a fresh attempt for
+        // the same order must succeed cleanly, not be blocked forever
+        // (22R's own explicit requirement).
+        var second = await service.RequestCancellationAsync(
+            businessId, customerId, null, OrderId, null, secondKey, restock: false,
+            DefaultRefundMethod, DefaultReason, CancellationToken.None);
+
+        Assert.Equal(IdempotentOperationOutcome.InProgress, second.Outcome);
+        Assert.NotEqual(first.OrderCancellationId, second.OrderCancellationId);
+    }
+
+    [Fact]
     public async Task RequestCancellationAsync_SameKeyDifferentBusiness_NoCollision()
     {
         await using var scope = _provider.CreateAsyncScope();

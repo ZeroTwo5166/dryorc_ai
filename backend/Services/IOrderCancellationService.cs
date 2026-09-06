@@ -8,6 +8,32 @@ public record OrderCancellationResult(
     string? FailureReason);
 
 /// <summary>
+/// Thrown by RequestCancellationAsync when the (BusinessId, ExternalOrderId)
+/// WHERE Status='Pending' partial unique index blocks a second, concurrent
+/// Pending row for the same order — see
+/// docs/handoffs/step-22-ai-action-safety-model-order-cancel-already-cancelled-classification.md's
+/// "Guard Concurrency Mechanism" subsection and
+/// docs/handoffs/step-23q-order-cancellation-pending-guard-design.md.
+/// Deliberately a distinct exception type, not a new IdempotentOperationOutcome
+/// value (Owner Decision, Step 23S, Option B of 23Q §3) — this is a
+/// structurally different conflict from KeyReusedWithDifferentIntent: a
+/// different idempotency key, colliding on a different unique constraint,
+/// against a row created by an entirely separate caller/Approval, not "the
+/// same key reused with different intent." Callers must treat this as an
+/// explicit, distinct refusal — never silently swallowed, never retried
+/// automatically, never treated as license to proceed with a fresh mutation
+/// (22R's own explicit "Blocked-Caller Behavior" requirement).
+/// </summary>
+public sealed class DuplicatePendingOrderCancellationException(Guid businessId, string externalOrderId)
+    : Exception(
+        $"A Pending OrderCancellation already exists for order '{externalOrderId}' in business {businessId}. " +
+        "This action is blocked pending manual recovery of the existing attempt.")
+{
+    public Guid BusinessId { get; } = businessId;
+    public string ExternalOrderId { get; } = externalOrderId;
+}
+
+/// <summary>
 /// Idempotency mechanism half of the OrderCancellation workflow — see the
 /// idempotency-mechanism handoff for the full design. Does not call Shopify
 /// itself; RequestCancellationAsync only ever leaves a Pending row behind on

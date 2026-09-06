@@ -24,6 +24,7 @@ namespace backend.Services;
 public class OrderCancellationService(AppDbContext db) : IOrderCancellationService
 {
     private const string IdempotencyIndexName = "IX_OrderCancellations_BusinessId_IdempotencyKey";
+    private const string PendingGuardIndexName = "IX_OrderCancellations_BusinessId_ExternalOrderId_Pending";
 
     public async Task<OrderCancellationResult> RequestCancellationAsync(
         Guid businessId, Guid customerId, Guid? conversationId,
@@ -106,6 +107,21 @@ public class OrderCancellationService(AppDbContext db) : IOrderCancellationServi
                     new OrderCancellationResult(existing.Id, IdempotentOperationOutcome.Failed, existing.FailureReason),
                 _ => new OrderCancellationResult(existing.Id, IdempotentOperationOutcome.InProgress, null),
             };
+        }
+        // Step 23S — Owner Decision (23Q §3, Option B): the new
+        // (BusinessId, ExternalOrderId) WHERE Status='Pending' guard is
+        // signaled via a distinct thrown exception, not a new
+        // IdempotentOperationOutcome value. Same insert-and-catch idiom as
+        // the existing clause above, distinguished only by ConstraintName —
+        // the two conflicts are structurally different (a different
+        // idempotency key colliding against a row from an entirely separate
+        // caller/Approval, not "the same key reused with different intent"),
+        // so this is not a variant of KeyReusedWithDifferentIntent.
+        catch (DbUpdateException ex) when (
+            ex.InnerException is PostgresException { SqlState: "23505", ConstraintName: PendingGuardIndexName })
+        {
+            db.Entry(cancellation).State = EntityState.Detached;
+            throw new DuplicatePendingOrderCancellationException(businessId, externalOrderId);
         }
     }
 
