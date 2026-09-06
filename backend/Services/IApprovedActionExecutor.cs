@@ -70,6 +70,21 @@ public enum ExecutionRefusalReason
     /// (step-43 addendum owner decision) — not a cause a client can act on
     /// any differently depending on which actually occurred.</summary>
     ApprovalClaimLost,
+
+    /// <summary>Step 48 — no active Shopify Integration exists for this
+    /// business, checked immediately before step 10 (the first
+    /// Shopify-touching step) to avoid an uncaught InvalidOperationException
+    /// from IShopifyOrderLookupService.LookupOrderOwnerAsync. Deliberately a
+    /// Refused reason, not an Executed(Failed, ...) result — this check runs
+    /// strictly before step 13's atomic claim, so no execution-intent row
+    /// exists yet to attach a FailureReason to. A stable, checkable
+    /// business-configuration precondition, not a transient infra failure —
+    /// does not weaken the infra-failure-stays-exception convention for
+    /// genuine runtime Shopify-call failures (token decrypt, non-2xx,
+    /// malformed JSON, GraphQL errors), which remain uncaught exceptions
+    /// unchanged. See docs/handoffs/step-48-cancelorder-tool-registration-production-safety-scoping.md
+    /// §8b.</summary>
+    ShopifyIntegrationUnavailable,
 }
 
 /// <summary>

@@ -682,6 +682,57 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Step 48 — an Approved, unexpired, resolved-customer, Level-2-verified
+    /// approval whose business has NO Integration row at all (active or
+    /// otherwise) must refuse with ShopifyIntegrationUnavailable, cleanly,
+    /// rather than let IShopifyOrderLookupService.LookupOrderOwnerAsync
+    /// throw an uncaught InvalidOperationException at step 10. Both
+    /// ThrowingOrderLookupService and ThrowingOrderCancellationExecutor are
+    /// used here — proving steps 10 through 15 are never reached at all,
+    /// not merely that step 10's own throw is caught somewhere downstream.
+    /// Business.CancelOrderToolEnabled is set true purely for scenario
+    /// fidelity to the user-described case ("a business that has the tool
+    /// enabled... but has no connected/live Shopify integration") — Execute
+    /// itself never reads that flag; the kill switch lives entirely at the
+    /// tool-exposure layer (ClaudeReplyServiceTests covers that).
+    /// </summary>
+    [Fact]
+    public async Task ExecuteApprovedActionAsync_NoActiveShopifyIntegration_ReturnsShopifyIntegrationUnavailable_NeverThrows()
+    {
+        var tenant = (MutableTenantAccessor)_provider.GetRequiredService<ICurrentTenantAccessor>();
+
+        await using var seedScope = _provider.CreateAsyncScope();
+        var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, approval, _) = await SeedApprovalAsync(seedDb);
+        business.CancelOrderToolEnabled = true;
+        await seedDb.SaveChangesAsync();
+        var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
+        // Deliberately no AddIntegrationAsync call — this business has no
+        // Integration row at all.
+
+        tenant.CurrentBusinessId = business.Id;
+        await using var readScope = _provider.CreateAsyncScope();
+        var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var orderLookupService = ThrowingOrderLookupService(readScope.ServiceProvider);
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            new ThrowingOrderCancellationExecutor());
+
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
+
+        var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
+        Assert.Equal(ExecutionRefusalReason.ShopifyIntegrationUnavailable, refused.Reason);
+
+        // No mutation, no consumption: this refusal happens strictly before
+        // step 13's atomic claim, same as every other pre-claim refusal.
+        Assert.Equal(ApprovalStatus.Approved, await ReadApprovalStatusAsync(approval.Id));
+    }
+
+    /// <summary>
     /// Step 10 — Shopify reports a different order owner than the
     /// Approval's resolved Customer (OwnerMismatch, one of
     /// OwnershipCheckFailureReason's eight members) must refuse with

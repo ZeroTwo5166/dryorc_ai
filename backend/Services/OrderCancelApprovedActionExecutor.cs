@@ -186,11 +186,45 @@ public class OrderCancelApprovedActionExecutor(
                 "Conversation is not currently Level 2 verified.");
         }
 
+        // Step 48 — pre-check, immediately before step 10 (the first
+        // Shopify-touching step): does an active Shopify Integration exist
+        // for this business at all. Identical predicate
+        // IShopifyOrderLookupService/IOrderCancellationExecutor already use
+        // internally, checked here explicitly so a business with no
+        // connected (or a disconnected) Shopify integration gets a clean,
+        // informative refusal instead of an uncaught InvalidOperationException
+        // from LookupOrderOwnerAsync below. Refused, not Executed(Failed,
+        // ...) — no execution-intent row exists yet (step 13 hasn't run),
+        // so there is nothing to attach a FailureReason to; the Approval is
+        // left Approved, retriable once Shopify is (re)connected. This is a
+        // stable, checkable business-configuration precondition, not a
+        // transient infra failure — every other infra-failure path in this
+        // method (token decrypt, non-2xx, malformed JSON, GraphQL errors)
+        // remains an uncaught exception, unweakened. See
+        // docs/handoffs/step-48-cancelorder-tool-registration-production-safety-scoping.md
+        // §8b. No AuditLog write — matching CustomerUnresolved's own
+        // precedent (step-38 §2a): not a check on the Approval's own
+        // authorization state, nobody attempted anything unauthorized.
+        var hasActiveShopifyIntegration = await db.Integrations
+            .IgnoreQueryFilters()
+            .AnyAsync(
+                i => i.BusinessId == approval.BusinessId
+                    && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName
+                    && i.IsActive,
+                cancellationToken);
+        if (!hasActiveShopifyIntegration)
+        {
+            return new ExecutionOutcome.Refused(
+                ExecutionRefusalReason.ShopifyIntegrationUnavailable,
+                "No active Shopify integration exists for this business.");
+        }
+
         // Step 10 — ownership verification. LookupOrderOwnerAsync throws
-        // uncaught on infra failure (missing/inactive Integration, token
-        // decrypt failure, non-2xx, malformed JSON, GraphQL errors, order
-        // not found) — that throw is intentionally allowed to propagate out
-        // of this method, matching the same infra-failure-stays-exception
+        // uncaught on infra failure (token decrypt failure, non-2xx,
+        // malformed JSON, GraphQL errors, order not found — missing/inactive
+        // Integration is now pre-checked above and cannot reach this call)
+        // — that throw is intentionally allowed to propagate out of this
+        // method, matching the same infra-failure-stays-exception
         // convention steps 14/15 already use (step-40 §5/§9, step-41 §2).
         // AuthorizeAsync is a pure DB read against Customers (no Shopify
         // call of its own — IOrderOwnershipAuthorizationService's own doc
