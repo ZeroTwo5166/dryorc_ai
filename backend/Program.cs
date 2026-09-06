@@ -189,6 +189,14 @@ builder.Services.AddScoped<IClaudeReplyService, ClaudeReplyService>();
 builder.Services.AddScoped<IToolDispatchService, ToolDispatchService>();
 builder.Services.AddScoped<IDispatchTool, GetCustomerTool>();
 
+// Step 48: registered unconditionally at the DI level, mirroring
+// GetCustomerTool above — the per-business kill switch
+// (Business.CancelOrderToolEnabled) is enforced entirely at the
+// tool-exposure layer (ClaudeReplyService, before ToolDispatchService.RunAsync
+// is ever called), not here. Registration alone does not make this tool
+// live for any business whose flag is false.
+builder.Services.AddScoped<IDispatchTool, OrderCancelProposalTool>();
+
 // Step 11: Voyage embeddings for KnowledgeDocument chunking/indexing — same
 // lazy pattern as Anthropic above. Startup must succeed whether or not
 // Voyage:ApiKey is configured; IKnowledgeIndexingService is always
