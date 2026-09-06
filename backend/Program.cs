@@ -335,11 +335,12 @@ builder.Services.AddTransient<IOrderCancellationExecutor>(sp => sp.GetRequiredSe
 builder.Services.AddScoped<IOrderCancellationReconciliationService, OrderCancellationReconciliationService>();
 builder.Services.AddHostedService<OrderCancellationReconciliationBackgroundService>();
 
-// IApprovedActionExecutor's implementation, still deliberately partial —
-// steps 3-8 of the execution ordering exist so far (Approval load,
-// ApprovalNotFound refusal, status/expiry checks with AuditLog writes,
-// customer re-derivation; see docs/handoffs/step-38-cancelorder-execute-next-slice-design.md).
-// No staff-facing endpoint calls this yet.
+// IApprovedActionExecutor's implementation — all 16 steps of the execution
+// ordering are implemented as of step-47 (3-13 committed earlier; 14-16,
+// the pre-execution ground-truth check and the Shopify orderCancel mutation
+// call, completed by step-47), plus step-48's pre-step-10 guard against a
+// business with no active Shopify integration. Called by ApprovalsController's
+// POST .../execute action (step-47) — no longer dormant.
 builder.Services.AddScoped<IApprovedActionExecutor, OrderCancelApprovedActionExecutor>();
 
 // ─────────────────────────────────────────────────────────────
