@@ -28,6 +28,8 @@ public static class AuditEventTypes
     public const string UnauthorizedActionBlocked = "UnauthorizedActionBlocked";
 
     // Step 22 AI Action Safety Model — Approval lifecycle
+    public const string ApprovalApproved = "ApprovalApproved";
+    public const string ApprovalDenied = "ApprovalDenied";
     public const string ExecutionClaimed = "ExecutionClaimed";
 
     // Staff / access
