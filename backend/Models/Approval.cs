@@ -50,6 +50,14 @@ public class Approval : ITenantOwned
     public DateTimeOffset? DeniedAt { get; set; }
     public Guid? DeniedBy { get; set; }
 
+    /// <summary>
+    /// Optional, staff-supplied free text explaining a denial — Step 47
+    /// addendum decision. No max length, matching Ticket.Summary's identical
+    /// optional-free-text convention. Never populated for any other status
+    /// transition.
+    /// </summary>
+    public string? DeniedReason { get; set; }
+
     public DateTimeOffset? ConsumedAt { get; set; }
 
     public Guid? OrderCancellationId { get; set; }

@@ -291,6 +291,9 @@ namespace backend.Migrations
                     b.Property<Guid?>("DeniedBy")
                         .HasColumnType("uuid");
 
+                    b.Property<string>("DeniedReason")
+                        .HasColumnType("text");
+
                     b.Property<string>("DisplaySummary")
                         .IsRequired()
                         .HasColumnType("text");
