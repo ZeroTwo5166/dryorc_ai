@@ -8,18 +8,24 @@ namespace backend.Services;
 
 /// <summary>
 /// The concrete IApprovedActionExecutor implementation for cancelOrder.
-/// Implements steps 3–9 of the execution ordering in
+/// Implements the full execution ordering in
 /// docs/handoffs/step-22z-approval-proposal-approval-lifecycle-design.md
-/// §10: the Approval load + tenant binding + ApprovalNotFound refusal
-/// (Step 29), the Status/ExpiresAt/CustomerId checks (steps 6/7/8, per
-/// docs/handoffs/step-38-cancelorder-execute-next-slice-design.md §6), and
-/// — added by this pass, per
+/// §10, steps 3–16: the Approval load + tenant binding + ApprovalNotFound
+/// refusal (Step 29), the Status/ExpiresAt/CustomerId checks (steps 6/7/8,
+/// per docs/handoffs/step-38-cancelorder-execute-next-slice-design.md §6),
+/// the Level 2 verification check (step 9, per
 /// docs/handoffs/step-39-cancelorder-execute-steps-9-16-next-slice-design.md
-/// §7 — the Level 2 verification check (step 9). Every step past that —
-/// ownership, hash recompute, the atomic claim, and the Shopify call — is
-/// explicitly NOT implemented by this pass and throws
-/// NotImplementedException if reached. See step-39 for the full design
-/// this class will eventually satisfy in full.
+/// §7), ownership verification (step 10), action-hash recomputation and
+/// execution-leg key derivation (steps 11/12), the atomic claim (step 13),
+/// and — added per
+/// docs/handoffs/step-47-execute-steps-14-16-and-staff-http-layer-design.md
+/// — the pre-execution ground-truth check and Shopify orderCancel mutation
+/// call (steps 14/15, reusing the already-existing, already-tested
+/// IShopifyOrderLookupService.GetCancellationStateAsync and
+/// IOrderCancellationExecutor.ExecuteAsync unmodified — no new Shopify
+/// integration was written for this). Step 16 (reconciliation) requires no
+/// code here at all — OrderCancellationReconciliationService already runs
+/// independently, unaffected by anything in this class.
 ///
 /// The Approval-load query below deliberately does NOT call
 /// IgnoreQueryFilters() — this is a positive, load-bearing requirement, not
@@ -84,7 +90,8 @@ public class OrderCancelApprovedActionExecutor(
     ILevel2VerificationChecker level2Checker,
     IShopifyOrderLookupService orderLookupService,
     IOrderOwnershipAuthorizationService ownershipService,
-    IOrderCancellationService orderCancellationService) : IApprovedActionExecutor
+    IOrderCancellationService orderCancellationService,
+    IOrderCancellationExecutor orderCancellationExecutor) : IApprovedActionExecutor
 {
     public async Task<ExecutionOutcome> ExecuteApprovedActionAsync(
         Guid approvalId, Guid executingStaffUserId, CancellationToken cancellationToken)
@@ -342,16 +349,46 @@ public class OrderCancelApprovedActionExecutor(
             await tx.CommitAsync(cancellationToken);
         }
 
-        throw new NotImplementedException(
-            "OrderCancelApprovedActionExecutor implements steps 3-13 of the execution ordering so far " +
-            "(Approval load/ApprovalNotFound + tenant binding, status/expiry checks with AuditLog " +
-            "writes, customer re-derivation, Level 2 verification with an AuditLog write, ownership " +
-            "verification with an AuditLog write, action-hash recomputation with an AuditLog write, " +
-            "execution-leg key derivation, the atomic Approved->Consumed claim, and OrderCancellation " +
-            "row creation with an AuditLog write). Every step beyond that — the pre-execution " +
-            "ground-truth check and the Shopify orderCancel mutation call — is deliberately not yet " +
-            "implemented. See docs/handoffs/step-43-cancelorder-execute-step-13-atomic-claim-design.md " +
-            "for the full design this method will eventually satisfy.");
+        // Step 14 — the first action strictly outside step 13's transaction
+        // (step-22z §10/§16, step-38 §2 row 14): reuse the existing,
+        // unmodified ground-truth check GetCancellationStateAsync already
+        // uses for reconciliation. Throws uncaught on infra failure, same
+        // convention as step 10's Shopify call. If Shopify already reports
+        // the order cancelled, this Approval's own attempt did not cause it
+        // (Decision 6, adopted, unweakened) — resolve directly to
+        // ExternallySatisfied and never call the mutation executor at all.
+        var groundTruth = await orderLookupService.GetCancellationStateAsync(
+            approval.BusinessId, approval.ResourceId, cancellationToken);
+        if (groundTruth.CancelledAt is not null)
+        {
+            await orderCancellationService.MarkConfirmedAsync(orderCancellationId, cancellationToken);
+            return new ExecutionOutcome.Executed(
+                orderCancellationId, ExecutionResultStatus.ExternallySatisfied,
+                "Order was already cancelled externally.");
+        }
+
+        // Step 15 — the existing, unmodified mutation executor. Throws
+        // uncaught on infra failure; on a genuine Shopify-reported rejection
+        // it has already called MarkFailedAsync internally before returning;
+        // otherwise it leaves the row Pending for reconciliation (step 16,
+        // unchanged, running independently — no code here). Re-read the row
+        // fresh (AsNoTracking) rather than trust any in-memory value, since
+        // ExecuteAsync mutates it via its own separate DB call, not via this
+        // method's own tracked context.
+        await orderCancellationExecutor.ExecuteAsync(orderCancellationId, cancellationToken);
+
+        var finalRow = await db.OrderCancellations
+            .IgnoreQueryFilters()
+            .AsNoTracking()
+            .FirstAsync(x => x.Id == orderCancellationId, cancellationToken);
+
+        return finalRow.Status switch
+        {
+            OrderCancellationStatus.Failed =>
+                new ExecutionOutcome.Executed(orderCancellationId, ExecutionResultStatus.Failed, finalRow.FailureReason),
+            _ =>
+                new ExecutionOutcome.Executed(orderCancellationId, ExecutionResultStatus.UnknownNeedsReconciliation, null),
+        };
     }
 
     /// <summary>

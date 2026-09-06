@@ -327,11 +327,84 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
             ? $$"""{ "data": { "order": { "id": "{{orderId}}", "customer": null } } }"""
             : $$"""{ "data": { "order": { "id": "{{orderId}}", "customer": { "id": "{{customerId}}" } } } }""";
 
+    /// <summary>
+    /// Step 14's own ground-truth query response shape — same shape
+    /// OrderCancellationReconciliationServiceTests.CancellationStateResponse
+    /// already uses, replicated here rather than shared, matching this
+    /// codebase's existing convention of not factoring test-fixture JSON
+    /// builders across unrelated test classes.
+    /// </summary>
+    private static string CancellationStateResponse(string orderId, DateTimeOffset? cancelledAt) =>
+        cancelledAt is null
+            ? $$"""{ "data": { "order": { "id": "{{orderId}}", "cancelledAt": null } } }"""
+            : $$"""{ "data": { "order": { "id": "{{orderId}}", "cancelledAt": "{{cancelledAt.Value:O}}" } } }""";
+
+    /// <summary>
+    /// Step 10 (LookupOrderOwnerAsync) and step 14 (GetCancellationStateAsync)
+    /// share one IShopifyOrderLookupService instance and therefore one fake
+    /// handler in these tests — a test that must reach both needs its
+    /// responses served in the exact order the executor calls them, not by
+    /// request-content inspection (the fake handler is call-order-based
+    /// throughout this file, matching NewOrderLookupService's own existing
+    /// per-test callback convention).
+    /// </summary>
+    private static Func<HttpRequestMessage, HttpResponseMessage> SequencedResponses(params string[] jsonResponses)
+    {
+        var index = 0;
+        return _ => JsonResponse(jsonResponses[index++]);
+    }
+
     private static HttpResponseMessage JsonResponse(string json) =>
         new(System.Net.HttpStatusCode.OK)
         {
             Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json"),
         };
+
+    /// <summary>Step 15's own mutation-accepted response shape — same shape
+    /// ShopifyOrderCancellationExecutorTests.AcceptedJobResponse already
+    /// uses.</summary>
+    private const string AcceptedJobResponse =
+        """{ "data": { "orderCancel": { "job": { "id": "gid://shopify/Job/1", "done": false }, "orderCancelUserErrors": [] } } }""";
+
+    /// <summary>Step 15's own mutation-rejected response shape — same shape
+    /// ShopifyOrderCancellationExecutorTests uses for a genuine Shopify
+    /// rejection (orderCancelUserErrors non-empty).</summary>
+    private const string RejectedMutationResponse =
+        """{ "data": { "orderCancel": { "job": null, "orderCancelUserErrors": [ { "field": ["orderId"], "message": "Order already cancelled", "code": "ALREADY_CANCELLED" } ] } } }""";
+
+    /// <summary>
+    /// Constructs a real ShopifyOrderCancellationExecutor (step 15's own
+    /// mutation caller) wired to FakeShopifyHttpMessageHandler — same
+    /// pattern as ShopifyOrderCancellationExecutorTests.NewExecutor. A
+    /// separate HttpClient/handler from NewOrderLookupService's — step 10/14
+    /// and step 15 are genuinely different Shopify services in production,
+    /// unified here only by both being fakes over the same Neon dev DB.
+    /// </summary>
+    private static ShopifyOrderCancellationExecutor NewOrderCancellationExecutor(
+        IServiceProvider scopedProvider, Func<HttpRequestMessage, HttpResponseMessage> respond) =>
+        new(
+            new HttpClient(new FakeShopifyHttpMessageHandler(respond)),
+            scopedProvider.GetRequiredService<AppDbContext>(),
+            scopedProvider.GetRequiredService<IIntegrationTokenProtector>(),
+            Options.Create(new ShopifyOptions
+            {
+                ClientId = "unused", ClientSecret = "unused", RedirectUri = "unused", AdminApiVersion = AdminApiVersion,
+            }),
+            scopedProvider.GetRequiredService<IOrderCancellationService>());
+
+    /// <summary>
+    /// For every test whose outcome is decided at or before step 13 (i.e.
+    /// step 14/15 must never run) — a fake IOrderCancellationExecutor that
+    /// throws if ExecuteAsync is ever called at all, affirmatively proving
+    /// step 15 is genuinely never reached on these paths, matching
+    /// ThrowingOrderLookupService's identical role for step 10.
+    /// </summary>
+    private sealed class ThrowingOrderCancellationExecutor : IOrderCancellationExecutor
+    {
+        public Task ExecuteAsync(Guid orderCancellationId, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException(
+                "Step 15 must not be reached — this test's Approval should refuse, or resolve at step 14, before it.");
+    }
 
     private async Task<List<AuditLog>> ReadAuditLogsAsync(Guid businessId, Guid entityId)
     {
@@ -352,6 +425,16 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var approval = await db.Approvals.IgnoreQueryFilters().AsNoTracking()
             .FirstAsync(a => a.Id == approvalId);
         return approval.Status;
+    }
+
+    private async Task<OrderCancellationStatus> ReadOrderCancellationStatusAsync(Guid? orderCancellationId)
+    {
+        Assert.NotNull(orderCancellationId);
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var row = await db.OrderCancellations.IgnoreQueryFilters().AsNoTracking()
+            .FirstAsync(o => o.Id == orderCancellationId!.Value);
+        return row.Status;
     }
 
     [Fact]
@@ -387,7 +470,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var ownershipService = new OrderOwnershipAuthorizationService(readDb);
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
         var executor = new OrderCancelApprovedActionExecutor(
-            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            new ThrowingOrderCancellationExecutor());
 
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, Guid.NewGuid(), CancellationToken.None);
 
@@ -414,7 +498,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var ownershipService = new OrderOwnershipAuthorizationService(readDb);
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
         var executor = new OrderCancelApprovedActionExecutor(
-            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            new ThrowingOrderCancellationExecutor());
 
         var outcome = await executor.ExecuteApprovedActionAsync(Guid.NewGuid(), Guid.NewGuid(), CancellationToken.None);
 
@@ -454,7 +539,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var ownershipService = new OrderOwnershipAuthorizationService(readDb);
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
         var executor = new OrderCancelApprovedActionExecutor(
-            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            new ThrowingOrderCancellationExecutor());
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
 
         var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
@@ -496,7 +582,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var ownershipService = new OrderOwnershipAuthorizationService(readDb);
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
         var executor = new OrderCancelApprovedActionExecutor(
-            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            new ThrowingOrderCancellationExecutor());
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
 
         var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
@@ -535,7 +622,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var ownershipService = new OrderOwnershipAuthorizationService(readDb);
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
         var executor = new OrderCancelApprovedActionExecutor(
-            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            new ThrowingOrderCancellationExecutor());
 
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, Guid.NewGuid(), CancellationToken.None);
 
@@ -578,7 +666,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var ownershipService = new OrderOwnershipAuthorizationService(readDb);
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
         var executor = new OrderCancelApprovedActionExecutor(
-            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            new ThrowingOrderCancellationExecutor());
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
 
         var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
@@ -629,7 +718,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var ownershipService = new OrderOwnershipAuthorizationService(readDb);
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
         var executor = new OrderCancelApprovedActionExecutor(
-            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            new ThrowingOrderCancellationExecutor());
 
         var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
@@ -652,19 +742,15 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
     /// <summary>
     /// Step 10 — Shopify confirms the SAME owning customer as the
     /// Approval's resolved Customer -> ownership verification succeeds, and
-    /// execution proceeds through step 13's atomic claim before falling
-    /// through to the still-not-implemented steps 14-16 boundary. Renamed
-    /// and re-asserted by the step-43 implementation pass — previously
-    /// named "...FallsThroughToNotImplementedAndWritesNoAuditLog" and
-    /// asserted zero AuditLog rows / an Approved status, both of which
-    /// became false the moment step 13 was implemented (the claim now
-    /// unconditionally requires exactly one ExecutionClaimed AuditLog row
-    /// and leaves the Approval Consumed on this path). Proves the negative
-    /// case explicitly, distinct from the general "everything passes"
-    /// boundary test below (which this test overlaps with by design, for
-    /// the same reason step-38/step-39 each added their own dedicated
-    /// success-path assertion alongside the general boundary test rather
-    /// than relying on the boundary test alone).
+    /// execution proceeds through step 13's atomic claim and (step-47) all
+    /// the way through steps 14-16: the ground-truth check (step 14) finds
+    /// the order not yet cancelled, so the mutation is sent (step 15) and
+    /// accepted (job pending) -> Executed(UnknownNeedsReconciliation).
+    /// Proves the negative case explicitly, distinct from the general
+    /// "everything passes" boundary test below (which this test overlaps
+    /// with by design, for the same reason step-38/step-39 each added their
+    /// own dedicated success-path assertion alongside the general boundary
+    /// test rather than relying on the boundary test alone).
     /// </summary>
     [Fact]
     public async Task ExecuteApprovedActionAsync_OwnershipVerificationSucceeds_ClaimsAndWritesExecutionClaimedAuditLog()
@@ -686,14 +772,22 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
         var orderLookupService = NewOrderLookupService(
             readScope.ServiceProvider,
-            _ => JsonResponse(OrderOwnerResponse(approval.ResourceId, customerExternalId)));
+            SequencedResponses(
+                OrderOwnerResponse(approval.ResourceId, customerExternalId),
+                CancellationStateResponse(approval.ResourceId, null)));
         var ownershipService = new OrderOwnershipAuthorizationService(readDb);
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
+        var orderCancellationExecutor = NewOrderCancellationExecutor(
+            readScope.ServiceProvider, _ => JsonResponse(AcceptedJobResponse));
         var executor = new OrderCancelApprovedActionExecutor(
-            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            orderCancellationExecutor);
 
-        await Assert.ThrowsAsync<NotImplementedException>(
-            () => executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None));
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
+
+        var executed = Assert.IsType<ExecutionOutcome.Executed>(outcome);
+        Assert.Equal(ExecutionResultStatus.UnknownNeedsReconciliation, executed.Status);
+        Assert.Null(executed.Detail);
 
         var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
         var entry = Assert.Single(auditLogs);
@@ -744,7 +838,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var ownershipService = new OrderOwnershipAuthorizationService(readDb);
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
         var executor = new OrderCancelApprovedActionExecutor(
-            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            new ThrowingOrderCancellationExecutor());
 
         var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
@@ -768,15 +863,13 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
     /// -> step 11 does not refuse, step 12's execution-leg key derivation
     /// runs (a pure, always-succeeding computation with no refusal path
     /// and no AuditLog write of its own, per step-42 §2), and execution
-    /// proceeds through step 13's atomic claim before falling through to
-    /// the still-not-implemented steps 14-16 boundary. Renamed and
-    /// re-asserted by the step-43 implementation pass — previously named
-    /// "...FallsThroughToNotImplementedAndWritesNoAuditLog" and asserted
-    /// zero AuditLog rows, which became false once step 13 was implemented
-    /// (the claim now unconditionally requires exactly one ExecutionClaimed
-    /// AuditLog row on this path). Proves the negative case explicitly,
-    /// distinct from the general boundary test below, same convention as
-    /// every earlier step's dedicated success-path assertion.
+    /// proceeds through step 13's atomic claim, then (step-47) step 14's own
+    /// ground-truth check finds the order ALREADY cancelled externally ->
+    /// Executed(ExternallySatisfied), never reaching step 15's mutation call
+    /// at all (ThrowingOrderCancellationExecutor affirmatively proves this).
+    /// Proves the negative case explicitly, distinct from the general
+    /// boundary test below, same convention as every earlier step's
+    /// dedicated success-path assertion.
     /// </summary>
     [Fact]
     public async Task ExecuteApprovedActionAsync_ActionHashMatches_ClaimsAndWritesExecutionClaimedAuditLog()
@@ -796,16 +889,24 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
         var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var now = DateTimeOffset.UtcNow;
         var orderLookupService = NewOrderLookupService(
             readScope.ServiceProvider,
-            _ => JsonResponse(OrderOwnerResponse(approval.ResourceId, customerExternalId)));
+            SequencedResponses(
+                OrderOwnerResponse(approval.ResourceId, customerExternalId),
+                CancellationStateResponse(approval.ResourceId, now)));
         var ownershipService = new OrderOwnershipAuthorizationService(readDb);
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
         var executor = new OrderCancelApprovedActionExecutor(
-            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            new ThrowingOrderCancellationExecutor());
 
-        await Assert.ThrowsAsync<NotImplementedException>(
-            () => executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None));
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
+
+        var executed = Assert.IsType<ExecutionOutcome.Executed>(outcome);
+        Assert.Equal(ExecutionResultStatus.ExternallySatisfied, executed.Status);
+        Assert.Equal("Order was already cancelled externally.", executed.Detail);
+        Assert.Equal(OrderCancellationStatus.Confirmed, await ReadOrderCancellationStatusAsync(executed.ExecutionIntentId));
 
         var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
         var entry = Assert.Single(auditLogs);
@@ -819,27 +920,28 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
     /// Deliberate scope-boundary test, same convention as
     /// OrderCancelProposalToolTests' own explicit-refusal tests: documents,
     /// rather than merely leaves implicit, exactly where this session's
-    /// implementation stops. Must be updated (not deleted) by whichever
-    /// future session extends ExecuteApprovedActionAsync past step 13 — a
-    /// passing NotImplementedException here after that point would mean the
-    /// new step's logic was never reached. Extended by this pass (was
-    /// previously the steps-3-12 boundary, per
-    /// docs/handoffs/step-43-cancelorder-execute-step-13-atomic-claim-design.md)
-    /// — this is now also the "successful claim + OrderCancellation row
-    /// creation" test: asserts the Approval is Consumed with
+    /// implementation stops for steps that DO refuse — a passing outcome
+    /// here after a future step is added without updating this test would
+    /// mean the new step's logic was never reached. Extended through step-47
+    /// (was previously the steps-3-12 boundary, per
+    /// docs/handoffs/step-43-cancelorder-execute-step-13-atomic-claim-design.md,
+    /// then the steps-3-13 boundary) — this is now the full "everything
+    /// passes, end to end" test: asserts the Approval is Consumed with
     /// OrderCancellationId set, exactly one ExecutionClaimed AuditLog row
-    /// exists, and the created OrderCancellation row itself has the
-    /// expected BusinessId/CustomerId/ConversationId/ExternalOrderId/
-    /// Status/Restock/Method/Reason/IdempotencyKey-length — not merely that
-    /// *an* outcome occurred. Also confirms exactly one Shopify call is
-    /// ever made (step 10's own ownership lookup) — step 13 itself performs
-    /// zero network/Shopify I/O (step-43 §3); ThrowingOrderLookupService
-    /// doesn't apply here since this test must legitimately reach and pass
-    /// step 10, so a call *counter* is used instead of a throw-if-invoked
-    /// guard. Also proves the adjacent-case negative: a valid Approved+
-    /// unexpired+resolved-customer+Level2-verified+ownership-matching+
-    /// hash-matching Approval does NOT trigger any of steps 6/7/8/9/10/11's
-    /// refusals.
+    /// exists, the created OrderCancellation row itself has the expected
+    /// BusinessId/CustomerId/ConversationId/ExternalOrderId/Restock/Method/
+    /// Reason/IdempotencyKey-length, and the final ExecutionOutcome/final
+    /// OrderCancellation.Status both reflect a mutation genuinely sent and
+    /// accepted (step 15). Confirms exactly one call to each of the two
+    /// separate Shopify surfaces this flow now touches — the ownership+
+    /// ground-truth lookup service (step 10 + step 14, two calls, same fake
+    /// handler) and the mutation executor (step 15, one call, a separate
+    /// fake handler) — step 13 itself still performs zero network/Shopify
+    /// I/O of its own (step-43 §3, unchanged). Also proves the
+    /// adjacent-case negative: a valid Approved+unexpired+resolved-customer+
+    /// Level2-verified+ownership-matching+hash-matching+not-yet-cancelled
+    /// Approval does NOT trigger any of steps 6/7/8/9/10/11's refusals nor
+    /// step 14's ExternallySatisfied shortcut.
     /// </summary>
     [Fact]
     public async Task ExecuteApprovedActionAsync_ApprovalExistsForCurrentTenant_ClaimsCreatesOrderCancellationAndThrowsNotImplemented()
@@ -858,24 +960,38 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
         var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
-        var callCount = 0;
+        var lookupCallCount = 0;
         var orderLookupService = NewOrderLookupService(
             readScope.ServiceProvider,
-            _ =>
+            request =>
             {
-                callCount++;
-                return JsonResponse(OrderOwnerResponse(approval.ResourceId, customerExternalId));
+                lookupCallCount++;
+                return JsonResponse(lookupCallCount == 1
+                    ? OrderOwnerResponse(approval.ResourceId, customerExternalId)
+                    : CancellationStateResponse(approval.ResourceId, null));
             });
         var ownershipService = new OrderOwnershipAuthorizationService(readDb);
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
+        var mutationCallCount = 0;
+        var orderCancellationExecutor = NewOrderCancellationExecutor(
+            readScope.ServiceProvider,
+            _ =>
+            {
+                mutationCallCount++;
+                return JsonResponse(AcceptedJobResponse);
+            });
         var executor = new OrderCancelApprovedActionExecutor(
-            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            orderCancellationExecutor);
 
         var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
-        await Assert.ThrowsAsync<NotImplementedException>(
-            () => executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None));
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
 
-        Assert.Equal(1, callCount);
+        var executed = Assert.IsType<ExecutionOutcome.Executed>(outcome);
+        Assert.Equal(ExecutionResultStatus.UnknownNeedsReconciliation, executed.Status);
+        Assert.Null(executed.Detail);
+        Assert.Equal(2, lookupCallCount);
+        Assert.Equal(1, mutationCallCount);
 
         var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
         var entry = Assert.Single(auditLogs);
@@ -902,6 +1018,62 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         Assert.Equal(RefundMethod.OriginalPaymentMethod, orderCancellation.Method);
         Assert.Equal(OrderCancelReason.Customer, orderCancellation.Reason);
         Assert.Equal(64, orderCancellation.IdempotencyKey.Length);
+    }
+
+    /// <summary>
+    /// Step 15 — the ground-truth check (step 14) finds the order not yet
+    /// cancelled, so the mutation is sent, but Shopify itself rejects it
+    /// (orderCancelUserErrors non-empty) -> Executed(Failed, reason), and
+    /// the underlying OrderCancellation row is left Failed with
+    /// FailureReason set (IOrderCancellationExecutor.ExecuteAsync's own,
+    /// unmodified behavior — already independently verified by
+    /// ShopifyOrderCancellationExecutorTests; this test only confirms
+    /// Execute correctly re-reads and reports that outcome, not that the
+    /// mutation executor itself behaves correctly).
+    /// </summary>
+    [Fact]
+    public async Task ExecuteApprovedActionAsync_MutationRejectedByShopify_ReturnsFailedAndWritesExecutionClaimedAuditLog()
+    {
+        var tenant = (MutableTenantAccessor)_provider.GetRequiredService<ICurrentTenantAccessor>();
+        const string customerExternalId = "gid://shopify/Customer/AAA";
+
+        await using var seedScope = _provider.CreateAsyncScope();
+        var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var tokenProtector = seedScope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
+        var (business, approval, _) = await SeedApprovalAsync(seedDb, customerExternalId: customerExternalId);
+        await AddIntegrationAsync(seedDb, tokenProtector, business.Id);
+        var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
+
+        tenant.CurrentBusinessId = business.Id;
+        await using var readScope = _provider.CreateAsyncScope();
+        var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var orderLookupService = NewOrderLookupService(
+            readScope.ServiceProvider,
+            SequencedResponses(
+                OrderOwnerResponse(approval.ResourceId, customerExternalId),
+                CancellationStateResponse(approval.ResourceId, null)));
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
+        var orderCancellationExecutor = NewOrderCancellationExecutor(
+            readScope.ServiceProvider, _ => JsonResponse(RejectedMutationResponse));
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            orderCancellationExecutor);
+
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
+
+        var executed = Assert.IsType<ExecutionOutcome.Executed>(outcome);
+        Assert.Equal(ExecutionResultStatus.Failed, executed.Status);
+        Assert.Equal("Order already cancelled", executed.Detail);
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var orderCancellation = await verifyDb.OrderCancellations.IgnoreQueryFilters().AsNoTracking()
+            .FirstAsync(o => o.Id == executed.ExecutionIntentId);
+        Assert.Equal(OrderCancellationStatus.Failed, orderCancellation.Status);
+        Assert.Equal("Order already cancelled", orderCancellation.FailureReason);
     }
 
     /// <summary>
@@ -952,7 +1124,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var ownershipService = new OrderOwnershipAuthorizationService(readDb);
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
         var executor = new OrderCancelApprovedActionExecutor(
-            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            new ThrowingOrderCancellationExecutor());
 
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, Guid.NewGuid(), CancellationToken.None);
 
@@ -1022,7 +1195,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var ownershipService = new OrderOwnershipAuthorizationService(readDb);
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
         var executor = new OrderCancelApprovedActionExecutor(
-            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            new ThrowingOrderCancellationExecutor());
 
         var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, Guid.NewGuid(), CancellationToken.None);
 
@@ -1151,15 +1325,21 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
             var firstLevel2Checker = firstScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
             var firstOrderLookupService = NewOrderLookupService(
                 firstScope.ServiceProvider,
-                _ => JsonResponse(OrderOwnerResponse(firstApproval.ResourceId, customerExternalId)));
+                SequencedResponses(
+                    OrderOwnerResponse(firstApproval.ResourceId, customerExternalId),
+                    CancellationStateResponse(firstApproval.ResourceId, null)));
             var firstOwnershipService = new OrderOwnershipAuthorizationService(firstDb);
             var firstOrderCancellationService = firstScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
+            var firstOrderCancellationExecutor = NewOrderCancellationExecutor(
+                firstScope.ServiceProvider, _ => JsonResponse(AcceptedJobResponse));
             var firstExecutor = new OrderCancelApprovedActionExecutor(
                 firstDb, firstAuditLogService, firstLevel2Checker, firstOrderLookupService,
-                firstOwnershipService, firstOrderCancellationService);
+                firstOwnershipService, firstOrderCancellationService, firstOrderCancellationExecutor);
 
-            await Assert.ThrowsAsync<NotImplementedException>(
-                () => firstExecutor.ExecuteApprovedActionAsync(firstApproval.Id, firstExecutingStaffUserId, CancellationToken.None));
+            var firstOutcome = await firstExecutor.ExecuteApprovedActionAsync(
+                firstApproval.Id, firstExecutingStaffUserId, CancellationToken.None);
+            var firstExecuted = Assert.IsType<ExecutionOutcome.Executed>(firstOutcome);
+            Assert.Equal(ExecutionResultStatus.UnknownNeedsReconciliation, firstExecuted.Status);
         }
 
         // Second Execute call, same order, first attempt still Pending —
@@ -1174,7 +1354,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var ownershipService = new OrderOwnershipAuthorizationService(readDb);
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
         var executor = new OrderCancelApprovedActionExecutor(
-            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            new ThrowingOrderCancellationExecutor());
 
         // Even though this attempt is ultimately refused and rolled back
         // (DuplicatePendingCancellation), it still reaches step 13's atomic
