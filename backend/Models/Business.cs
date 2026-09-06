@@ -44,6 +44,18 @@ public class Business
     public bool ExtendedAuditLoggingEnabled { get; set; } = false;
     public bool CancelOrderRestocksInventory { get; set; } = false;
 
+    /// <summary>
+    /// Step 48 — a narrow, single-tool kill switch: whether the AI is
+    /// offered the cancelOrder proposal tool at all for this business.
+    /// Default false — opt-in, not opt-out. This is explicitly NOT Decision
+    /// 8's deferred per-write-tool automation-tier system (auto-approve
+    /// under a limit, tiered policy) — it has no relationship to the
+    /// human-approval pipeline itself; a business with this true still
+    /// requires the full propose→approve/deny→execute flow, unchanged. See
+    /// docs/handoffs/step-48-cancelorder-tool-registration-production-safety-scoping.md.
+    /// </summary>
+    public bool CancelOrderToolEnabled { get; set; } = false;
+
 
     /// <summary>
     /// Maximum refund amount Nivora may execute autonomously (Mode = Auto)

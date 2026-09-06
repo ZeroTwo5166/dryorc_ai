@@ -411,6 +411,9 @@ namespace backend.Migrations
                     b.Property<bool>("CancelOrderRestocksInventory")
                         .HasColumnType("boolean");
 
+                    b.Property<bool>("CancelOrderToolEnabled")
+                        .HasColumnType("boolean");
+
                     b.Property<string>("ContactEmail")
                         .HasColumnType("text");
 
