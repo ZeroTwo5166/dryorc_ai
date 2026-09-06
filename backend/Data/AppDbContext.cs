@@ -64,6 +64,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
     public DbSet<NotificationRecipient> NotificationRecipients => Set<NotificationRecipient>();
     public DbSet<BusinessSigningKey> BusinessSigningKeys => Set<BusinessSigningKey>();
     public DbSet<ConsumedSignedIdentityToken> ConsumedSignedIdentityTokens => Set<ConsumedSignedIdentityToken>();
+    public DbSet<Approval> Approvals => Set<Approval>();
 
     // Step 18: the ASP.NET Core Data Protection key ring, persisted here
     // (Postgres) instead of the framework's filesystem default — see
@@ -557,9 +558,35 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
             o.Property(x => x.ExternalOrderId).HasMaxLength(256);
             o.Property(x => x.IdempotencyKey).HasMaxLength(256);
 
-            o.HasIndex(x => new { x.BusinessId, x.ExternalOrderId });
+            // Explicit name on this first index via the HasIndex(expr, name)
+            // overload — previously unnamed, relying on EF Core's own
+            // default-naming convention — is now required, not stylistic:
+            // Step 23S adds a second index over these exact same
+            // (BusinessId, ExternalOrderId) columns below. Confirmed
+            // directly this pass, empirically: chaining .HasDatabaseName(...)
+            // after a second, otherwise-identical HasIndex(propertyExpression)
+            // call does NOT create two independent index objects — EF Core's
+            // fluent builder silently merges the second call's configuration
+            // into the first's single underlying index definition regardless
+            // (verified by inspecting AppDbContextModelSnapshot.cs after a
+            // first attempt: only one index over these columns existed in
+            // the generated model at all), and the resulting migration
+            // dropped this pre-existing, unrelated index — something this
+            // task was never authorized to remove. The HasIndex(expression,
+            // name) overload below, giving each call an explicit name at the
+            // point of construction rather than via a later chained call, is
+            // the mechanism that actually produces two distinct, independently-
+            // managed index objects.
+            o.HasIndex(x => new { x.BusinessId, x.ExternalOrderId }, "IX_OrderCancellations_BusinessId_ExternalOrderId");
             o.HasIndex(x => new { x.BusinessId, x.CustomerId });
             o.HasIndex(x => new { x.BusinessId, x.IdempotencyKey }).IsUnique();
+
+            // Step 23S — at most one Pending OrderCancellation per order at a
+            // time, closing the gap Step 22R first designed (two different
+            // Approvals independently reaching Execute for the same order).
+            o.HasIndex(x => new { x.BusinessId, x.ExternalOrderId }, "IX_OrderCancellations_BusinessId_ExternalOrderId_Pending")
+                .IsUnique()
+                .HasFilter("\"Status\" = 'Pending'");
 
             o.ToTable(t => t.HasCheckConstraint(
                 "CK_OrderCancellations_CompletedAt",
@@ -857,6 +884,50 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
 
             r.HasOne<ApplicationUser>().WithMany()
                 .HasForeignKey(x => x.UserId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        // ─────────────────────────────────────────────────────────────
+        // Approval — Step 22 AI Action Safety Model. Persistence only; see
+        // Approval.cs's own doc comment.
+        // ─────────────────────────────────────────────────────────────
+        builder.Entity<Approval>(ap =>
+        {
+            ap.Property(x => x.ToolName).HasMaxLength(256);
+            ap.Property(x => x.ResourceId).HasMaxLength(256);
+            ap.Property(x => x.ActionHash).HasMaxLength(64);
+            ap.Property(x => x.Status).HasConversion<string>().HasMaxLength(32);
+
+            ap.HasOne<Business>().WithMany()
+                .HasForeignKey(x => x.BusinessId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            // Cascade, not Restrict — ConversationId is required non-null
+            // here (unlike every other entity's own nullable ConversationId,
+            // which uses SetNull instead, since SetNull is structurally
+            // impossible against a non-nullable column). The only other two
+            // non-nullable ConversationId FKs in this codebase (Message,
+            // VerificationCode) both use Cascade — matched here per
+            // docs/handoffs/step-22w-approval-migration-design-independent-verification.md
+            // §7's independently-verified, correctly-scoped precedent.
+            ap.HasOne<Conversation>().WithMany()
+                .HasForeignKey(x => x.ConversationId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            ap.HasOne<Customer>().WithMany()
+                .HasForeignKey(x => x.CustomerId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            ap.HasOne<ApplicationUser>().WithMany()
+                .HasForeignKey(x => x.ApprovedBy)
+                .OnDelete(DeleteBehavior.SetNull);
+
+            ap.HasOne<ApplicationUser>().WithMany()
+                .HasForeignKey(x => x.DeniedBy)
+                .OnDelete(DeleteBehavior.SetNull);
+
+            ap.HasOne<OrderCancellation>().WithMany()
+                .HasForeignKey(x => x.OrderCancellationId)
                 .OnDelete(DeleteBehavior.Restrict);
         });
 
