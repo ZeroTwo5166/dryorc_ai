@@ -38,12 +38,11 @@ public record ToolDispatchOutcome(ToolDispatchStatus Status, string? ResponseTex
 /// and docs/handoffs/step-19-tool-dispatch-design-approved.md for the
 /// approved architecture.
 ///
-/// This is infrastructure only — no concrete write tool is registered
-/// anywhere in this codebase yet (see WriteToolBase's own doc comment).
-/// With zero IDispatchTool implementations registered, a conversation
-/// dispatched through this service behaves like an ordinary tool-free
-/// Claude call, mirroring the existing ClaudeReplyService path, which this
-/// service does not replace, modify, or get wired into.
+/// Wired live as of Step 23K — ClaudeReplyService calls RunAsync for every
+/// conversation with a resolved customer, offering GetCustomerTool (and, as
+/// of Step 48, OrderCancelProposalTool where the calling business has
+/// opted in) rather than the tool-free dormant state this comment
+/// originally described.
 /// </summary>
 public interface IToolDispatchService
 {
@@ -52,10 +51,20 @@ public interface IToolDispatchService
     /// <paramref name="messages"/> is mutated in place — every assistant
     /// turn and tool_result turn generated during dispatch is appended to
     /// it, so callers can inspect/persist the full transcript afterward.
+    ///
+    /// <paramref name="disabledToolNames"/> (Step 48): tool names excluded
+    /// from both the Tools definition sent to Claude and the dispatch
+    /// loop's own tool-resolution check — a disabled tool is treated
+    /// identically to an unregistered one, never offered and never
+    /// dispatchable, even if somehow named in a tool_use block anyway. A
+    /// mechanism-neutral set, not a per-tool configuration system — the
+    /// caller decides what belongs in it (e.g. ClaudeReplyService checking
+    /// Business.CancelOrderToolEnabled), this interface only enforces it.
     /// </summary>
     Task<ToolDispatchOutcome> RunAsync(
         ToolDispatchContext context,
         string systemPrompt,
         List<Anthropic.Models.Messages.MessageParam> messages,
+        IReadOnlySet<string> disabledToolNames,
         CancellationToken cancellationToken);
 }

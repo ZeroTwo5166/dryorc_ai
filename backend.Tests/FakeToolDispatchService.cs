@@ -18,14 +18,17 @@ public class FakeToolDispatchService : IToolDispatchService
     public ToolDispatchContext? LastContext { get; private set; }
     public string? LastSystemPrompt { get; private set; }
     public List<MessageParam>? LastMessages { get; private set; }
+    public IReadOnlySet<string>? LastDisabledToolNames { get; private set; }
 
     public Task<ToolDispatchOutcome> RunAsync(
-        ToolDispatchContext context, string systemPrompt, List<MessageParam> messages, CancellationToken cancellationToken)
+        ToolDispatchContext context, string systemPrompt, List<MessageParam> messages,
+        IReadOnlySet<string> disabledToolNames, CancellationToken cancellationToken)
     {
         CallCount++;
         LastContext = context;
         LastSystemPrompt = systemPrompt;
         LastMessages = messages;
+        LastDisabledToolNames = disabledToolNames;
         return Task.FromResult(OutcomeToReturn);
     }
 }

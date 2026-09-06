@@ -127,7 +127,7 @@ public class ToolDispatchServiceTests
         var service = new ToolDispatchService([], fakeMessages, NullLogger<ToolDispatchService>.Instance);
         var messages = new List<MessageParam>();
 
-        var outcome = await service.RunAsync(Context, "system prompt", messages, CancellationToken.None);
+        var outcome = await service.RunAsync(Context, "system prompt", messages, new HashSet<string>(), CancellationToken.None);
 
         Assert.Equal(ToolDispatchStatus.Completed, outcome.Status);
         Assert.Equal("Hello, how can I help?", outcome.ResponseText);
@@ -144,7 +144,7 @@ public class ToolDispatchServiceTests
         var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
         var messages = new List<MessageParam>();
 
-        var outcome = await service.RunAsync(Context, "system prompt", messages, CancellationToken.None);
+        var outcome = await service.RunAsync(Context, "system prompt", messages, new HashSet<string>(), CancellationToken.None);
 
         Assert.Equal(ToolDispatchStatus.Completed, outcome.Status);
         Assert.Equal("Your order has shipped!", outcome.ResponseText);
@@ -176,7 +176,7 @@ public class ToolDispatchServiceTests
         fakeMessages.Enqueue(TextResponse("Done!"));
         var service = new ToolDispatchService([writeTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
 
-        var outcome = await service.RunAsync(Context, "system prompt", new List<MessageParam>(), CancellationToken.None);
+        var outcome = await service.RunAsync(Context, "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
 
         Assert.Equal(ToolDispatchStatus.Completed, outcome.Status);
         Assert.Equal(1, writeTool.CallCount);
@@ -198,7 +198,7 @@ public class ToolDispatchServiceTests
         fakeMessages.Enqueue(TextResponse("All done."));
         var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
 
-        var outcome = await service.RunAsync(Context, "system prompt", new List<MessageParam>(), CancellationToken.None);
+        var outcome = await service.RunAsync(Context, "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
 
         Assert.Equal(ToolDispatchStatus.Completed, outcome.Status);
         Assert.Equal("All done.", outcome.ResponseText);
@@ -216,7 +216,7 @@ public class ToolDispatchServiceTests
         await cts.CancelAsync();
 
         await Assert.ThrowsAsync<OperationCanceledException>(() =>
-            service.RunAsync(Context, "system prompt", new List<MessageParam>(), cts.Token));
+            service.RunAsync(Context, "system prompt", new List<MessageParam>(), new HashSet<string>(), cts.Token));
 
         Assert.Equal(0, fakeMessages.CallCount);
     }
@@ -235,7 +235,7 @@ public class ToolDispatchServiceTests
         }
         var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
 
-        var outcome = await service.RunAsync(Context, "system prompt", new List<MessageParam>(), CancellationToken.None);
+        var outcome = await service.RunAsync(Context, "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
 
         Assert.Equal(ToolDispatchStatus.IterationLimitReached, outcome.Status);
         Assert.Null(outcome.ResponseText);
@@ -244,6 +244,55 @@ public class ToolDispatchServiceTests
         // decision (see the implementation report), so this only asserts
         // "bounded and small," not a specific number.
         Assert.True(fakeMessages.CallCount is > 0 and < 50);
+    }
+
+    // ── Step 48: disabledToolNames gating ──
+    //
+    // Business.CancelOrderToolEnabled itself is checked one layer up
+    // (ClaudeReplyService, see ClaudeReplyServiceTests); these two tests
+    // cover what ToolDispatchService.RunAsync must do with the
+    // disabledToolNames set once it has one, independent of where it came
+    // from.
+
+    [Fact]
+    public async Task RunAsync_DisabledTool_ExcludedFromToolsArraySentToClaude()
+    {
+        var readTool = new RecordingReadOnlyTool();
+        var fakeMessages = new SequencedFakeMessageService();
+        fakeMessages.Enqueue(TextResponse("Hi there."));
+        var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+
+        await service.RunAsync(
+            Context, "system prompt", new List<MessageParam>(), new HashSet<string> { readTool.Name }, CancellationToken.None);
+
+        Assert.Equal(1, fakeMessages.CallCount);
+        var toolsSent = fakeMessages.Requests[0].Tools;
+        Assert.NotNull(toolsSent);
+        Assert.Empty(toolsSent!);
+    }
+
+    [Fact]
+    public async Task RunAsync_DisabledTool_IfModelRequestsItAnyway_ReturnsErrorToolResult_NeverExecutes()
+    {
+        var readTool = new RecordingReadOnlyTool();
+        var fakeMessages = new SequencedFakeMessageService();
+        // The model is never actually offered this tool (proven by the test
+        // above); this proves the dispatch loop also fails closed in the
+        // structurally-shouldn't-happen case where a tool_use block names a
+        // disabled tool anyway — defense in depth, not the primary gate.
+        fakeMessages.Enqueue(ToolUseResponse(readTool.Name, Args(new { orderId = "1" }), "toolu_disabled"));
+        fakeMessages.Enqueue(TextResponse("Handled."));
+        var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+        var messages = new List<MessageParam>();
+
+        var outcome = await service.RunAsync(
+            Context, "system prompt", messages, new HashSet<string> { readTool.Name }, CancellationToken.None);
+
+        Assert.Equal(ToolDispatchStatus.Completed, outcome.Status);
+        Assert.Equal(0, readTool.CallCount);
+        Assert.True(messages[1].Content.TryPickContentBlockParams(out var blocks));
+        Assert.True(blocks![0].TryPickToolResult(out var toolResult));
+        Assert.True(toolResult!.IsError);
     }
 
     [Fact]
@@ -255,7 +304,7 @@ public class ToolDispatchServiceTests
         var service = new ToolDispatchService([], fakeMessages, NullLogger<ToolDispatchService>.Instance);
         var messages = new List<MessageParam>();
 
-        var outcome = await service.RunAsync(Context, "system prompt", messages, CancellationToken.None);
+        var outcome = await service.RunAsync(Context, "system prompt", messages, new HashSet<string>(), CancellationToken.None);
 
         Assert.Equal(ToolDispatchStatus.Completed, outcome.Status);
         Assert.Equal(2, fakeMessages.CallCount);
@@ -274,7 +323,7 @@ public class ToolDispatchServiceTests
         var service = new ToolDispatchService([throwingTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
         var messages = new List<MessageParam>();
 
-        var outcome = await service.RunAsync(Context, "system prompt", messages, CancellationToken.None);
+        var outcome = await service.RunAsync(Context, "system prompt", messages, new HashSet<string>(), CancellationToken.None);
 
         Assert.Equal(ToolDispatchStatus.Completed, outcome.Status);
         Assert.True(messages[1].Content.TryPickContentBlockParams(out var blocks));
@@ -291,7 +340,7 @@ public class ToolDispatchServiceTests
         var fakeMessages = new SequencedFakeMessageService { ExceptionToThrow = exception };
         var service = new ToolDispatchService([], fakeMessages, NullLogger<ToolDispatchService>.Instance);
 
-        var outcome = await service.RunAsync(Context, "system prompt", new List<MessageParam>(), CancellationToken.None);
+        var outcome = await service.RunAsync(Context, "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
 
         Assert.Equal(ToolDispatchStatus.ClaudeCallFailed, outcome.Status);
         Assert.Null(outcome.ResponseText);

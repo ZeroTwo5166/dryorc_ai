@@ -564,7 +564,8 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
     // call — gated behind [LiveClaudeFact], same as the test above.
 
     private async Task<(Business Business, Conversation Conversation)> SeedConversationWithResolvedCustomerAsync(
-        AppDbContext db, string customerName, string customerEmail, string customerMessage)
+        AppDbContext db, string customerName, string customerEmail, string customerMessage,
+        bool cancelOrderToolEnabled = false)
     {
         var business = new Business
         {
@@ -573,6 +574,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             TimeZone = "Europe/Copenhagen",
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow,
+            CancelOrderToolEnabled = cancelOrderToolEnabled,
         };
         var widget = new Widget
         {
@@ -691,6 +693,53 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         Assert.Single(toolsSent!);
         var sentTool = (Anthropic.Models.Messages.Tool)toolsSent![0].Value!;
         Assert.Equal("getCustomer", sentTool.Name);
+    }
+
+    // ── Step 48: per-business cancelOrder kill switch ──
+    //
+    // Business.CancelOrderToolEnabled is checked here, in
+    // GenerateReplyAsync, before ToolDispatchService.RunAsync is ever
+    // called — not inside ToolDispatchService itself, which deliberately
+    // stays free of a database dependency. These two tests assert the
+    // disabledToolNames set FakeToolDispatchService actually received,
+    // proving the gate is computed correctly in both directions.
+
+    [Fact]
+    public async Task GenerateReplyAsync_CancelOrderToolDisabled_PassesDisabledToolNameToDispatch()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithResolvedCustomerAsync(
+            db, "Test Customer", "test.customer@marker-test.invalid", "Can you cancel my order?",
+            cancelOrderToolEnabled: false);
+
+        var fakeDispatch = new FakeToolDispatchService();
+        var service = new ClaudeReplyService(
+            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, NullLogger<ClaudeReplyService>.Instance);
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.NotNull(fakeDispatch.LastDisabledToolNames);
+        Assert.Contains(OrderCancelProposalTool.ToolName, fakeDispatch.LastDisabledToolNames!);
+    }
+
+    [Fact]
+    public async Task GenerateReplyAsync_CancelOrderToolEnabled_DoesNotDisableIt()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithResolvedCustomerAsync(
+            db, "Test Customer", "test.customer@marker-test.invalid", "Can you cancel my order?",
+            cancelOrderToolEnabled: true);
+
+        var fakeDispatch = new FakeToolDispatchService();
+        var service = new ClaudeReplyService(
+            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, NullLogger<ClaudeReplyService>.Instance);
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.NotNull(fakeDispatch.LastDisabledToolNames);
+        Assert.DoesNotContain(OrderCancelProposalTool.ToolName, fakeDispatch.LastDisabledToolNames!);
     }
 
     [LiveClaudeFact]

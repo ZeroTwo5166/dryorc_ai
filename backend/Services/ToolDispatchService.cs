@@ -35,6 +35,7 @@ public class ToolDispatchService(
         ToolDispatchContext context,
         string systemPrompt,
         List<MessageParam> messages,
+        IReadOnlySet<string> disabledToolNames,
         CancellationToken cancellationToken)
     {
         for (var iteration = 0; iteration < MaxToolIterations; iteration++)
@@ -50,7 +51,11 @@ public class ToolDispatchService(
                     MaxTokens = MaxReplyTokens,
                     System = systemPrompt,
                     Messages = messages,
+                    // Step 48: a disabled tool is never included here — the
+                    // model is never told it exists, not "offered but
+                    // rejected later."
                     Tools = _toolsByName.Values
+                        .Where(t => !disabledToolNames.Contains(t.Name))
                         .Select(t => (ToolUnion)new Tool
                         {
                             Name = t.Name,
@@ -118,7 +123,7 @@ public class ToolDispatchService(
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                var result = await ExecuteToolAsync(context, response.ID, toolUse, cancellationToken);
+                var result = await ExecuteToolAsync(context, response.ID, toolUse, disabledToolNames, cancellationToken);
                 resultBlocks.Add(new ContentBlockParam(
                     new ToolResultBlockParam(toolUse.ID)
                     {
@@ -138,9 +143,17 @@ public class ToolDispatchService(
     }
 
     private async Task<ToolExecutionResult> ExecuteToolAsync(
-        ToolDispatchContext context, string assistantMessageId, ToolUseBlock toolUse, CancellationToken cancellationToken)
+        ToolDispatchContext context, string assistantMessageId, ToolUseBlock toolUse,
+        IReadOnlySet<string> disabledToolNames, CancellationToken cancellationToken)
     {
-        if (!_toolsByName.TryGetValue(toolUse.Name, out var tool))
+        // Step 48: a disabled tool is treated identically to an
+        // unregistered one — defense in depth alongside the Tools-array
+        // filtering above, since offering and dispatching are two separate
+        // code paths that could in principle diverge. Should be
+        // unreachable in practice (Claude cannot name a tool it was never
+        // offered), but this must fail closed, not silently execute, if it
+        // ever is.
+        if (!_toolsByName.TryGetValue(toolUse.Name, out var tool) || disabledToolNames.Contains(toolUse.Name))
         {
             logger.LogWarning("Unknown tool {ToolName} requested by the model; returning an error tool_result.", toolUse.Name);
             return ToolExecutionResult.Error("Unknown tool.");

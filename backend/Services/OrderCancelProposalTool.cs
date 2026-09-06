@@ -34,7 +34,14 @@ public class OrderCancelProposalTool(AppDbContext db) : IActionProposalTool
 {
     private static readonly TimeSpan ApprovalTtl = TimeSpan.FromMinutes(15); // Decision 1, ADOPTED
 
-    public string Name => "cancelOrder";
+    /// <summary>
+    /// Step 48 — a stable, non-stringly-typed reference to this tool's own
+    /// name, for ClaudeReplyService's per-business gate (Business.CancelOrderToolEnabled)
+    /// to name without duplicating the literal "cancelOrder" in a second file.
+    /// </summary>
+    public const string ToolName = "cancelOrder";
+
+    public string Name => ToolName;
 
     public string Description =>
         "Propose cancelling a customer's Shopify order. This does not cancel the order immediately — " +

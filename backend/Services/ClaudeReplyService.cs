@@ -190,8 +190,22 @@ public class ClaudeReplyService(
             var toolAwareSystemPrompt = BuildSystemPrompt(business.Name, retrievedChunks) +
                 "\n\nYou have a getCustomer tool that looks up the customer's name and email on file. " +
                 "Use it whenever the customer asks about their own account/profile details.";
+
+            // Step 48: a narrow, single-tool kill switch — Business.CancelOrderToolEnabled
+            // is checked here (the Business row is already loaded above, no
+            // extra query) rather than inside ToolDispatchService, which
+            // deliberately stays free of a database dependency for its own
+            // pure-unit-test suite. Default false — an opted-out business's
+            // AI is never told this tool exists at all, not offered and
+            // then refused. Explicitly not Decision 8's deferred
+            // per-write-tool automation-tier system — see
+            // docs/handoffs/step-48-cancelorder-tool-registration-production-safety-scoping.md.
+            var disabledToolNames = business.CancelOrderToolEnabled
+                ? (IReadOnlySet<string>)new HashSet<string>()
+                : new HashSet<string> { OrderCancelProposalTool.ToolName };
+
             var outcome = await toolDispatchService.RunAsync(
-                dispatchContext, toolAwareSystemPrompt, messages, cancellationToken);
+                dispatchContext, toolAwareSystemPrompt, messages, disabledToolNames, cancellationToken);
 
             // ToolDispatchService.RunAsync already internally catches the
             // same Anthropic exception types the inline path below handles,
