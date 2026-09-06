@@ -147,15 +147,30 @@ public abstract record ExecutionOutcome
 /// never reachable from ToolDispatchService's AI-facing tool collection.
 ///
 /// ExecuteApprovedActionAsync(Guid approvalId, ...) deliberately accepts no
-/// other parameter — BusinessId/CustomerId/ToolName/ResourceId/
+/// other business-data parameter — BusinessId/CustomerId/ToolName/ResourceId/
 /// CanonicalArguments/ConversationId/ActionHash must all be loaded from the
 /// Approval row keyed by approvalId, never accepted as caller-supplied
 /// values: accepting any of these from the client would create two
 /// disagreeing sources of truth and defeat the hash-comparison mechanism
 /// for whichever field was trusted from the caller.
+///
+/// executingStaffUserId (added per docs/handoffs/step-45-staff-actor-identity-threading-design.md,
+/// owner decision confirmed in that document's addendum) is categorically
+/// different from the fields above: it is never compared against anything
+/// stored on Approval (there is no ExecutedBy column, and none is added by
+/// that design), it is not one of ActionHasher.Derive's six hash inputs, and
+/// its only use is as an opaque value recorded on the AuditLog rows steps
+/// 6-13 write (Actor=NivoraBusinessStaff, ChangedByUserId=executingStaffUserId).
+/// Non-nullable: every current and anticipated caller is an authenticated
+/// staff HTTP request behind NivoraPolicies.OwnerOrAdmin + SameTenant
+/// (verified upstream of this interface, never inside it — step-45 §4/§7);
+/// the caller resolves it the same way every existing controller resolves
+/// CurrentUserId (User.FindFirstValue(ClaimTypes.NameIdentifier)), not via
+/// an injected accessor — step-45 §3 for why this deliberately does not
+/// mirror ICurrentTenantAccessor's shape.
 /// </summary>
 public interface IApprovedActionExecutor
 {
     Task<ExecutionOutcome> ExecuteApprovedActionAsync(
-        Guid approvalId, CancellationToken cancellationToken);
+        Guid approvalId, Guid executingStaffUserId, CancellationToken cancellationToken);
 }

@@ -87,7 +87,7 @@ public class OrderCancelApprovedActionExecutor(
     IOrderCancellationService orderCancellationService) : IApprovedActionExecutor
 {
     public async Task<ExecutionOutcome> ExecuteApprovedActionAsync(
-        Guid approvalId, CancellationToken cancellationToken)
+        Guid approvalId, Guid executingStaffUserId, CancellationToken cancellationToken)
     {
         var approval = await db.Approvals
             .FirstOrDefaultAsync(a => a.Id == approvalId, cancellationToken);
@@ -110,7 +110,7 @@ public class OrderCancelApprovedActionExecutor(
         // (step-38 §2a/§6).
         if (approval.Status != ApprovalStatus.Approved)
         {
-            await WriteUnauthorizedExecutionBlockedAsync(approval, approval.Status.ToString(), cancellationToken);
+            await WriteUnauthorizedExecutionBlockedAsync(approval, approval.Status.ToString(), executingStaffUserId, cancellationToken);
 
             return new ExecutionOutcome.Refused(
                 ExecutionRefusalReason.ApprovalNotApproved,
@@ -122,7 +122,7 @@ public class OrderCancelApprovedActionExecutor(
         var now = DateTimeOffset.UtcNow;
         if (approval.ExpiresAt <= now)
         {
-            await WriteUnauthorizedExecutionBlockedAsync(approval, "Expired", cancellationToken);
+            await WriteUnauthorizedExecutionBlockedAsync(approval, "Expired", executingStaffUserId, cancellationToken);
 
             return new ExecutionOutcome.Refused(
                 ExecutionRefusalReason.ApprovalExpired, "Approval has expired.");
@@ -172,7 +172,7 @@ public class OrderCancelApprovedActionExecutor(
             approval.BusinessId, approval.ConversationId, cancellationToken);
         if (!level2Verified)
         {
-            await WriteUnauthorizedExecutionBlockedAsync(approval, "Level2VerificationFailed", cancellationToken);
+            await WriteUnauthorizedExecutionBlockedAsync(approval, "Level2VerificationFailed", executingStaffUserId, cancellationToken);
 
             return new ExecutionOutcome.Refused(
                 ExecutionRefusalReason.Level2VerificationFailed,
@@ -200,7 +200,7 @@ public class OrderCancelApprovedActionExecutor(
         if (!ownershipResult.IsAuthorized)
         {
             await WriteUnauthorizedExecutionBlockedAsync(
-                approval, $"OwnershipVerificationFailed:{ownershipResult.Reason}", cancellationToken);
+                approval, $"OwnershipVerificationFailed:{ownershipResult.Reason}", executingStaffUserId, cancellationToken);
 
             return new ExecutionOutcome.Refused(
                 ExecutionRefusalReason.OwnershipVerificationFailed,
@@ -222,7 +222,7 @@ public class OrderCancelApprovedActionExecutor(
             approval.ToolName, approval.ResourceId, approval.CanonicalArguments);
         if (recomputedActionHash != approval.ActionHash)
         {
-            await WriteUnauthorizedExecutionBlockedAsync(approval, "ActionHashMismatch", cancellationToken);
+            await WriteUnauthorizedExecutionBlockedAsync(approval, "ActionHashMismatch", executingStaffUserId, cancellationToken);
 
             return new ExecutionOutcome.Refused(
                 ExecutionRefusalReason.ActionHashMismatch,
@@ -299,8 +299,8 @@ public class OrderCancelApprovedActionExecutor(
             // refused attempt.
             await auditLogService.LogAsync(
                 approval.BusinessId, AuditEntityTypes.Approval, approval.Id.ToString(),
-                AuditEventTypes.ExecutionClaimed, ActorType.NivoraSystem,
-                changedByUserId: null, cancellationToken: cancellationToken);
+                AuditEventTypes.ExecutionClaimed, ActorType.NivoraBusinessStaff,
+                changedByUserId: executingStaffUserId, cancellationToken: cancellationToken);
 
             // Parsed once at proposal time (Step 23N); Execute re-derives
             // only what OrderCancelProposalTool.ParseInput originally
@@ -355,36 +355,36 @@ public class OrderCancelApprovedActionExecutor(
     }
 
     /// <summary>
-    /// Steps 6/7's shared AuditLog write — reuses the existing
+    /// Steps 6/7/9/10/11's shared AuditLog write — reuses the existing
     /// AuditEventTypes.UnauthorizedActionBlocked constant per step-22z §18's
     /// explicit instruction, not a new one. LogAsync does not call
     /// SaveChangesAsync itself, so this method does, immediately — these
     /// checks have no open transaction to share it with.
     ///
-    /// ActorType.NivoraSystem / ChangedByUserId=null is a deliberate
-    /// placeholder, not an oversight: IApprovedActionExecutor's locked
-    /// signature (approvalId, CancellationToken only) carries no caller-
-    /// identity parameter, so the specific staff member who triggered this
-    /// refusal cannot be recorded here. Threading a staff actor into
-    /// Execute's signature is an explicitly deferred design question
-    /// (step-38 §6/§9) — NivoraSystem is used because this determination is
-    /// made by Nivora's own backend logic, not a captured human/AI/customer
-    /// identity, matching this codebase's existing precedent for exactly
-    /// that shape of event (WidgetConversationService.cs's own
-    /// ActorType.NivoraSystem usage for a backend-determined outcome with no
-    /// captured actor, not merely a scheduled job).
+    /// ActorType.NivoraBusinessStaff / ChangedByUserId=executingStaffUserId,
+    /// per docs/handoffs/step-45-staff-actor-identity-threading-design.md
+    /// (owner decision confirmed in that document's addendum) — corrected
+    /// from the prior ActorType.NivoraSystem/null placeholder. ActorType
+    /// records the origin of the request, not who evaluated the refusal
+    /// condition (Nivora's own backend logic evaluates every write this
+    /// codebase makes); the origin of every refusal this method records is,
+    /// today and for every anticipated caller, the executing staff member's
+    /// own authenticated HTTP request — never a scheduled job. See step-45
+    /// §5 for why the prior WidgetConversationService.cs analogy does not
+    /// hold (that call site has no staff request to attribute to at all;
+    /// this one always does).
     ///
     /// ConversationId is deliberately left unset: AuditLog.ConversationId's
     /// own doc comment reserves that column for Actor == Ai specifically —
     /// not populated here, consistent with that stated contract.
     /// </summary>
     private async Task WriteUnauthorizedExecutionBlockedAsync(
-        Approval approval, string newValue, CancellationToken cancellationToken)
+        Approval approval, string newValue, Guid executingStaffUserId, CancellationToken cancellationToken)
     {
         await auditLogService.LogAsync(
             approval.BusinessId, AuditEntityTypes.Approval, approval.Id.ToString(),
-            AuditEventTypes.UnauthorizedActionBlocked, ActorType.NivoraSystem,
-            changedByUserId: null, newValue: newValue, cancellationToken: cancellationToken);
+            AuditEventTypes.UnauthorizedActionBlocked, ActorType.NivoraBusinessStaff,
+            changedByUserId: executingStaffUserId, newValue: newValue, cancellationToken: cancellationToken);
         await db.SaveChangesAsync(cancellationToken);
     }
 }

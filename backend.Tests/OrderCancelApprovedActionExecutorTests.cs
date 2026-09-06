@@ -66,6 +66,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
 
     private ServiceProvider _provider = null!;
     private readonly List<Guid> _businessIdsToClean = [];
+    private readonly List<Guid> _userIdsToClean = [];
 
     public Task InitializeAsync()
     {
@@ -112,7 +113,19 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
             // OrderCancellation row, so this ordering requirement was
             // never previously exercised). Integrations/Customers/Widgets
             // before Businesses.
+            // AspNetUsers next — AuditLog.ChangedByUserId now has a real FK
+            // to AspNetUsers (FK_AuditLogs_AspNetUsers_ChangedByUserId),
+            // discovered by this session's identity-threading fix (previously
+            // never exercised, since ChangedByUserId was always null before
+            // step-45). Must run after the AuditLogs delete above and before
+            // Businesses below, same ordering convention as
+            // NotificationDataTests.cs's own DisposeAsync.
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AuditLogs\" WHERE \"BusinessId\" = ANY({ids})");
+            if (_userIdsToClean.Count > 0)
+            {
+                var userIds = _userIdsToClean.ToArray();
+                await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AspNetUsers\" WHERE \"Id\" = ANY({userIds})");
+            }
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"OrderCancellations\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Integrations\" WHERE \"BusinessId\" = ANY({ids})");
@@ -233,6 +246,34 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Seeds a real ApplicationUser row to stand in for "the executing
+    /// staff member" — required because AuditLog.ChangedByUserId carries a
+    /// real FK to AspNetUsers (FK_AuditLogs_AspNetUsers_ChangedByUserId);
+    /// an arbitrary Guid.NewGuid() with no backing row fails that
+    /// constraint the moment a write actually reaches AuditLogs. Same
+    /// minimal shape as NotificationDataTests.CreateStaffUserAsync — a
+    /// direct db.Users.Add, not the full UserManager.CreateAsync path,
+    /// since no password/role/email-confirmation behavior is under test
+    /// here, only the FK's existence.
+    /// </summary>
+    private async Task<Guid> CreateStaffUserAsync(AppDbContext db, Guid businessId)
+    {
+        var user = new ApplicationUser
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            UserName = $"staff-{Guid.NewGuid():N}@marker-test.invalid",
+            Email = $"staff-{Guid.NewGuid():N}@marker-test.invalid",
+            EmailConfirmed = true,
+            CreatedAt = DateTimeOffset.UtcNow,
+        };
+        db.Users.Add(user);
+        await db.SaveChangesAsync();
+        _userIdsToClean.Add(user.Id);
+        return user.Id;
+    }
+
+    /// <summary>
     /// Seeds an active Shopify Integration for the business — required
     /// before IShopifyOrderLookupService.LookupOrderOwnerAsync can succeed
     /// (it throws InvalidOperationException otherwise). Same shape as
@@ -348,7 +389,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var executor = new OrderCancelApprovedActionExecutor(
             readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
 
-        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, Guid.NewGuid(), CancellationToken.None);
 
         var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
         Assert.Equal(ExecutionRefusalReason.ApprovalNotFound, refused.Reason);
@@ -375,7 +416,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var executor = new OrderCancelApprovedActionExecutor(
             readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
 
-        var outcome = await executor.ExecuteApprovedActionAsync(Guid.NewGuid(), CancellationToken.None);
+        var outcome = await executor.ExecuteApprovedActionAsync(Guid.NewGuid(), Guid.NewGuid(), CancellationToken.None);
 
         var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
         Assert.Equal(ExecutionRefusalReason.ApprovalNotFound, refused.Reason);
@@ -384,9 +425,9 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
     /// <summary>
     /// Step 6 — every non-Approved status must refuse with
     /// ApprovalNotApproved and write exactly one durable AuditLog row
-    /// (AuditEventTypes.UnauthorizedActionBlocked, ActorType.NivoraSystem,
-    /// ChangedByUserId null, NewValue == the actual status) before
-    /// returning. Covers all three non-Approved ApprovalStatus members —
+    /// (AuditEventTypes.UnauthorizedActionBlocked, ActorType.NivoraBusinessStaff,
+    /// ChangedByUserId == the executing staff member, NewValue == the actual
+    /// status) before returning. Covers all three non-Approved ApprovalStatus members —
     /// not just one — since step-38 §6's write applies uniformly to "Status
     /// != Approved", not to one specific wrong status.
     /// </summary>
@@ -402,6 +443,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         await using var seedScope = _provider.CreateAsyncScope();
         var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var (business, approval, _) = await SeedApprovalAsync(seedDb, status: status);
+        var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
 
         tenant.CurrentBusinessId = business.Id;
         await using var readScope = _provider.CreateAsyncScope();
@@ -413,8 +455,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
         var executor = new OrderCancelApprovedActionExecutor(
             readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
-
-        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
 
         var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
         Assert.Equal(ExecutionRefusalReason.ApprovalNotApproved, refused.Reason);
@@ -422,8 +463,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
         var entry = Assert.Single(auditLogs);
         Assert.Equal(AuditEventTypes.UnauthorizedActionBlocked, entry.EventType);
-        Assert.Equal(ActorType.NivoraSystem, entry.Actor);
-        Assert.Null(entry.ChangedByUserId);
+        Assert.Equal(ActorType.NivoraBusinessStaff, entry.Actor);
+        Assert.Equal(executingStaffUserId, entry.ChangedByUserId);
         Assert.Equal(status.ToString(), entry.NewValue);
     }
 
@@ -444,6 +485,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var (business, approval, _) = await SeedApprovalAsync(
             seedDb, expiresAt: DateTimeOffset.UtcNow.AddMinutes(-1));
+        var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
 
         tenant.CurrentBusinessId = business.Id;
         await using var readScope = _provider.CreateAsyncScope();
@@ -455,8 +497,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
         var executor = new OrderCancelApprovedActionExecutor(
             readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
-
-        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
 
         var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
         Assert.Equal(ExecutionRefusalReason.ApprovalExpired, refused.Reason);
@@ -464,8 +505,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
         var entry = Assert.Single(auditLogs);
         Assert.Equal(AuditEventTypes.UnauthorizedActionBlocked, entry.EventType);
-        Assert.Equal(ActorType.NivoraSystem, entry.Actor);
-        Assert.Null(entry.ChangedByUserId);
+        Assert.Equal(ActorType.NivoraBusinessStaff, entry.Actor);
+        Assert.Equal(executingStaffUserId, entry.ChangedByUserId);
         Assert.Equal("Expired", entry.NewValue);
     }
 
@@ -496,7 +537,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var executor = new OrderCancelApprovedActionExecutor(
             readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
 
-        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, Guid.NewGuid(), CancellationToken.None);
 
         var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
         Assert.Equal(ExecutionRefusalReason.CustomerUnresolved, refused.Reason);
@@ -526,6 +567,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         await using var seedScope = _provider.CreateAsyncScope();
         var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var (business, approval, _) = await SeedApprovalAsync(seedDb, level2Verified: false);
+        var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
 
         tenant.CurrentBusinessId = business.Id;
         await using var readScope = _provider.CreateAsyncScope();
@@ -537,8 +579,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
         var executor = new OrderCancelApprovedActionExecutor(
             readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
-
-        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
 
         var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
         Assert.Equal(ExecutionRefusalReason.Level2VerificationFailed, refused.Reason);
@@ -546,8 +587,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
         var entry = Assert.Single(auditLogs);
         Assert.Equal(AuditEventTypes.UnauthorizedActionBlocked, entry.EventType);
-        Assert.Equal(ActorType.NivoraSystem, entry.Actor);
-        Assert.Null(entry.ChangedByUserId);
+        Assert.Equal(ActorType.NivoraBusinessStaff, entry.Actor);
+        Assert.Equal(executingStaffUserId, entry.ChangedByUserId);
         Assert.Equal("Level2VerificationFailed", entry.NewValue);
     }
 
@@ -590,7 +631,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var executor = new OrderCancelApprovedActionExecutor(
             readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
 
-        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
+        var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
 
         var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
         Assert.Equal(ExecutionRefusalReason.OwnershipVerificationFailed, refused.Reason);
@@ -598,8 +640,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
         var entry = Assert.Single(auditLogs);
         Assert.Equal(AuditEventTypes.UnauthorizedActionBlocked, entry.EventType);
-        Assert.Equal(ActorType.NivoraSystem, entry.Actor);
-        Assert.Null(entry.ChangedByUserId);
+        Assert.Equal(ActorType.NivoraBusinessStaff, entry.Actor);
+        Assert.Equal(executingStaffUserId, entry.ChangedByUserId);
         Assert.Equal("OwnershipVerificationFailed:OwnerMismatch", entry.NewValue);
 
         // No mutation, no consumption: the Approval is untouched by a step
@@ -635,6 +677,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var tokenProtector = seedScope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
         var (business, approval, _) = await SeedApprovalAsync(seedDb, customerExternalId: customerExternalId);
         await AddIntegrationAsync(seedDb, tokenProtector, business.Id);
+        var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
 
         tenant.CurrentBusinessId = business.Id;
         await using var readScope = _provider.CreateAsyncScope();
@@ -650,13 +693,13 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
             readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
 
         await Assert.ThrowsAsync<NotImplementedException>(
-            () => executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None));
+            () => executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None));
 
         var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
         var entry = Assert.Single(auditLogs);
         Assert.Equal(AuditEventTypes.ExecutionClaimed, entry.EventType);
-        Assert.Equal(ActorType.NivoraSystem, entry.Actor);
-        Assert.Null(entry.ChangedByUserId);
+        Assert.Equal(ActorType.NivoraBusinessStaff, entry.Actor);
+        Assert.Equal(executingStaffUserId, entry.ChangedByUserId);
         Assert.Equal(ApprovalStatus.Consumed, await ReadApprovalStatusAsync(approval.Id));
     }
 
@@ -703,7 +746,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var executor = new OrderCancelApprovedActionExecutor(
             readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
 
-        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
+        var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
 
         var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
         Assert.Equal(ExecutionRefusalReason.ActionHashMismatch, refused.Reason);
@@ -711,8 +755,8 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
         var entry = Assert.Single(auditLogs);
         Assert.Equal(AuditEventTypes.UnauthorizedActionBlocked, entry.EventType);
-        Assert.Equal(ActorType.NivoraSystem, entry.Actor);
-        Assert.Null(entry.ChangedByUserId);
+        Assert.Equal(ActorType.NivoraBusinessStaff, entry.Actor);
+        Assert.Equal(executingStaffUserId, entry.ChangedByUserId);
         Assert.Equal("ActionHashMismatch", entry.NewValue);
 
         Assert.Equal(ApprovalStatus.Approved, await ReadApprovalStatusAsync(approval.Id));
@@ -745,6 +789,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var tokenProtector = seedScope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
         var (business, approval, _) = await SeedApprovalAsync(seedDb, customerExternalId: customerExternalId);
         await AddIntegrationAsync(seedDb, tokenProtector, business.Id);
+        var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
 
         tenant.CurrentBusinessId = business.Id;
         await using var readScope = _provider.CreateAsyncScope();
@@ -760,13 +805,13 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
             readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
 
         await Assert.ThrowsAsync<NotImplementedException>(
-            () => executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None));
+            () => executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None));
 
         var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
         var entry = Assert.Single(auditLogs);
         Assert.Equal(AuditEventTypes.ExecutionClaimed, entry.EventType);
-        Assert.Equal(ActorType.NivoraSystem, entry.Actor);
-        Assert.Null(entry.ChangedByUserId);
+        Assert.Equal(ActorType.NivoraBusinessStaff, entry.Actor);
+        Assert.Equal(executingStaffUserId, entry.ChangedByUserId);
         Assert.Equal(ApprovalStatus.Consumed, await ReadApprovalStatusAsync(approval.Id));
     }
 
@@ -826,16 +871,17 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var executor = new OrderCancelApprovedActionExecutor(
             readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
 
+        var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
         await Assert.ThrowsAsync<NotImplementedException>(
-            () => executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None));
+            () => executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None));
 
         Assert.Equal(1, callCount);
 
         var auditLogs = await ReadAuditLogsAsync(business.Id, approval.Id);
         var entry = Assert.Single(auditLogs);
         Assert.Equal(AuditEventTypes.ExecutionClaimed, entry.EventType);
-        Assert.Equal(ActorType.NivoraSystem, entry.Actor);
-        Assert.Null(entry.ChangedByUserId);
+        Assert.Equal(ActorType.NivoraBusinessStaff, entry.Actor);
+        Assert.Equal(executingStaffUserId, entry.ChangedByUserId);
 
         await using var verifyScope = _provider.CreateAsyncScope();
         var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -908,7 +954,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var executor = new OrderCancelApprovedActionExecutor(
             readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
 
-        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, Guid.NewGuid(), CancellationToken.None);
 
         var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
         Assert.Equal(ExecutionRefusalReason.ApprovalClaimLost, refused.Reason);
@@ -978,7 +1024,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var executor = new OrderCancelApprovedActionExecutor(
             readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
 
-        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, CancellationToken.None);
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, Guid.NewGuid(), CancellationToken.None);
 
         var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
         Assert.Equal(ExecutionRefusalReason.ApprovalClaimLost, refused.Reason);
@@ -1092,6 +1138,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         seedDb.Conversations.Add(secondConversation);
         seedDb.Approvals.Add(secondApproval);
         await seedDb.SaveChangesAsync();
+        var firstExecutingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
 
         tenant.CurrentBusinessId = business.Id;
 
@@ -1112,7 +1159,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
                 firstOwnershipService, firstOrderCancellationService);
 
             await Assert.ThrowsAsync<NotImplementedException>(
-                () => firstExecutor.ExecuteApprovedActionAsync(firstApproval.Id, CancellationToken.None));
+                () => firstExecutor.ExecuteApprovedActionAsync(firstApproval.Id, firstExecutingStaffUserId, CancellationToken.None));
         }
 
         // Second Execute call, same order, first attempt still Pending —
@@ -1129,7 +1176,16 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
         var executor = new OrderCancelApprovedActionExecutor(
             readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService);
 
-        var outcome = await executor.ExecuteApprovedActionAsync(secondApproval.Id, CancellationToken.None);
+        // Even though this attempt is ultimately refused and rolled back
+        // (DuplicatePendingCancellation), it still reaches step 13's atomic
+        // claim and adds an ExecutionClaimed AuditLog row to the same
+        // tracked-context batch RequestCancellationAsync flushes — that row
+        // needs a real ChangedByUserId to satisfy
+        // FK_AuditLogs_AspNetUsers_ChangedByUserId, or the batch fails on
+        // the FK before ever reaching the duplicate-key check this test
+        // means to exercise.
+        var secondExecutingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
+        var outcome = await executor.ExecuteApprovedActionAsync(secondApproval.Id, secondExecutingStaffUserId, CancellationToken.None);
 
         var refused = Assert.IsType<ExecutionOutcome.Refused>(outcome);
         Assert.Equal(ExecutionRefusalReason.DuplicatePendingCancellation, refused.Reason);
