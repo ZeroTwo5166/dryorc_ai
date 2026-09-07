@@ -42,12 +42,33 @@ public static class PostgresConnectionString
 
             if (key.Equals("sslmode", StringComparison.OrdinalIgnoreCase))
             {
-                builder.SslMode = Enum.Parse<SslMode>(value, ignoreCase: true);
+                builder.SslMode = ParseDefinedSslMode(value);
             }
             // channel_binding (Neon-specific) has no Npgsql keyword equivalent —
             // Neon's pooler enforces it server-side regardless of client config.
         }
 
         return builder.ConnectionString;
+    }
+
+    /// <summary>
+    /// Same Enum.TryParse-plus-Enum.IsDefined discipline established in
+    /// ToolArgumentCanonicalizer.DecodeOrderCancellationArgs (Step 31) and
+    /// OrderCancelProposalTool.ParseRequiredEnum (Step 33), applied here.
+    /// Enum.Parse alone (the prior code) already throws for a non-numeric,
+    /// unrecognized string, but — like Enum.TryParse — silently accepts any
+    /// numeric string, including one with no corresponding SslMode member at
+    /// all (e.g. "99"), converting it directly to an undefined enum value
+    /// rather than failing. ignoreCase: true is preserved exactly to avoid
+    /// changing behavior for any currently-valid sslmode value.
+    /// </summary>
+    private static SslMode ParseDefinedSslMode(string value)
+    {
+        if (!Enum.TryParse<SslMode>(value, ignoreCase: true, out var sslMode) || !Enum.IsDefined(sslMode))
+        {
+            throw new FormatException($"Invalid sslmode value '{value}' in connection string URI.");
+        }
+
+        return sslMode;
     }
 }

@@ -68,7 +68,7 @@ public class KnowledgeDocumentsController(
     [Authorize(Policy = NivoraPolicies.OwnerOrAdmin)]
     public async Task<IActionResult> Create([FromBody] CreateKnowledgeDocumentRequest request)
     {
-        if (!Enum.TryParse<KnowledgeDocumentType>(request.Type, out var type))
+        if (!Enum.TryParse<KnowledgeDocumentType>(request.Type, out var type) || !Enum.IsDefined(type))
         {
             return BadRequest($"Invalid Type '{request.Type}'.");
         }
@@ -101,7 +101,7 @@ public class KnowledgeDocumentsController(
         var authResult = await authorizationService.AuthorizeAsync(User, document, NivoraPolicies.SameTenant);
         if (!authResult.Succeeded) return NotFound();
 
-        if (!Enum.TryParse<KnowledgeDocumentType>(request.Type, out var type))
+        if (!Enum.TryParse<KnowledgeDocumentType>(request.Type, out var type) || !Enum.IsDefined(type))
         {
             return BadRequest($"Invalid Type '{request.Type}'.");
         }

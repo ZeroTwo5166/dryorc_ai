@@ -84,7 +84,7 @@ public class TagModeMappingsController(
     [Authorize(Policy = NivoraPolicies.OwnerOnly)]
     public async Task<IActionResult> Create([FromBody] CreateTagModeMappingRequest request)
     {
-        if (!Enum.TryParse<ConversationMode>(request.Mode, out var mode))
+        if (!Enum.TryParse<ConversationMode>(request.Mode, out var mode) || !Enum.IsDefined(mode))
         {
             return BadRequest($"Invalid Mode '{request.Mode}'.");
         }
@@ -136,7 +136,7 @@ public class TagModeMappingsController(
         var authResult = await authorizationService.AuthorizeAsync(User, mapping, NivoraPolicies.SameTenant);
         if (!authResult.Succeeded) return NotFound();
 
-        if (!Enum.TryParse<ConversationMode>(request.Mode, out var mode))
+        if (!Enum.TryParse<ConversationMode>(request.Mode, out var mode) || !Enum.IsDefined(mode))
         {
             return BadRequest($"Invalid Mode '{request.Mode}'.");
         }

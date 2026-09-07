@@ -106,7 +106,7 @@ public class TicketsController(
 
         if (status is not null)
         {
-            if (!Enum.TryParse<TicketStatus>(status, out var parsedStatus))
+            if (!Enum.TryParse<TicketStatus>(status, out var parsedStatus) || !Enum.IsDefined(parsedStatus))
             {
                 return BadRequest($"Invalid status '{status}'.");
             }
@@ -202,7 +202,7 @@ public class TicketsController(
             channel = request.Channel;
         }
 
-        if (!Enum.TryParse<TicketPriority>(request.Priority, out var priority))
+        if (!Enum.TryParse<TicketPriority>(request.Priority, out var priority) || !Enum.IsDefined(priority))
         {
             return BadRequest($"Invalid Priority '{request.Priority}'.");
         }
@@ -503,7 +503,7 @@ public class TicketsController(
         var authResult = await authorizationService.AuthorizeAsync(User, ticket, NivoraPolicies.SameTenant);
         if (!authResult.Succeeded) return NotFound();
 
-        if (!Enum.TryParse<TicketPriority>(request.Priority, out var priority))
+        if (!Enum.TryParse<TicketPriority>(request.Priority, out var priority) || !Enum.IsDefined(priority))
         {
             return BadRequest($"Invalid Priority '{request.Priority}'.");
         }
