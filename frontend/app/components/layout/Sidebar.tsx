@@ -68,7 +68,7 @@ const navSections: NavSection[] = [
   },
   {
     label: "System",
-    items: [{ label: "Settings", icon: IconSettings, soon: true }],
+    items: [{ label: "Settings", icon: IconSettings, href: "/settings/integrations" }],
   },
 ];
 

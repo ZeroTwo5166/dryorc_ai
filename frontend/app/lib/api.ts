@@ -647,14 +647,11 @@ export type ConnectIntegrationResponse = {
   authorizationUrl: string;
 };
 
-// Step 18 ships zero concrete OAuth providers (see
-// backend/Controllers/IntegrationsController.cs) — every {platform} route
-// 404s in production today, and no endpoint exposes which platforms are
-// connectable, so there is nothing yet for a "Connect X" button to offer.
-// No dashboard UI calls these functions yet; they exist so Step 19 (the
-// first real provider, Shopify) can wire a settings page straight into an
-// already-correct client — same deferred-caller precedent as createTicket
-// (Step 16, still unused by the dashboard as of this writing).
+// Step 19 registered the first real provider (Shopify), so `shopify` is
+// live today — see ShopifyIntegrationOAuthProvider.PlatformName. No endpoint
+// exposes which platforms are connectable in general, though, so the
+// settings/integrations page (Step 49) hard-codes "shopify" as a literal
+// rather than offering a generic provider picker.
 export function listIntegrations(): Promise<Integration[]> {
   return api.get("/api/integrations");
 }
