@@ -19,6 +19,7 @@ type MockUser = {
   planTier: string | null;
   roles: string[];
   expiresAtUtc: string;
+  cancelOrderToolEnabled: boolean;
 };
 
 const { mockRouterReplace, authState, apiState, searchParamsState } = vi.hoisted(() => ({
@@ -28,6 +29,7 @@ const { mockRouterReplace, authState, apiState, searchParamsState } = vi.hoisted
     listIntegrations: vi.fn(),
     connectIntegration: vi.fn(),
     disconnectIntegration: vi.fn(),
+    setCancelOrderToolEnabled: vi.fn(),
   },
   searchParamsState: { params: new URLSearchParams() as URLSearchParams },
 }));
@@ -49,6 +51,7 @@ vi.mock("../../lib/api", async () => {
     listIntegrations: apiState.listIntegrations,
     connectIntegration: apiState.connectIntegration,
     disconnectIntegration: apiState.disconnectIntegration,
+    setCancelOrderToolEnabled: apiState.setCancelOrderToolEnabled,
   };
 });
 
@@ -69,7 +72,7 @@ const shopifyDisconnected = {
   disconnectedAt: new Date().toISOString(),
 };
 
-function setOwner() {
+function setOwner(cancelOrderToolEnabled = false) {
   authState.user = {
     userId: "u1",
     businessId: "b1",
@@ -78,6 +81,7 @@ function setOwner() {
     planTier: "trial",
     roles: ["Owner"],
     expiresAtUtc: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    cancelOrderToolEnabled,
   };
 }
 
@@ -94,6 +98,7 @@ describe("SettingsIntegrationsPage", () => {
     apiState.listIntegrations.mockReset().mockResolvedValue([]);
     apiState.connectIntegration.mockReset();
     apiState.disconnectIntegration.mockReset().mockResolvedValue(null);
+    apiState.setCancelOrderToolEnabled.mockReset();
   });
 
   it("shows a disconnected state with a Connect control for Owner when no Shopify row exists", async () => {
@@ -232,5 +237,112 @@ describe("SettingsIntegrationsPage", () => {
     authState.user = null;
     renderPage();
     await waitFor(() => expect(mockRouterReplace).toHaveBeenCalledWith("/login"));
+  });
+
+  describe("Cancel order tool", () => {
+    it("loads the current value and shows an Owner an interactive toggle", async () => {
+      setOwner(false);
+      renderPage();
+
+      expect(await screen.findByRole("button", { name: /^disabled$/i })).toBeInTheDocument();
+    });
+
+    it("renders as enabled when the Me response already has the flag on", async () => {
+      setOwner(true);
+      apiState.listIntegrations.mockResolvedValue([shopifyConnected]);
+      renderPage();
+
+      expect(await screen.findByRole("button", { name: /^enabled$/i })).toBeInTheDocument();
+    });
+
+    it("shows a read-only label for a non-Owner, with no button", async () => {
+      setOwner(true);
+      setAgent();
+      renderPage();
+
+      await screen.findByText("Cancel order tool");
+      expect(screen.queryByRole("button", { name: /^(enabled|disabled)$/i })).not.toBeInTheDocument();
+      expect(screen.getByText("Enabled")).toBeInTheDocument();
+    });
+
+    it("disables the enable action while Shopify is disconnected, with explanatory copy", async () => {
+      setOwner(false);
+      apiState.listIntegrations.mockResolvedValue([]); // no Shopify row at all
+      renderPage();
+
+      const toggle = await screen.findByRole("button", { name: /^disabled$/i });
+      expect(toggle).toBeDisabled();
+      expect(screen.getByText(/connect shopify first/i)).toBeInTheDocument();
+      expect(apiState.setCancelOrderToolEnabled).not.toHaveBeenCalled();
+    });
+
+    it("keeps the disable action available even while Shopify is disconnected", async () => {
+      setOwner(true);
+      apiState.listIntegrations.mockResolvedValue([shopifyDisconnected]);
+      apiState.setCancelOrderToolEnabled.mockResolvedValue({ cancelOrderToolEnabled: false });
+      renderPage();
+
+      const toggle = await screen.findByRole("button", { name: /^enabled$/i });
+      expect(toggle).toBeEnabled();
+      expect(screen.getByText(/won.t execute until shopify is reconnected/i)).toBeInTheDocument();
+
+      fireEvent.click(toggle);
+      await waitFor(() => expect(apiState.setCancelOrderToolEnabled).toHaveBeenCalledWith(false));
+      expect(await screen.findByRole("button", { name: /^disabled$/i })).toBeInTheDocument();
+    });
+
+    it("enables successfully while Shopify is connected and reflects the persisted response value", async () => {
+      setOwner(false);
+      apiState.listIntegrations.mockResolvedValue([shopifyConnected]);
+      apiState.setCancelOrderToolEnabled.mockResolvedValue({ cancelOrderToolEnabled: true });
+      renderPage();
+
+      const toggle = await screen.findByRole("button", { name: /^disabled$/i });
+      fireEvent.click(toggle);
+
+      await waitFor(() => expect(apiState.setCancelOrderToolEnabled).toHaveBeenCalledWith(true));
+      expect(await screen.findByRole("button", { name: /^enabled$/i })).toBeInTheDocument();
+    });
+
+    it("surfaces a backend 409 rejection inline without flipping the toggle", async () => {
+      const { ApiError } = await import("../../lib/api");
+      setOwner(false);
+      apiState.listIntegrations.mockResolvedValue([shopifyConnected]);
+      apiState.setCancelOrderToolEnabled.mockRejectedValue(
+        new ApiError(409, "Cannot enable — no active Shopify integration exists for this business."),
+      );
+      renderPage();
+
+      const toggle = await screen.findByRole("button", { name: /^disabled$/i });
+      fireEvent.click(toggle);
+
+      expect(await screen.findByText("Cannot enable — no active Shopify integration exists for this business.")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^disabled$/i })).toBeInTheDocument(); // unchanged, not flipped to Enabled
+    });
+
+    it("does not clobber an in-flight optimistic update when the user object reference changes for an unrelated reason", async () => {
+      setOwner(false);
+      apiState.listIntegrations.mockResolvedValue([shopifyConnected]);
+      apiState.setCancelOrderToolEnabled.mockResolvedValue({ cancelOrderToolEnabled: true });
+      const { rerender } = renderPage();
+
+      const toggle = await screen.findByRole("button", { name: /^disabled$/i });
+      fireEvent.click(toggle);
+      expect(await screen.findByRole("button", { name: /^enabled$/i })).toBeInTheDocument();
+
+      // Simulate an unrelated Me() refresh (e.g. the session-expiry-extension
+      // flow) that produces a *new* user object reference with the same
+      // underlying cancelOrderToolEnabled value from before the toggle. A
+      // naive effect re-syncing local state from `user` on every render
+      // would incorrectly flip the toggle back to "Disabled" here.
+      authState.user = { ...(authState.user as MockUser) };
+      rerender(
+        <ThemeProvider>
+          <SettingsIntegrationsPage />
+        </ThemeProvider>,
+      );
+
+      expect(await screen.findByRole("button", { name: /^enabled$/i })).toBeInTheDocument();
+    });
   });
 });

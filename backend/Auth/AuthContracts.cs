@@ -22,7 +22,8 @@ public record MeResponse(
     string BusinessName,
     string? PlanTier,
     IReadOnlyList<string> Roles,
-    DateTimeOffset ExpiresAtUtc);
+    DateTimeOffset ExpiresAtUtc,
+    bool CancelOrderToolEnabled);
 
 public record ConfirmEmailRequest(Guid UserId, string Token);
 

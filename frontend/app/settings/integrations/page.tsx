@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useState, type FormEvent } from "react";
+import { Suspense, useEffect, useRef, useState, type FormEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { DashboardShell } from "../../components/layout/DashboardShell";
 import { FormError } from "../../components/auth/FormField";
@@ -12,6 +12,7 @@ import {
   connectIntegration,
   disconnectIntegration,
   listIntegrations,
+  setCancelOrderToolEnabled,
   type Integration,
 } from "../../lib/api";
 
@@ -73,11 +74,32 @@ function SettingsIntegrationsContent() {
   const [disconnecting, setDisconnecting] = useState(false);
   const [disconnectError, setDisconnectError] = useState<string | null>(null);
 
+  // Step 49b — Cancel Order Tool toggle. Local state, seeded once from
+  // user.cancelOrderToolEnabled — never re-synced from `user` on every
+  // render (see the seeding effect below). Mirrors the `shopify` state
+  // pattern above, not the shared auth-context object directly.
+  const [toolEnabled, setToolEnabled] = useState(false);
+  const toolEnabledSeededRef = useRef(false);
+  const [savingTool, setSavingTool] = useState(false);
+  const [toolError, setToolError] = useState<string | null>(null);
+
   useEffect(() => {
     if (status === "ready" && !user) {
       router.replace("/login");
     }
   }, [status, user, router]);
+
+  // Seeds `toolEnabled` exactly once, the first time `user` becomes
+  // available — never again afterward, even if `user`'s reference later
+  // changes for an unrelated reason (e.g. the session-expiry-extension
+  // flow re-calling Me()). Without the ref guard, a plain `[user]`-keyed
+  // effect would clobber an in-flight or already-completed optimistic
+  // update with a stale value on every such refresh.
+  useEffect(() => {
+    if (!user || toolEnabledSeededRef.current) return;
+    toolEnabledSeededRef.current = true;
+    setToolEnabled(user.cancelOrderToolEnabled);
+  }, [user]);
 
   useEffect(() => {
     if (!user) return;
@@ -145,6 +167,26 @@ function SettingsIntegrationsContent() {
     }
   }
 
+  // Step 49b. The backend endpoint is authoritative — this is not a
+  // substitute for its own precondition check, only a secondary UI guard
+  // (design doc §7). On success, the local value is set from the
+  // response's persisted value, not assumed from the optimistic toggle.
+  async function handleToggleCancelOrderTool() {
+    const next = !toolEnabled;
+    setToolError(null);
+    setSavingTool(true);
+    try {
+      const result = await setCancelOrderToolEnabled(next);
+      setToolEnabled(result.cancelOrderToolEnabled);
+    } catch (err) {
+      // Leave state as-is — the control remains available to retry. This is
+      // also where the backend's 409 precondition rejection surfaces.
+      setToolError(err instanceof ApiError ? err.message : "Something went wrong. Please try again.");
+    } finally {
+      setSavingTool(false);
+    }
+  }
+
   if (status === "loading" || !user) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background">
@@ -191,90 +233,132 @@ function SettingsIntegrationsContent() {
             </p>
           </div>
         ) : (
-          <section className="mt-8 rounded-2xl border border-border bg-card px-5 py-4">
-            <div className="flex items-start justify-between gap-4">
-              <div className="flex items-start gap-3">
-                <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent-soft text-accent">
-                  <IconStore className="h-4 w-4" />
-                </span>
-                <div>
-                  <p className="text-sm font-medium text-foreground">Shopify</p>
-                  <p className="mt-1 text-[13px] text-muted-foreground">
-                    Lets the AI look up and cancel Shopify orders on your business&apos;s behalf.
-                  </p>
-                </div>
-              </div>
-              <span
-                className={`shrink-0 rounded-full px-2.5 py-1 text-[10.5px] font-semibold uppercase tracking-wider ${
-                  isConnected ? "bg-accent-soft text-accent" : "bg-muted text-muted-foreground"
-                }`}
-              >
-                {isConnected ? "Connected" : "Disconnected"}
-              </span>
-            </div>
-
-            {isConnected ? (
-              <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
-                <div className="min-w-0">
-                  <p className="truncate text-[13px] text-foreground">{shopify?.externalAccountIdentifier}</p>
-                  {shopify?.connectedAt && (
-                    <p className="mt-0.5 text-[12.5px] text-muted-foreground/70">
-                      Connected {formatRelativeTime(shopify.connectedAt)}
-                    </p>
-                  )}
-                  {disconnectError && <p className="mt-2 text-[13px] text-destructive">{disconnectError}</p>}
-                </div>
-                {canConnect && (
-                  <button
-                    type="button"
-                    onClick={handleDisconnect}
-                    disabled={disconnecting}
-                    className="shrink-0 rounded-full border border-destructive-soft px-3.5 py-1.5 text-[13px] font-medium text-destructive transition-colors hover:bg-destructive-soft disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {disconnecting ? "Disconnecting…" : "Disconnect"}
-                  </button>
-                )}
-              </div>
-            ) : canConnect ? (
-              <form onSubmit={handleConnect} className="mt-4 border-t border-border pt-4">
-                <label htmlFor="shopName" className="mb-1.5 block text-[13px] font-medium text-foreground">
-                  Shop name
-                </label>
-                <div className="flex items-start gap-2">
-                  <div className="flex-1">
-                    <input
-                      id="shopName"
-                      type="text"
-                      required
-                      placeholder="example-store"
-                      value={shopName}
-                      onChange={(e) => {
-                        setShopName(e.target.value);
-                        setShopNameError(null);
-                      }}
-                      className="w-full rounded-xl border border-border bg-card px-3.5 py-2.5 text-sm text-foreground shadow-sm outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-accent focus:ring-2 focus:ring-accent/20"
-                    />
-                    <p className="mt-1 text-[12.5px] text-muted-foreground/70">
-                      The bare shop name from your Shopify admin URL — not the full domain.
+          <>
+            <section className="mt-8 rounded-2xl border border-border bg-card px-5 py-4">
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex items-start gap-3">
+                  <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-accent-soft text-accent">
+                    <IconStore className="h-4 w-4" />
+                  </span>
+                  <div>
+                    <p className="text-sm font-medium text-foreground">Shopify</p>
+                    <p className="mt-1 text-[13px] text-muted-foreground">
+                      Lets the AI look up and cancel Shopify orders on your business&apos;s behalf.
                     </p>
                   </div>
-                  <button
-                    type="submit"
-                    disabled={connecting}
-                    className="shrink-0 rounded-full bg-primary px-4 py-2.5 text-[13px] font-medium text-primary-foreground shadow-sm transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {connecting ? "Connecting…" : "Connect"}
-                  </button>
                 </div>
-                {shopNameError && <p className="mt-2 text-[13px] text-destructive">{shopNameError}</p>}
-                {connectError && <p className="mt-2 text-[13px] text-destructive">{connectError}</p>}
-              </form>
-            ) : (
-              <p className="mt-4 border-t border-border pt-4 text-[13px] text-muted-foreground">
-                Not connected. An Owner can connect Shopify from this page.
-              </p>
-            )}
-          </section>
+                <span
+                  className={`shrink-0 rounded-full px-2.5 py-1 text-[10.5px] font-semibold uppercase tracking-wider ${
+                    isConnected ? "bg-accent-soft text-accent" : "bg-muted text-muted-foreground"
+                  }`}
+                >
+                  {isConnected ? "Connected" : "Disconnected"}
+                </span>
+              </div>
+
+              {isConnected ? (
+                <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
+                  <div className="min-w-0">
+                    <p className="truncate text-[13px] text-foreground">{shopify?.externalAccountIdentifier}</p>
+                    {shopify?.connectedAt && (
+                      <p className="mt-0.5 text-[12.5px] text-muted-foreground/70">
+                        Connected {formatRelativeTime(shopify.connectedAt)}
+                      </p>
+                    )}
+                    {disconnectError && <p className="mt-2 text-[13px] text-destructive">{disconnectError}</p>}
+                  </div>
+                  {canConnect && (
+                    <button
+                      type="button"
+                      onClick={handleDisconnect}
+                      disabled={disconnecting}
+                      className="shrink-0 rounded-full border border-destructive-soft px-3.5 py-1.5 text-[13px] font-medium text-destructive transition-colors hover:bg-destructive-soft disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {disconnecting ? "Disconnecting…" : "Disconnect"}
+                    </button>
+                  )}
+                </div>
+              ) : canConnect ? (
+                <form onSubmit={handleConnect} className="mt-4 border-t border-border pt-4">
+                  <label htmlFor="shopName" className="mb-1.5 block text-[13px] font-medium text-foreground">
+                    Shop name
+                  </label>
+                  <div className="flex items-start gap-2">
+                    <div className="flex-1">
+                      <input
+                        id="shopName"
+                        type="text"
+                        required
+                        placeholder="example-store"
+                        value={shopName}
+                        onChange={(e) => {
+                          setShopName(e.target.value);
+                          setShopNameError(null);
+                        }}
+                        className="w-full rounded-xl border border-border bg-card px-3.5 py-2.5 text-sm text-foreground shadow-sm outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-accent focus:ring-2 focus:ring-accent/20"
+                      />
+                      <p className="mt-1 text-[12.5px] text-muted-foreground/70">
+                        The bare shop name from your Shopify admin URL — not the full domain.
+                      </p>
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={connecting}
+                      className="shrink-0 rounded-full bg-primary px-4 py-2.5 text-[13px] font-medium text-primary-foreground shadow-sm transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {connecting ? "Connecting…" : "Connect"}
+                    </button>
+                  </div>
+                  {shopNameError && <p className="mt-2 text-[13px] text-destructive">{shopNameError}</p>}
+                  {connectError && <p className="mt-2 text-[13px] text-destructive">{connectError}</p>}
+                </form>
+              ) : (
+                <p className="mt-4 border-t border-border pt-4 text-[13px] text-muted-foreground">
+                  Not connected. An Owner can connect Shopify from this page.
+                </p>
+              )}
+            </section>
+
+            <section className="mt-6 rounded-2xl border border-border bg-card px-5 py-4">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <p className="text-sm font-medium text-foreground">Cancel order tool</p>
+                  <p className="mt-1 text-[13px] text-muted-foreground">
+                    Lets the AI propose Shopify order cancellations for staff to approve.
+                  </p>
+                </div>
+                {canConnect ? (
+                  <button
+                    type="button"
+                    onClick={handleToggleCancelOrderTool}
+                    disabled={savingTool || (!toolEnabled && !isConnected)}
+                    aria-pressed={toolEnabled}
+                    className={`shrink-0 rounded-full px-4 py-2 text-[13px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                      toolEnabled
+                        ? "bg-accent-soft text-accent"
+                        : "border border-border text-foreground hover:bg-muted"
+                    }`}
+                  >
+                    {savingTool ? "Working…" : toolEnabled ? "Enabled" : "Disabled"}
+                  </button>
+                ) : (
+                  <span className="shrink-0 text-[13px] font-medium text-muted-foreground">
+                    {toolEnabled ? "Enabled" : "Disabled"}
+                  </span>
+                )}
+              </div>
+
+              {!toolEnabled && !isConnected && (
+                <p className="mt-3 text-[12.5px] text-muted-foreground/70">Connect Shopify first to enable this.</p>
+              )}
+              {toolEnabled && !isConnected && (
+                <p className="mt-3 text-[12.5px] text-muted-foreground/70">
+                  Shopify is disconnected — the AI can propose cancellations, but they won&apos;t execute until Shopify is reconnected.
+                </p>
+              )}
+              {toolError && <p className="mt-3 text-[13px] text-destructive">{toolError}</p>}
+            </section>
+          </>
         )}
       </main>
     </DashboardShell>

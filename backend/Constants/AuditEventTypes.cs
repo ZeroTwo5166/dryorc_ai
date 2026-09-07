@@ -13,6 +13,13 @@ public static class AuditEventTypes
     public const string RetentionChanged = "RetentionChanged";
     public const string StatusChanged = "StatusChanged";
 
+    // Business — Cancel Order Tool flag (step 49b). Named like
+    // CustomerExtendedLoggingEnabled/Disabled below (its closest exercised
+    // precedent), prefixed with the entity name to avoid reading like the
+    // Business.CancelOrderToolEnabled field itself.
+    public const string BusinessCancelOrderToolEnabled = "BusinessCancelOrderToolEnabled";
+    public const string BusinessCancelOrderToolDisabled = "BusinessCancelOrderToolDisabled";
+
     // Customer
     public const string CustomerFieldUpdated = "CustomerFieldUpdated";
     public const string CustomerDeleted = "CustomerDeleted";

@@ -183,6 +183,9 @@ export type MeResponse = {
   // frontend's session-expiry warning schedules off this, never off its own
   // guess. See AuthController.Me / ExtendSession.
   expiresAtUtc: string;
+  // Step 49b — Business.CancelOrderToolEnabled, already loaded by Me() for
+  // every page load; see settings/integrations/page.tsx.
+  cancelOrderToolEnabled: boolean;
 };
 
 export function register(body: RegisterRequest): Promise<RegisterResponse> {
@@ -662,4 +665,17 @@ export function connectIntegration(platform: string, body: ConnectIntegrationReq
 
 export function disconnectIntegration(platform: string): Promise<null> {
   return api.post(`/api/integrations/${platform}/disconnect`);
+}
+
+// Talks to backend/Controllers/BusinessController.cs (Step 49b).
+
+export type SetCancelOrderToolEnabledResponse = {
+  cancelOrderToolEnabled: boolean;
+};
+
+// No businessId/tenantId parameter, deliberately — the backend derives the
+// caller's own business from the authenticated session, never from a
+// client-supplied value (see BusinessController.SetCancelOrderToolEnabled).
+export function setCancelOrderToolEnabled(enabled: boolean): Promise<SetCancelOrderToolEnabledResponse> {
+  return api.put("/api/business/cancel-order-tool", { enabled });
 }
