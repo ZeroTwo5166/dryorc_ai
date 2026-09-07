@@ -19,6 +19,7 @@ namespace backend.Tests;
 /// No KnowledgeChunk/embedding/RAG behavior exists to test yet — those are
 /// Steps 11-12.
 /// </summary>
+[Collection("KnowledgeChunks collection")]
 public class KnowledgeDocumentsApiTests : IAsyncLifetime
 {
     private readonly NivoraApiFactory _factory = new();

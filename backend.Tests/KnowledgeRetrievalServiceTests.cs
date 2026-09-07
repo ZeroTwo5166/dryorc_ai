@@ -26,6 +26,7 @@ namespace backend.Tests;
 /// constructed directly against the actual query vector Voyage (the fake)
 /// will produce for the query text.
 /// </summary>
+[Collection("KnowledgeChunks collection")]
 public class KnowledgeRetrievalServiceTests : IAsyncLifetime
 {
     private ServiceProvider _provider = null!;

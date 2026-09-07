@@ -17,6 +17,7 @@ namespace backend.Tests;
 /// pattern WidgetConversationServiceTests already established for this
 /// codebase's service-level tests.
 /// </summary>
+[Collection("KnowledgeChunks collection")]
 public class KnowledgeIndexingServiceTests : IAsyncLifetime
 {
     private ServiceProvider _provider = null!;
