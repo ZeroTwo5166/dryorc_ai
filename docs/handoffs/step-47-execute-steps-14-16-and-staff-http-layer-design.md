@@ -213,3 +213,24 @@ DESIGN COMPLETE — READY FOR INDEPENDENT VERIFICATION
 ```
 
 Per this project's standing process, the implementing session may not verify its own work — an independent pass should re-derive the migration, the Execute steps 14–16 sequencing, the new audit constants, and the controller's authorization/DTO shapes from source before this is treated as verified.
+
+---
+
+## 15. Independent verification — VERIFIED
+
+A separate pass re-derived every claim in the implementation directly from source, not from the implementing session's own report:
+
+- **Fresh-worktree build + full suite**: re-run independently from a genuinely separate `git worktree` at `HEAD` (`b2176ca`) — both projects build with 0 errors; full suite **692 passed, 3 skipped, 0 failed, 695 total**, matching the reported numbers exactly, no HNSW-flake or other failure on this run.
+- **`DeniedReason` migration**: confirmed via `dotnet ef migrations list` directly against the dev DB — `20260906125750_AddApprovalDeniedReason` present in `__EFMigrationsHistory`. `dotnet ef migrations has-pending-model-changes` — "No changes have been made to the model since the last migration," zero drift.
+- **Execute steps 14–16 sequencing**: read `OrderCancelApprovedActionExecutor.cs` directly. Step 14's `GetCancellationStateAsync` call sits strictly after the step-13 transaction's `CommitAsync` (outside the `await using` block); on `CancelledAt != null` it calls `MarkConfirmedAsync` and returns `Executed(ExternallySatisfied, ...)` without ever touching the mutation executor; on `CancelledAt == null` it proceeds to step 15's `orderCancellationExecutor.ExecuteAsync`, then re-reads `OrderCancellation.Status` to map `Failed`/`UnknownNeedsReconciliation`. This is an exact match to `step-22z` §10's steps 14–15 text, confirmed by direct side-by-side comparison, not inferred from passing tests.
+- **New `AuditEventTypes` usage**: read `ApprovalsController.Approve`/`Deny` directly — both write `ActorType.NivoraBusinessStaff, changedByUserId: currentUserId` (a real resolved staff id), not the `NivoraSystem`/`null` placeholder step-45 corrected elsewhere. No regression.
+- **Authorization, per endpoint**: confirmed individually, not assumed from one — the class-level `[Authorize(Policy = NivoraPolicies.OwnerOrAdmin)]` applies to all four actions (no per-action override or `[AllowAnonymous]` anywhere in the file); `Approve`, `Deny`, and `Execute` each independently load the `Approval` (Layer 1, tenant query filter) then call `authorizationService.AuthorizeAsync(User, approval, NivoraPolicies.SameTenant)` (Layer 2) before acting; `List` correctly relies on Layer 1 alone, matching the design's own stated exception for a list with no single resource to check.
+- **`DeniedReason` optionality**: confirmed nullable with no validation attribute at both the DTO (`DenyApprovalRequest(string? Reason)`, and the controller parameter itself `DenyApprovalRequest? request` is nullable too) and entity (`Approval.DeniedReason`, `string?`) layers.
+- **No live staleness check, no notification code**: confirmed by full direct read of `ApprovalsController.cs` — its constructor injects only `AppDbContext`/`IAuthorizationService`/`IAuditLogService`/`IApprovedActionExecutor`; a repository-wide `grep` for `NotificationService`/`IShopifyOrderLookupService`/`GetCancellationStateAsync`/`LookupOrderOwnerAsync` inside the controller file returns zero hits.
+- **Per-commit file lists**: `git show --stat` on all 4 commits diffed against their claimed contents — `6a029c9` (migration + model), `09da4ae` (executor + its tests), `de16cf3` (2-line audit-constants addition only), `52ab0ea` (controller + its tests) — each matches exactly, no discrepancy.
+
+**No item requires returning to the implementing session.**
+
+```text
+VERIFIED
+```
