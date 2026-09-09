@@ -63,6 +63,20 @@ public record ExecuteApprovalResponse(string Result, string? RefusalReason, stri
 /// as of step-47) — this controller performs no business logic of its own
 /// for that action beyond resolving executingStaffUserId and serializing the
 /// result.
+///
+/// Step refundOrder Phase 2 — routing addition: resolves
+/// IEnumerable&lt;IApprovedActionExecutor&gt;, not a single injected instance,
+/// mirroring IIntegrationOAuthProvider's own established multi-provider DI
+/// pattern (design doc §3.3). The correct executor is selected by matching
+/// its own ToolName against the loaded Approval's ToolName. If none match —
+/// currently true for every "refundOrder" Approval, since no
+/// RefundApprovedActionExecutor exists yet — Execute returns a Refused
+/// outcome (ExecutionRefusalReason.NoExecutorRegisteredForTool) without
+/// calling any executor at all; it never falls through to
+/// OrderCancelApprovedActionExecutor or any other mismatched tool.
+/// SingleOrDefault (not FirstOrDefault) is deliberate: if two registered
+/// executors ever claimed the same ToolName, that is a live configuration
+/// bug that must throw loudly, not one silently resolved by pick-the-first.
 /// </summary>
 [ApiController]
 [Route("api/approvals")]
@@ -71,7 +85,7 @@ public class ApprovalsController(
     AppDbContext db,
     IAuthorizationService authorizationService,
     IAuditLogService auditLogService,
-    IApprovedActionExecutor executor) : ControllerBase
+    IEnumerable<IApprovedActionExecutor> executors) : ControllerBase
 {
     private Guid CurrentUserId
     {
@@ -215,7 +229,15 @@ public class ApprovalsController(
         var authResult = await authorizationService.AuthorizeAsync(User, approval, NivoraPolicies.SameTenant);
         if (!authResult.Succeeded) return NotFound();
 
-        var outcome = await executor.ExecuteApprovedActionAsync(id, CurrentUserId, cancellationToken);
+        // Step refundOrder Phase 2 routing — see class doc comment. No
+        // executor is invoked at all when nothing matches; this is an
+        // explicit, safe rejection, not a fall-through to a mismatched tool.
+        var matchingExecutor = executors.SingleOrDefault(e => e.ToolName == approval.ToolName);
+        var outcome = matchingExecutor is not null
+            ? await matchingExecutor.ExecuteApprovedActionAsync(id, CurrentUserId, cancellationToken)
+            : new ExecutionOutcome.Refused(
+                ExecutionRefusalReason.NoExecutorRegisteredForTool,
+                $"No execution capability is registered for tool '{approval.ToolName}'.");
 
         var response = outcome switch
         {

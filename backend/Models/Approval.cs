@@ -61,4 +61,14 @@ public class Approval : ITenantOwned
     public DateTimeOffset? ConsumedAt { get; set; }
 
     public Guid? OrderCancellationId { get; set; }
+
+    /// <summary>
+    /// Step refundOrder Phase 1 — mirrors OrderCancellationId's exact
+    /// shape (nullable, Restrict-on-delete) for the refundOrder execution
+    /// intent. See docs/handoffs/step-refundorder-design.md §12.3: a
+    /// second tool-specific FK column, not a redesign into a generic
+    /// polymorphic-execution-intent shape — that would be a larger change
+    /// than this pass's scope justifies.
+    /// </summary>
+    public Guid? RefundId { get; set; }
 }

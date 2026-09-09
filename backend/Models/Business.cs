@@ -56,6 +56,21 @@ public class Business
     /// </summary>
     public bool CancelOrderToolEnabled { get; set; } = false;
 
+    /// <summary>
+    /// Step refundOrder Phase 3 — Owner Decision 3 (docs/handoffs/step-refundorder-design.md
+    /// §14.3): mandatory dual-layer kill switch for refundOrder, deliberately
+    /// stricter than CancelOrderToolEnabled's single-layer precedent above.
+    /// Layer 1 (exposure): gates whether the AI is offered the refundOrder
+    /// proposal tool at all (ClaudeReplyService's disabledToolNames
+    /// construction). Layer 2 (execution): RefundApprovedActionExecutor
+    /// independently re-checks this same field at execution time, so an
+    /// Approval proposed and even staff-approved while this was true is still
+    /// refused if the business subsequently set it to false before execution
+    /// — human approval does not bypass this check. Default false — opt-in,
+    /// not opt-out, matching CancelOrderToolEnabled's own default.
+    /// </summary>
+    public bool RefundToolEnabled { get; set; } = false;
+
 
     /// <summary>
     /// Maximum refund amount Nivora may execute autonomously (Mode = Auto)

@@ -200,9 +200,22 @@ public class ClaudeReplyService(
             // then refused. Explicitly not Decision 8's deferred
             // per-write-tool automation-tier system — see
             // docs/handoffs/step-48-cancelorder-tool-registration-production-safety-scoping.md.
-            var disabledToolNames = business.CancelOrderToolEnabled
-                ? (IReadOnlySet<string>)new HashSet<string>()
-                : new HashSet<string> { OrderCancelProposalTool.ToolName };
+            //
+            // Step refundOrder Phase 3 — Owner Decision 3, Layer 1 (design
+            // §14.3): Business.RefundToolEnabled gates refundOrder's own
+            // exposure identically. This is a second, independent per-tool
+            // flag, not a reuse of CancelOrderToolEnabled — each tool is
+            // disabled/enabled on its own. Layer 2 (execution-time
+            // re-check) lives in RefundApprovedActionExecutor, not here.
+            var disabledToolNames = new HashSet<string>();
+            if (!business.CancelOrderToolEnabled)
+            {
+                disabledToolNames.Add(OrderCancelProposalTool.ToolName);
+            }
+            if (!business.RefundToolEnabled)
+            {
+                disabledToolNames.Add(RefundProposalTool.ToolName);
+            }
 
             var outcome = await toolDispatchService.RunAsync(
                 dispatchContext, toolAwareSystemPrompt, messages, disabledToolNames, cancellationToken);

@@ -19,4 +19,10 @@ public static class AuditEntityTypes
     public const string TagModeMapping = "TagModeMapping";
     public const string ApplicationUser = "ApplicationUser";
     public const string Approval = "Approval";
+
+    /// <summary>Step refundOrder Phase 3 (design §15.2) — the Refund row
+    /// itself, for its own terminal Confirmed/Failed audit rows. Distinct
+    /// from Order (a Shopify-side concept) and from Approval (the claim
+    /// audit row already uses AuditEntityTypes.Approval).</summary>
+    public const string Refund = "Refund";
 }

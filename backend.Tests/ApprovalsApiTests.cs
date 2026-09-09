@@ -179,7 +179,8 @@ public class ApprovalsApiTests : IAsyncLifetime
     /// refuses before step 11 ever recomputes it.
     /// </summary>
     private async Task<Approval> SeedApprovalAsync(
-        Guid businessId, ApprovalStatus status = ApprovalStatus.Pending, DateTimeOffset? expiresAt = null)
+        Guid businessId, ApprovalStatus status = ApprovalStatus.Pending, DateTimeOffset? expiresAt = null,
+        string toolName = "cancelOrder")
     {
         await using var scope = _factory.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -204,9 +205,9 @@ public class ApprovalsApiTests : IAsyncLifetime
         var approval = new Approval
         {
             Id = Guid.NewGuid(), BusinessId = businessId, ConversationId = conversation.Id, CustomerId = customer.Id,
-            ToolName = "cancelOrder", ResourceId = "gid://shopify/Order/12345",
+            ToolName = toolName, ResourceId = "gid://shopify/Order/12345",
             CanonicalArguments = "placeholder", ActionHash = new string('a', 64),
-            DisplaySummary = "Cancel order gid://shopify/Order/12345.",
+            DisplaySummary = $"Test approval for {toolName}.",
             Status = status, CreatedAt = now, ExpiresAt = expiresAt ?? now.AddMinutes(15),
         };
 
@@ -512,5 +513,90 @@ public class ApprovalsApiTests : IAsyncLifetime
         var response = await client.PostAsync($"/api/approvals/{approval.Id}/execute", null);
 
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    // ── Execute routing (Step refundOrder Phase 2/3) ──────────────────────
+
+    /// <summary>
+    /// The core multi-executor routing proof (design doc §3.3): with two
+    /// distinct ToolName values now able to reach Execute, a "refundOrder"
+    /// Approval must route to the real RefundApprovedActionExecutor (Phase
+    /// 3), while a "cancelOrder" Approval in the same business must still
+    /// reach the real, unmodified OrderCancelApprovedActionExecutor —
+    /// proving the router neither drops cancelOrder's own behavior nor lets
+    /// a refundOrder Approval fall through to cancelOrder's executor.
+    ///
+    /// Updated for Phase 3 (was originally written against Phase 2, when no
+    /// RefundApprovedActionExecutor existed yet and this same request
+    /// produced a routing-layer NoExecutorRegisteredForTool refusal instead
+    /// — see git history for that prior assertion). Business.RefundToolEnabled
+    /// defaults false and SetUpBusinessAsync does not enable it, so the
+    /// refund executor now genuinely runs and refuses at its own first
+    /// precondition (Owner Decision 3, Layer 2, design §14.3) — this is
+    /// itself independent, executor-authored proof the router correctly
+    /// dispatched to RefundApprovedActionExecutor, not a controller-level
+    /// shortcut, mirroring the cancelOrder approval's own identical proof
+    /// below.
+    /// </summary>
+    [Fact]
+    public async Task Execute_RefundOrderApproval_RoutesToRefundExecutor_CancelOrderApprovalStillRoutesCorrectly()
+    {
+        var businessId = await SetUpBusinessAsync("Execute Multi-Tool Routing Business");
+        var (owner, ownerCookie) = await SeedStaffAndLoginAsync(businessId, RoleNames.Owner);
+        var refundApproval = await SeedApprovalAsync(businessId, status: ApprovalStatus.Approved, toolName: "refundOrder");
+        var cancelApproval = await SeedApprovalAsync(businessId, status: ApprovalStatus.Denied, toolName: "cancelOrder");
+
+        using var client = NewClient();
+
+        var refundResponse = await client.SendAsync(Authed(HttpMethod.Post, $"/api/approvals/{refundApproval.Id}/execute", ownerCookie));
+        Assert.Equal(HttpStatusCode.OK, refundResponse.StatusCode);
+        var refundBody = await refundResponse.Content.ReadFromJsonAsync<ExecuteApprovalResponse>();
+        Assert.NotNull(refundBody);
+        Assert.Equal("Refused", refundBody!.Result);
+        Assert.Equal(nameof(ExecutionRefusalReason.RefundToolDisabled), refundBody.RefusalReason);
+        Assert.Null(refundBody.ExecutionIntentId);
+        // RefundToolDisabled is refused before the atomic claim (no
+        // execution-intent row exists yet) and is deliberately not audited
+        // (design §14.3 — a business-configuration fact, not a check on the
+        // Approval's own authorization state) — matching
+        // ShopifyIntegrationUnavailable's own identical no-audit precedent.
+        Assert.Empty(await ReadAuditLogsAsync(businessId, refundApproval.Id));
+        Assert.Null((await ReadApprovalAsync(refundApproval.Id)).RefundId);
+
+        var cancelResponse = await client.SendAsync(Authed(HttpMethod.Post, $"/api/approvals/{cancelApproval.Id}/execute", ownerCookie));
+        Assert.Equal(HttpStatusCode.OK, cancelResponse.StatusCode);
+        var cancelBody = await cancelResponse.Content.ReadFromJsonAsync<ExecuteApprovalResponse>();
+        Assert.NotNull(cancelBody);
+        Assert.Equal("Refused", cancelBody!.Result);
+        Assert.Equal(nameof(ExecutionRefusalReason.ApprovalNotApproved), cancelBody.RefusalReason);
+
+        var cancelLogs = await ReadAuditLogsAsync(businessId, cancelApproval.Id);
+        var cancelEntry = Assert.Single(cancelLogs);
+        Assert.Equal(AuditEventTypes.UnauthorizedActionBlocked, cancelEntry.EventType);
+        Assert.Equal(owner.Id, cancelEntry.ChangedByUserId);
+    }
+
+    /// <summary>
+    /// A ToolName with no registered executor at all must fail the same safe
+    /// way — the router has no special-case knowledge of any specific tool
+    /// name; it only ever matches against registered executors' own ToolName
+    /// values.
+    /// </summary>
+    [Fact]
+    public async Task Execute_CompletelyUnknownToolName_ReturnsRefusedNoExecutorRegistered()
+    {
+        var businessId = await SetUpBusinessAsync("Execute Unknown Tool Business");
+        var (_, ownerCookie) = await SeedStaffAndLoginAsync(businessId, RoleNames.Owner);
+        var approval = await SeedApprovalAsync(businessId, status: ApprovalStatus.Approved, toolName: "totallyUnrecognizedTool");
+
+        using var client = NewClient();
+        var response = await client.SendAsync(Authed(HttpMethod.Post, $"/api/approvals/{approval.Id}/execute", ownerCookie));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<ExecuteApprovalResponse>();
+        Assert.NotNull(body);
+        Assert.Equal("Refused", body!.Result);
+        Assert.Equal(nameof(ExecutionRefusalReason.NoExecutorRegisteredForTool), body.RefusalReason);
+        Assert.Empty(await ReadAuditLogsAsync(businessId, approval.Id));
     }
 }

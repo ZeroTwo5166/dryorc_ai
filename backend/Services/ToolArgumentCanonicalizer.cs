@@ -174,6 +174,96 @@ public static class ToolArgumentCanonicalizer
     }
 
     /// <summary>
+    /// Step refundOrder Phase 2 — mirrors <see cref="CanonicalizeOrderCancellationArgs"/>'s
+    /// exact discipline (length-prefixed concatenation) for refundOrder's
+    /// own item/quantity-only contract (docs/handoffs/step-refundorder-design.md
+    /// §5.1/§9.1, Owner Decision 1). ExternalOrderId is deliberately NOT
+    /// included here, for the identical reason
+    /// <see cref="CanonicalizeOrderCancellationArgs"/> excludes it — it is
+    /// the action identity's ResourceId, a separate component from
+    /// CanonicalArguments. CustomerReason is deliberately excluded too,
+    /// matching that method's own exclusion of free-text context.
+    ///
+    /// Items are sorted by ExternalLineItemId (ordinal) before encoding —
+    /// the design's own §9.1 "same intent" comparison is a SET of
+    /// (ExternalLineItemId, Quantity) pairs, not an ordered list, so two
+    /// requests naming the same items in a different order must
+    /// canonicalize identically (mirrors RefundService.SameItemSet's own
+    /// order-independent set-equality semantics from Phase 1, restated here
+    /// as a canonical-string property instead of a runtime comparison).
+    /// Duplicate ExternalLineItemId values within one call are not
+    /// deduplicated or rejected here — RefundProposalTool.ParseInput rejects
+    /// them before this method is ever called; this method is a pure
+    /// function of whatever it's given, matching every other method on this
+    /// class.
+    /// </summary>
+    public static string CanonicalizeRefundArgs(RefundMethod method, IReadOnlyList<(string ExternalLineItemId, int Quantity)> items) =>
+        string.Concat(
+            LengthPrefixed(method.ToString()),
+            LengthPrefixed(items.Count.ToString(CultureInfo.InvariantCulture)),
+            string.Concat(items
+                .OrderBy(i => i.ExternalLineItemId, StringComparer.Ordinal)
+                .Select(i => LengthPrefixed(i.ExternalLineItemId) + LengthPrefixed(i.Quantity.ToString(CultureInfo.InvariantCulture)))));
+
+    /// <summary>
+    /// The exact inverse of <see cref="CanonicalizeRefundArgs"/>, mirroring
+    /// <see cref="DecodeOrderCancellationArgs"/>'s own Enum.TryParse-plus-
+    /// Enum.IsDefined discipline and never-silently-accept-a-malformed-input
+    /// posture — a caller must never act on a value this function could not
+    /// prove was exactly what was originally canonicalized. Quantity and
+    /// item-count fields use <see cref="NumberStyles.None"/> (no sign, no
+    /// leading/trailing whitespace) for the identical reason: the encoder
+    /// only ever writes a non-negative <c>int.ToString()</c>, so anything
+    /// else could not have come from <see cref="CanonicalizeRefundArgs"/>.
+    /// Items are returned in the same (sorted) order the encoder wrote them
+    /// in — the original caller-supplied order is not preserved past
+    /// canonicalization, matching Owner Decision 1's own framing that the
+    /// SET of (ExternalLineItemId, Quantity) pairs is what defines intent,
+    /// not their order.
+    /// </summary>
+    public static (RefundMethod Method, IReadOnlyList<(string ExternalLineItemId, int Quantity)> Items) DecodeRefundArgs(
+        string canonicalArguments)
+    {
+        var cursor = 0;
+        var methodField = ReadLengthPrefixedField(canonicalArguments, ref cursor);
+        var countField = ReadLengthPrefixedField(canonicalArguments, ref cursor);
+
+        if (!Enum.TryParse<RefundMethod>(methodField, out var method) || !Enum.IsDefined(method))
+        {
+            throw new FormatException($"Malformed canonical refund arguments: unrecognized RefundMethod field '{methodField}'.");
+        }
+
+        if (!int.TryParse(countField, NumberStyles.None, CultureInfo.InvariantCulture, out var count))
+        {
+            throw new FormatException($"Malformed canonical refund arguments: invalid item count field '{countField}'.");
+        }
+
+        var items = new List<(string ExternalLineItemId, int Quantity)>(count);
+        for (var i = 0; i < count; i++)
+        {
+            var lineItemId = ReadLengthPrefixedField(canonicalArguments, ref cursor);
+            var quantityField = ReadLengthPrefixedField(canonicalArguments, ref cursor);
+
+            if (!int.TryParse(quantityField, NumberStyles.None, CultureInfo.InvariantCulture, out var quantity))
+            {
+                throw new FormatException(
+                    $"Malformed canonical refund arguments: invalid quantity field '{quantityField}' for item '{lineItemId}'.");
+            }
+
+            items.Add((lineItemId, quantity));
+        }
+
+        if (cursor != canonicalArguments.Length)
+        {
+            throw new FormatException(
+                $"Malformed canonical refund arguments: {canonicalArguments.Length - cursor} trailing character(s) " +
+                $"after the declared {count} item(s).");
+        }
+
+        return (method, items);
+    }
+
+    /// <summary>
     /// Matches CustomerUpdateActionService's own intent field exactly: the
     /// SET of FieldsChanged names (never values — see CustomerUpdateAction's
     /// own PII-discipline doc comment). Sorted and de-duplicated before

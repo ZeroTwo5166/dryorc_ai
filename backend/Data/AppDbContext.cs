@@ -929,6 +929,13 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
             ap.HasOne<OrderCancellation>().WithMany()
                 .HasForeignKey(x => x.OrderCancellationId)
                 .OnDelete(DeleteBehavior.Restrict);
+
+            // Step refundOrder Phase 1 — identical shape to the
+            // OrderCancellationId FK immediately above (nullable,
+            // Restrict-on-delete). See design doc §12.3.
+            ap.HasOne<Refund>().WithMany()
+                .HasForeignKey(x => x.RefundId)
+                .OnDelete(DeleteBehavior.Restrict);
         });
 
         // ─────────────────────────────────────────────────────────────

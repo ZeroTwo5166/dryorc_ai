@@ -323,6 +323,21 @@ builder.Services.AddScoped<IOrderOwnershipAuthorizationService, OrderOwnershipAu
 builder.Services.AddScoped<IOrderCancellationService, OrderCancellationService>();
 builder.Services.AddScoped<ICustomerUpdateActionService, CustomerUpdateActionService>();
 
+// Step refundOrder Phase 1 — persistence/idempotency foundation (see
+// docs/handoffs/step-refundorder-design.md).
+builder.Services.AddScoped<IRefundService, RefundService>();
+
+// Step refundOrder Phase 2 — RefundProposalTool, the AI-facing proposal
+// tool. Registered as IDispatchTool, mirroring OrderCancelProposalTool's own
+// registration immediately above/below (ToolDispatchService resolves the
+// concrete IActionProposalTool case itself — see ToolDispatchService.cs's
+// existing switch, unmodified by this phase). Exposure-time gating
+// (Business.RefundToolEnabled, Owner Decision 3 Layer 1) is applied in
+// ClaudeReplyService's own disabledToolNames construction, mirroring
+// CancelOrderToolEnabled's identical pattern — this registration itself is
+// unconditional, same as OrderCancelProposalTool's own registration.
+builder.Services.AddScoped<IDispatchTool, RefundProposalTool>();
+
 // Pending-reconciliation design pass: ShopifyOrderCancellationExecutor
 // actually calls orderCancel (no production trigger yet — deliberate, see
 // docs/handoffs/pending-reconciliation-design-scoping.md; exercised only
@@ -335,6 +350,16 @@ builder.Services.AddTransient<IOrderCancellationExecutor>(sp => sp.GetRequiredSe
 builder.Services.AddScoped<IOrderCancellationReconciliationService, OrderCancellationReconciliationService>();
 builder.Services.AddHostedService<OrderCancellationReconciliationBackgroundService>();
 
+// Step refundOrder Phase 3 — the refundable-quantity/suggestedRefund
+// preflight lookup (design §8.3, research Q1/Q2) and the refundCreate
+// executor (design §8.5/§9.5, research Q3/Q5/Q11). Same split-registration
+// pattern as ShopifyOrderLookupService/ShopifyOrderCancellationExecutor
+// above, for the identical test-override reason.
+builder.Services.AddHttpClient<ShopifyRefundLookupService>();
+builder.Services.AddTransient<IShopifyRefundLookupService>(sp => sp.GetRequiredService<ShopifyRefundLookupService>());
+builder.Services.AddHttpClient<ShopifyRefundExecutor>();
+builder.Services.AddTransient<IRefundExecutor>(sp => sp.GetRequiredService<ShopifyRefundExecutor>());
+
 // IApprovedActionExecutor's implementation — all 16 steps of the execution
 // ordering are implemented as of step-47 (3-13 committed earlier; 14-16,
 // the pre-execution ground-truth check and the Shopify orderCancel mutation
@@ -342,6 +367,11 @@ builder.Services.AddHostedService<OrderCancellationReconciliationBackgroundServi
 // business with no active Shopify integration. Called by ApprovalsController's
 // POST .../execute action (step-47) — no longer dormant.
 builder.Services.AddScoped<IApprovedActionExecutor, OrderCancelApprovedActionExecutor>();
+
+// Step refundOrder Phase 3 — the second concrete IApprovedActionExecutor.
+// Resolved by ApprovalsController via IEnumerable<IApprovedActionExecutor> +
+// ToolName matching (design §3.3, already implemented ahead of this phase).
+builder.Services.AddScoped<IApprovedActionExecutor, RefundApprovedActionExecutor>();
 
 // ─────────────────────────────────────────────────────────────
 // Identity — cookie-based auth for staff/dashboard users.

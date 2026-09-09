@@ -29,6 +29,14 @@ public static class AuditEventTypes
     public const string RefundIssued = "RefundIssued";
     public const string OrderCancelled = "OrderCancelled";
 
+    // Step refundOrder Phase 3 (design §15.2) — refundOrder's own terminal
+    // state transitions are audited, a deliberate divergence from
+    // cancelOrder's own under-audited shipped precedent (§15.1: cancelOrder
+    // writes no audit row for its own terminal Confirmed/Failed transition,
+    // only for ExecutionClaimed). RefundIssued (declared above) is this
+    // constant's own first real caller, on Pending -> Confirmed.
+    public const string RefundFailed = "RefundFailed";
+
     // Verification / authorization
     public const string Level2VerificationSucceeded = "Level2VerificationSucceeded";
     public const string Level2VerificationFailed = "Level2VerificationFailed";

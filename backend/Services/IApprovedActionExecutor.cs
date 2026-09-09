@@ -85,15 +85,78 @@ public enum ExecutionRefusalReason
     /// unchanged. See docs/handoffs/step-48-cancelorder-tool-registration-production-safety-scoping.md
     /// §8b.</summary>
     ShopifyIntegrationUnavailable,
+
+    /// <summary>Step refundOrder Phase 2 — ApprovalsController.Execute found
+    /// no registered IApprovedActionExecutor whose ToolName matches the
+    /// loaded Approval's own ToolName. Reached only for a tool that has a
+    /// proposal path (an Approval row can exist) but no execution capability
+    /// registered yet — refundOrder in this phase is the only such case, a
+    /// deliberate consequence of Phase 2 building RefundProposalTool without
+    /// RefundApprovedActionExecutor (Phase 3). A routing-layer refusal, not
+    /// this class's own: no ExecuteApprovedActionAsync implementation is
+    /// ever invoked on this path, so no execution-intent row can exist and
+    /// there is nothing to attach a FailureReason to. Explicit fail-safe —
+    /// see docs/handoffs/step-refundorder-design.md §3.3: this never falls
+    /// through to a registered executor for a different tool.</summary>
+    NoExecutorRegisteredForTool,
+
+    /// <summary>
+    /// Step refundOrder Phase 3 — Owner Decision 3, Layer 2
+    /// (docs/handoffs/step-refundorder-design.md §14.3): Business.RefundToolEnabled
+    /// was false at execution time. Checked early, alongside the other
+    /// business-configuration preconditions (cf. ShopifyIntegrationUnavailable
+    /// immediately below) — a stable, checkable fact about the business's own
+    /// configuration, not a check on the Approval's own authorization state,
+    /// so (matching ShopifyIntegrationUnavailable's own precedent) no
+    /// AuditLog write accompanies this refusal. Refused, not
+    /// Executed(Failed, ...): no execution-intent row exists yet at this
+    /// point, so there is nothing to attach a FailureReason to. The Approval
+    /// is left Approved — retriable once the business re-enables the tool.
+    /// This is the concrete enforcement point for Decision 3's Layer 2
+    /// requirement that human approval does not bypass the kill switch.
+    /// </summary>
+    RefundToolDisabled,
+
+    /// <summary>
+    /// Step refundOrder Phase 3 (design §17/§18): Shopify's own
+    /// LineItem.refundableQuantity, read immediately before the atomic claim,
+    /// is less than the requested Quantity for at least one requested line
+    /// item (this includes the already-fully-refunded case, where
+    /// refundableQuantity == 0). A Shopify-state/business-fact refusal, not a
+    /// security refusal — no AuditLog write, matching
+    /// DuplicatePendingCancellation's own "ordinary concurrency/state
+    /// handling" precedent. Refused before any local Refund row is created
+    /// and before refundCreate is ever called. Per design §17, this preflight
+    /// check narrows but does not close the disclosed distinct-Approval
+    /// double-refund race — see RefundApprovedActionExecutor's own doc
+    /// comment.
+    /// </summary>
+    InsufficientRefundableQuantity,
+
+    /// <summary>
+    /// Step refundOrder Phase 3 (design §18): Shopify reported the requested
+    /// ExternalLineItemId does not belong to the target order
+    /// (LineItemNotFoundOnOrderException from IShopifyRefundLookupService).
+    /// Distinct from InsufficientRefundableQuantity — this is "the item
+    /// doesn't exist on this order at all," not "it exists but not enough
+    /// remains refundable." No AuditLog write, same reasoning as that value.
+    /// </summary>
+    RefundLineItemNotOnOrder,
 }
 
 /// <summary>
 /// Status of an execution attempt that DID create/reference a durable
-/// execution-intent row. Deliberately 3-valued, not 4 — a plain,
+/// execution-intent row. Originally 3-valued (step-23u §1): "a plain,
 /// Nivora-caused Confirmed is not reachable as a synchronous return value
-/// from any code path that exists today (step-23u §1), so it is not a
-/// member of this enum. Not yet reachable from any implemented code path as
-/// of Step 29 — no execution attempt reaches the atomic claim yet.
+/// from any code path that exists today [i.e. cancelOrder only, orderCancel
+/// being asynchronous], so it is not a member of this enum." Step
+/// refundOrder Phase 3 is exactly the case that sentence anticipated
+/// changing: refundCreate is confirmed synchronous (design §8.5, research
+/// Q5), so a genuinely Nivora-caused, synchronously-known Confirmed result IS
+/// now reachable — hence the addition of Confirmed below. This is a narrow,
+/// additive change to a shared type: OrderCancelApprovedActionExecutor.cs
+/// itself is untouched and never produces this new value, so cancelOrder's
+/// own behavior is unaffected.
 /// </summary>
 public enum ExecutionResultStatus
 {
@@ -102,6 +165,19 @@ public enum ExecutionResultStatus
     /// Resolves the row's Status to Confirmed with causation NOT attributed
     /// to Nivora.</summary>
     ExternallySatisfied,
+
+    /// <summary>
+    /// Step refundOrder Phase 3 — a genuinely Nivora-caused success, known
+    /// synchronously in the same call that caused it (refundCreate's own
+    /// confirmed-synchronous response, design §8.5/§11.2) — never reachable
+    /// for cancelOrder's own asynchronous orderCancel mutation, which is why
+    /// this value did not exist before this phase. Distinct from
+    /// ExternallySatisfied (which specifically means NOT caused by this
+    /// attempt) and from UnknownNeedsReconciliation (which specifically
+    /// means the row remains Pending) — this is Confirmed, caused by this
+    /// attempt, known now.
+    /// </summary>
+    Confirmed,
 
     /// <summary>A definite, Shopify-reported rejection. The tool-specific
     /// MarkFailedAsync-equivalent was called.</summary>
@@ -186,6 +262,24 @@ public abstract record ExecutionOutcome
 /// </summary>
 public interface IApprovedActionExecutor
 {
+    /// <summary>
+    /// Step refundOrder Phase 2 — the Approval.ToolName this executor
+    /// handles, used by ApprovalsController.Execute to route a loaded
+    /// Approval to the correct executor now that more than one concrete
+    /// IApprovedActionExecutor can be registered (design doc §3.3, the
+    /// IIntegrationOAuthProvider/PlatformName precedent). A default
+    /// interface member, not an abstract one: Step 48 preservation for this
+    /// phase requires OrderCancelApprovedActionExecutor.cs to remain
+    /// byte-for-byte untouched, so it cannot be made to declare this member
+    /// itself. The default below exists solely so that one already-shipped
+    /// implementation keeps routing correctly without any change to its own
+    /// file. Every OTHER IApprovedActionExecutor implementation — including
+    /// any future one — MUST override this default with its own real tool
+    /// name; relying on the default for anything other than
+    /// OrderCancelApprovedActionExecutor is a routing bug, not a valid use.
+    /// </summary>
+    string ToolName => OrderCancelProposalTool.ToolName;
+
     Task<ExecutionOutcome> ExecuteApprovedActionAsync(
         Guid approvalId, Guid executingStaffUserId, CancellationToken cancellationToken);
 }

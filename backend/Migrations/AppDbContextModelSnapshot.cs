@@ -304,6 +304,9 @@ namespace backend.Migrations
                     b.Property<Guid?>("OrderCancellationId")
                         .HasColumnType("uuid");
 
+                    b.Property<Guid?>("RefundId")
+                        .HasColumnType("uuid");
+
                     b.Property<string>("ResourceId")
                         .IsRequired()
                         .HasMaxLength(256)
@@ -332,6 +335,8 @@ namespace backend.Migrations
                     b.HasIndex("DeniedBy");
 
                     b.HasIndex("OrderCancellationId");
+
+                    b.HasIndex("RefundId");
 
                     b.ToTable("Approvals");
                 });
@@ -432,6 +437,9 @@ namespace backend.Migrations
 
                     b.Property<string>("PlanTier")
                         .HasColumnType("text");
+
+                    b.Property<bool>("RefundToolEnabled")
+                        .HasColumnType("boolean");
 
                     b.Property<int>("RetentionDays")
                         .HasColumnType("integer");
@@ -1813,6 +1821,11 @@ namespace backend.Migrations
                     b.HasOne("backend.Models.OrderCancellation", null)
                         .WithMany()
                         .HasForeignKey("OrderCancellationId")
+                        .OnDelete(DeleteBehavior.Restrict);
+
+                    b.HasOne("backend.Models.Refund", null)
+                        .WithMany()
+                        .HasForeignKey("RefundId")
                         .OnDelete(DeleteBehavior.Restrict);
                 });
 

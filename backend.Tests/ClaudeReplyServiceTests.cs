@@ -565,7 +565,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
 
     private async Task<(Business Business, Conversation Conversation)> SeedConversationWithResolvedCustomerAsync(
         AppDbContext db, string customerName, string customerEmail, string customerMessage,
-        bool cancelOrderToolEnabled = false)
+        bool cancelOrderToolEnabled = false, bool refundToolEnabled = false)
     {
         var business = new Business
         {
@@ -575,6 +575,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             CreatedAt = DateTimeOffset.UtcNow,
             UpdatedAt = DateTimeOffset.UtcNow,
             CancelOrderToolEnabled = cancelOrderToolEnabled,
+            RefundToolEnabled = refundToolEnabled,
         };
         var widget = new Widget
         {
@@ -740,6 +741,55 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
 
         Assert.NotNull(fakeDispatch.LastDisabledToolNames);
         Assert.DoesNotContain(OrderCancelProposalTool.ToolName, fakeDispatch.LastDisabledToolNames!);
+    }
+
+    // ── Step refundOrder Phase 3: Owner Decision 3, Layer 1 (exposure) ──
+    //
+    // Business.RefundToolEnabled is checked here, in GenerateReplyAsync,
+    // identically in shape to CancelOrderToolEnabled immediately above —
+    // an independent, second per-tool flag, not a reuse of
+    // CancelOrderToolEnabled's own check. These two tests assert the
+    // disabledToolNames set FakeToolDispatchService actually received from
+    // the real GenerateReplyAsync code path, proving the gate is computed
+    // correctly in both directions — the same proof shape the existing
+    // CancelOrderToolEnabled pair already establishes for that tool.
+
+    [Fact]
+    public async Task GenerateReplyAsync_RefundToolDisabled_PassesDisabledToolNameToDispatch()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithResolvedCustomerAsync(
+            db, "Test Customer", "test.customer@marker-test.invalid", "Can you refund my order?",
+            refundToolEnabled: false);
+
+        var fakeDispatch = new FakeToolDispatchService();
+        var service = new ClaudeReplyService(
+            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, NullLogger<ClaudeReplyService>.Instance);
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.NotNull(fakeDispatch.LastDisabledToolNames);
+        Assert.Contains(RefundProposalTool.ToolName, fakeDispatch.LastDisabledToolNames!);
+    }
+
+    [Fact]
+    public async Task GenerateReplyAsync_RefundToolEnabled_DoesNotDisableIt()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithResolvedCustomerAsync(
+            db, "Test Customer", "test.customer@marker-test.invalid", "Can you refund my order?",
+            refundToolEnabled: true);
+
+        var fakeDispatch = new FakeToolDispatchService();
+        var service = new ClaudeReplyService(
+            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, NullLogger<ClaudeReplyService>.Instance);
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.NotNull(fakeDispatch.LastDisabledToolNames);
+        Assert.DoesNotContain(RefundProposalTool.ToolName, fakeDispatch.LastDisabledToolNames!);
     }
 
     [LiveClaudeFact]

@@ -298,4 +298,183 @@ public class ToolArgumentCanonicalizerTests
         Assert.Equal(canonical1, canonical2);
         Assert.Equal(canonical2, canonical3);
     }
+
+    // ── Refund args (Step refundOrder Phase 2) ──────────────────────────
+
+    private static (string ExternalLineItemId, int Quantity)[] Items(params (string, int)[] items) => items;
+
+    [Fact]
+    public void CanonicalizeRefundArgs_IsDeterministic()
+    {
+        var canonical1 = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.OriginalPaymentMethod, Items(("gid://shopify/LineItem/1", 2)));
+        var canonical2 = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.OriginalPaymentMethod, Items(("gid://shopify/LineItem/1", 2)));
+
+        Assert.Equal(canonical1, canonical2);
+    }
+
+    [Fact]
+    public void CanonicalizeRefundArgs_ItemOrderShuffled_ProducesIdenticalOutput()
+    {
+        // Design doc §9.1 — "same intent" is the SET of
+        // (ExternalLineItemId, Quantity) pairs, not an ordered list.
+        var inOrder = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.OriginalPaymentMethod,
+            Items(("gid://shopify/LineItem/1", 1), ("gid://shopify/LineItem/2", 2)));
+        var shuffled = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.OriginalPaymentMethod,
+            Items(("gid://shopify/LineItem/2", 2), ("gid://shopify/LineItem/1", 1)));
+
+        Assert.Equal(inOrder, shuffled);
+    }
+
+    [Fact]
+    public void CanonicalizeRefundArgs_DifferentMethod_ProducesDifferentOutput()
+    {
+        var original = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.OriginalPaymentMethod, Items(("gid://shopify/LineItem/1", 1)));
+        var storeCredit = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.StoreCredit, Items(("gid://shopify/LineItem/1", 1)));
+
+        Assert.NotEqual(original, storeCredit);
+    }
+
+    [Fact]
+    public void CanonicalizeRefundArgs_DifferentQuantity_ProducesDifferentOutput()
+    {
+        var one = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.OriginalPaymentMethod, Items(("gid://shopify/LineItem/1", 1)));
+        var two = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.OriginalPaymentMethod, Items(("gid://shopify/LineItem/1", 2)));
+
+        Assert.NotEqual(one, two);
+    }
+
+    [Fact]
+    public void CanonicalizeRefundArgs_DifferentLineItem_ProducesDifferentOutput()
+    {
+        var itemA = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.OriginalPaymentMethod, Items(("gid://shopify/LineItem/1", 1)));
+        var itemB = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.OriginalPaymentMethod, Items(("gid://shopify/LineItem/DIFFERENT", 1)));
+
+        Assert.NotEqual(itemA, itemB);
+    }
+
+    [Fact]
+    public void CanonicalizeRefundArgs_DifferentItemCount_ProducesDifferentOutput()
+    {
+        var oneItem = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.OriginalPaymentMethod, Items(("gid://shopify/LineItem/1", 1)));
+        var twoItems = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.OriginalPaymentMethod,
+            Items(("gid://shopify/LineItem/1", 1), ("gid://shopify/LineItem/2", 1)));
+
+        Assert.NotEqual(oneItem, twoItems);
+    }
+
+    [Fact]
+    public void DecodeRefundArgs_RoundTrips_ItemOrderNormalizedToSorted()
+    {
+        var canonical = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.StoreCredit,
+            Items(("gid://shopify/LineItem/2", 2), ("gid://shopify/LineItem/1", 1)));
+
+        var decoded = ToolArgumentCanonicalizer.DecodeRefundArgs(canonical);
+
+        Assert.Equal(RefundMethod.StoreCredit, decoded.Method);
+        Assert.Equal(2, decoded.Items.Count);
+        // Sorted (ordinal) regardless of the order originally supplied.
+        Assert.Equal("gid://shopify/LineItem/1", decoded.Items[0].ExternalLineItemId);
+        Assert.Equal(1, decoded.Items[0].Quantity);
+        Assert.Equal("gid://shopify/LineItem/2", decoded.Items[1].ExternalLineItemId);
+        Assert.Equal(2, decoded.Items[1].Quantity);
+    }
+
+    [Fact]
+    public void DecodeRefundArgs_SingleItem_RoundTrips()
+    {
+        var canonical = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.OriginalPaymentMethod, Items(("gid://shopify/LineItem/99999", 7)));
+
+        var decoded = ToolArgumentCanonicalizer.DecodeRefundArgs(canonical);
+
+        Assert.Equal(RefundMethod.OriginalPaymentMethod, decoded.Method);
+        var only = Assert.Single(decoded.Items);
+        Assert.Equal("gid://shopify/LineItem/99999", only.ExternalLineItemId);
+        Assert.Equal(7, only.Quantity);
+    }
+
+    [Fact]
+    public void DecodeRefundArgs_EmptyString_ThrowsFormatException()
+    {
+        Assert.Throws<FormatException>(() => ToolArgumentCanonicalizer.DecodeRefundArgs(""));
+    }
+
+    [Fact]
+    public void DecodeRefundArgs_UnrecognizedRefundMethodValue_ThrowsFormatException()
+    {
+        // "Bitcoin" is neither a real RefundMethod member name.
+        var canonical = "7:Bitcoin" + "1:0";
+
+        Assert.Throws<FormatException>(() => ToolArgumentCanonicalizer.DecodeRefundArgs(canonical));
+    }
+
+    [Fact]
+    public void DecodeRefundArgs_OutOfRangeNumericRefundMethodValue_ThrowsFormatException()
+    {
+        // "99" has no corresponding RefundMethod member (only 0 and 1 are defined).
+        var canonical = "2:99" + "1:0";
+
+        Assert.Throws<FormatException>(() => ToolArgumentCanonicalizer.DecodeRefundArgs(canonical));
+    }
+
+    [Fact]
+    public void DecodeRefundArgs_NegativeItemCount_ThrowsFormatException()
+    {
+        // NumberStyles.None rejects a leading '-' — the encoder never writes
+        // one. Method-field length computed, not hardcoded, so this test
+        // stays correct if RefundMethod's member names ever change.
+        var methodField = $"{nameof(RefundMethod.OriginalPaymentMethod).Length}:{RefundMethod.OriginalPaymentMethod}";
+        var canonical = methodField + "2:-1";
+
+        Assert.Throws<FormatException>(() => ToolArgumentCanonicalizer.DecodeRefundArgs(canonical));
+    }
+
+    [Fact]
+    public void DecodeRefundArgs_TruncatedMidField_ThrowsFormatException()
+    {
+        var valid = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.StoreCredit, Items(("gid://shopify/LineItem/1", 3)));
+        var truncated = valid[..(valid.Length - 3)];
+
+        Assert.Throws<FormatException>(() => ToolArgumentCanonicalizer.DecodeRefundArgs(truncated));
+    }
+
+    [Fact]
+    public void DecodeRefundArgs_TrailingGarbage_ThrowsFormatException()
+    {
+        var valid = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.StoreCredit, Items(("gid://shopify/LineItem/1", 3)));
+        var corrupted = valid + "extra";
+
+        Assert.Throws<FormatException>(() => ToolArgumentCanonicalizer.DecodeRefundArgs(corrupted));
+    }
+
+    [Fact]
+    public void DecodeRefundArgs_DeclaredCountExceedsActualItems_ThrowsFormatException()
+    {
+        // Declares 5 items but the string only contains one item's worth of
+        // encoded data after the count field — ReadLengthPrefixedField must
+        // fail closed on the resulting overrun, never return a partial/
+        // best-guess item list.
+        var oneItemCanonical = ToolArgumentCanonicalizer.CanonicalizeRefundArgs(
+            RefundMethod.OriginalPaymentMethod, Items(("gid://shopify/LineItem/1", 1)));
+        var methodField = $"{nameof(RefundMethod.OriginalPaymentMethod).Length}:{RefundMethod.OriginalPaymentMethod}";
+        var itemsPortion = oneItemCanonical[(methodField.Length + "1:1".Length)..];
+        var corrupted = methodField + "1:5" + itemsPortion;
+
+        Assert.Throws<FormatException>(() => ToolArgumentCanonicalizer.DecodeRefundArgs(corrupted));
+    }
 }
