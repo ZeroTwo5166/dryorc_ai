@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using backend.Constants;
 using backend.Data;
 using backend.Enums;
 using backend.Interfaces;
@@ -174,6 +175,14 @@ public class ShopifyRefundExecutorTests : IAsyncLifetime
         Assert.Null(row.CompletedAt);
         Assert.Null(row.ExternalRefundId);
         Assert.Null(row.TotalAmount);
+
+        // A userErrors rejection must never be misclassified as an auth
+        // failure (Decision 7: "existing GraphQL userErrors handling must
+        // remain separate and unchanged").
+        Assert.DoesNotContain(ShopifyFailureReasons.ReauthorizationRequiredPrefix, row.FailureReason);
+        var integration = await db.Integrations.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(i => i.BusinessId == businessId && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName);
+        Assert.Null(integration.ReauthorizationRequiredAt);
     }
 
     [Fact]
@@ -231,9 +240,18 @@ public class ShopifyRefundExecutorTests : IAsyncLifetime
         await Assert.ThrowsAsync<InvalidOperationException>(() => executor.ExecuteAsync(rowId, "key", CancellationToken.None));
     }
 
+    /// <summary>
+    /// Decision 7 explicitly excludes these statuses from auth
+    /// classification (401/403 moved to their own dedicated tests below) —
+    /// every other non-success status keeps the original, unchanged
+    /// uncaught-throw behavior.
+    /// </summary>
     [Theory]
-    [InlineData(HttpStatusCode.Unauthorized)]
+    [InlineData(HttpStatusCode.BadRequest)]
+    [InlineData(HttpStatusCode.NotFound)]
+    [InlineData(HttpStatusCode.TooManyRequests)]
     [InlineData(HttpStatusCode.InternalServerError)]
+    [InlineData(HttpStatusCode.BadGateway)]
     public async Task ExecuteAsync_Throws_OnNonSuccessStatus(HttpStatusCode status)
     {
         await using var scope = _provider.CreateAsyncScope();
@@ -246,6 +264,102 @@ public class ShopifyRefundExecutorTests : IAsyncLifetime
 
         var row = await db.Refunds.IgnoreQueryFilters().AsNoTracking().SingleAsync(x => x.Id == rowId);
         Assert.Equal(RefundStatus.Pending, row.Status);
+
+        var integration = await db.Integrations.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(i => i.BusinessId == businessId && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName);
+        Assert.Null(integration.ReauthorizationRequiredAt);
+    }
+
+    /// <summary>
+    /// Step Shopify-auth-reauth (design §6/§7) — Decision 7 items 1/2: HTTP
+    /// 401/403 are classified as auth failures. Never an uncaught exception,
+    /// never a status quo Pending row — MarkFailedAsync is called with an
+    /// auth-marked FailureReason and Integration.ReauthorizationRequiredAt
+    /// is set, mirroring the existing userErrors branch's own return-normally
+    /// shape.
+    /// </summary>
+    [Theory]
+    [InlineData(HttpStatusCode.Unauthorized)]
+    [InlineData(HttpStatusCode.Forbidden)]
+    public async Task ExecuteAsync_ClassifiesHttp401And403_MarksFailed_WithAuthReason_SetsReauthorizationRequired(HttpStatusCode status)
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (businessId, customerId) = await CreateBusinessWithIntegrationAsync(db, scope.ServiceProvider);
+        var rowId = await CreatePendingRowAsync(scope.ServiceProvider, businessId, customerId);
+
+        var executor = NewExecutor(scope.ServiceProvider, _ => new HttpResponseMessage(status));
+        await executor.ExecuteAsync(rowId, "key", CancellationToken.None);
+
+        var row = await db.Refunds.IgnoreQueryFilters().AsNoTracking().SingleAsync(x => x.Id == rowId);
+        Assert.Equal(RefundStatus.Failed, row.Status);
+        Assert.NotNull(row.FailureReason);
+        Assert.StartsWith(ShopifyFailureReasons.ReauthorizationRequiredPrefix, row.FailureReason);
+        Assert.Contains(((int)status).ToString(), row.FailureReason);
+        Assert.Null(row.CompletedAt);
+        Assert.Null(row.ExternalRefundId);
+
+        var integration = await db.Integrations.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(i => i.BusinessId == businessId && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName);
+        Assert.NotNull(integration.ReauthorizationRequiredAt);
+        Assert.True(integration.IsActive); // Decision 1/2 — never deactivated by an auth failure
+    }
+
+    /// <summary>
+    /// Decision 7 item 3 — any exception from IIntegrationTokenProtector.Unprotect
+    /// is classified identically to the HTTP 401/403 cases above. Corrupts
+    /// the stored EncryptedAccessToken directly (bypassing Protect) so
+    /// Unprotect genuinely throws, never reaching the HTTP call at all.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteAsync_TokenDecryptFailure_MarksFailed_WithAuthReason_SetsReauthorizationRequired()
+    {
+        await using var seedScope = _provider.CreateAsyncScope();
+        var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (businessId, customerId) = await CreateBusinessWithIntegrationAsync(seedDb, seedScope.ServiceProvider);
+        var rowId = await CreatePendingRowAsync(seedScope.ServiceProvider, businessId, customerId);
+
+        // A fresh scope for both the corruption write and the executor
+        // itself — never one that has this Integration already tracked.
+        // ExecuteUpdateAsync bypasses the change tracker on write but does
+        // not invalidate an already-tracked in-memory instance elsewhere,
+        // so reusing seedScope's own `seedDb` for either side would let the
+        // executor's tracked (non-AsNoTracking) read silently see the
+        // stale, uncorrupted value regardless of what actually reached
+        // Postgres. Tampers a validly-protected ciphertext byte-for-byte —
+        // same proven technique as IntegrationTokenProtectorTests.
+        // Unprotect_TamperedCiphertext_ThrowsRatherThanReturningGarbage —
+        // rather than a cross-purpose Protect/Unprotect pair, since this
+        // bare ServiceCollection's AddDataProtection() (no persisted key
+        // ring, unlike NivoraApiFactory's real Program.cs-configured one)
+        // does not reliably enforce purpose separation on its own, but
+        // authenticated-encryption tampering detection holds regardless.
+        await using var execScope = _provider.CreateAsyncScope();
+        var execDb = execScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var execTokenProtector = execScope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
+        var validCiphertext = execTokenProtector.Protect(ShopifyIntegrationOAuthProvider.PlatformName, AccessToken);
+        var tamperedChars = validCiphertext.ToCharArray();
+        var mid = tamperedChars.Length / 2;
+        tamperedChars[mid] = tamperedChars[mid] == 'A' ? 'B' : 'A';
+        var tamperedCiphertext = new string(tamperedChars);
+        await execDb.Integrations
+            .IgnoreQueryFilters()
+            .Where(i => i.BusinessId == businessId)
+            .ExecuteUpdateAsync(s => s.SetProperty(i => i.EncryptedAccessToken, tamperedCiphertext));
+
+        var executor = NewExecutor(execScope.ServiceProvider, _ => throw new InvalidOperationException(
+            "The Shopify HTTP call must not be reached — token decryption should fail first."));
+        await executor.ExecuteAsync(rowId, "key", CancellationToken.None);
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var row = await verifyDb.Refunds.IgnoreQueryFilters().AsNoTracking().SingleAsync(x => x.Id == rowId);
+        Assert.Equal(RefundStatus.Failed, row.Status);
+        Assert.StartsWith(ShopifyFailureReasons.ReauthorizationRequiredPrefix, row.FailureReason);
+
+        var integration = await verifyDb.Integrations.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(i => i.BusinessId == businessId && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName);
+        Assert.NotNull(integration.ReauthorizationRequiredAt);
     }
 
     [Fact]

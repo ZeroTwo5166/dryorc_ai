@@ -244,6 +244,69 @@ public class IntegrationsApiTests : IAsyncLifetime
         Assert.True(rows[0].IsActive);
     }
 
+    /// <summary>
+    /// Step Shopify-auth-reauth (docs/handoffs/step-shopify-auth-reauth-design.md
+    /// §4.2/§12/§14) — a successful reconnect must clear
+    /// Integration.ReauthorizationRequiredAt, exactly like it already clears
+    /// every other credential-related field on this row. Simulates a prior
+    /// auth-classified failure by setting the column directly (the executor
+    /// paths that actually set it are covered independently by
+    /// ShopifyRefundExecutorTests/ShopifyOrderCancellationExecutorTests) —
+    /// this test's own job is only to verify Callback's reconnect branch
+    /// clears it, not to re-derive how it got set.
+    /// </summary>
+    [Fact]
+    public async Task Reconnect_ClearsReauthorizationRequiredAt()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Integration Reauth Clear Business");
+
+        async Task ConnectOnceAsync()
+        {
+            var connectResponse = await ownerClient.SendAsync(WithBody(
+                Authed(HttpMethod.Post, $"/api/integrations/{FakeIntegrationOAuthProvider.PlatformName}/connect", ownerCookie),
+                new ConnectIntegrationRequest("my-shop.example.com")));
+            var state = await ExtractStateAsync(connectResponse);
+            using var noRedirectClient = NewClientNoRedirect();
+            var callbackResponse = await noRedirectClient.SendAsync(
+                Authed(HttpMethod.Get,
+                    $"/api/integrations/{FakeIntegrationOAuthProvider.PlatformName}/callback?code={FakeIntegrationOAuthProvider.ValidCode}&state={Uri.EscapeDataString(state)}",
+                    ownerCookie));
+            Assert.Equal(HttpStatusCode.Redirect, callbackResponse.StatusCode);
+        }
+
+        await ConnectOnceAsync();
+
+        await using (var seedScope = _factory.Services.CreateAsyncScope())
+        {
+            var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            await seedDb.Integrations
+                .IgnoreQueryFilters()
+                .Where(i => i.BusinessId == businessId)
+                .ExecuteUpdateAsync(s => s.SetProperty(i => i.ReauthorizationRequiredAt, DateTimeOffset.UtcNow));
+        }
+
+        await using (var verifyBeforeScope = _factory.Services.CreateAsyncScope())
+        {
+            var verifyBeforeDb = verifyBeforeScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var before = await verifyBeforeDb.Integrations.IgnoreQueryFilters().AsNoTracking()
+                .SingleAsync(i => i.BusinessId == businessId);
+            Assert.NotNull(before.ReauthorizationRequiredAt);
+        }
+
+        await ConnectOnceAsync();
+
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var row = await db.Integrations.IgnoreQueryFilters().AsNoTracking().SingleAsync(i => i.BusinessId == businessId);
+        Assert.True(row.IsActive);
+        Assert.Null(row.ReauthorizationRequiredAt);
+
+        var listResponse = await ownerClient.SendAsync(Authed(HttpMethod.Get, "/api/integrations", ownerCookie));
+        var integrations = await listResponse.Content.ReadFromJsonAsync<List<IntegrationResponse>>();
+        var integration = Assert.Single(integrations!);
+        Assert.Null(integration.ReauthorizationRequiredAt);
+    }
+
     // ── Tenant isolation ────────────────────────────────────────────────
 
     [Fact]

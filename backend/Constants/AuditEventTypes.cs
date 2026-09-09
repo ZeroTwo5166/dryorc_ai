@@ -37,6 +37,30 @@ public static class AuditEventTypes
     // constant's own first real caller, on Pending -> Confirmed.
     public const string RefundFailed = "RefundFailed";
 
+    /// <summary>
+    /// Step Shopify-auth-reauth (docs/handoffs/step-shopify-auth-reauth-design.md
+    /// §8.3) — OrderCancellation's own terminal Failed audit event, deliberately
+    /// scoped to ONLY the auth-classified branch, not every Failed transition
+    /// (the pre-existing, un-audited userErrors-driven Failed path is left
+    /// exactly as under-audited as it is today, per step-43 §15.1's own
+    /// disclosed precedent — not a fix this narrow workstream is chartered to
+    /// make). OrderCancelled (declared above) remains a distinct, unrelated
+    /// success-shaped event never written by this design.
+    /// </summary>
+    public const string OrderCancellationFailed = "OrderCancellationFailed";
+
+    /// <summary>
+    /// Step Shopify-auth-reauth (design §10) — written against
+    /// AuditEntityTypes.Integration whenever a Shopify mutation for that
+    /// integration is classified as an authentication/authorization failure
+    /// (HTTP 401/403) or a token-decryption failure, alongside the write to
+    /// Integration.ReauthorizationRequiredAt. Distinct from
+    /// IntegrationConnected/IntegrationDisconnected below — this event
+    /// records a credential-health observation, never a lifecycle/
+    /// configuration change, and never implies IsActive changed.
+    /// </summary>
+    public const string IntegrationReauthorizationRequired = "IntegrationReauthorizationRequired";
+
     // Verification / authorization
     public const string Level2VerificationSucceeded = "Level2VerificationSucceeded";
     public const string Level2VerificationFailed = "Level2VerificationFailed";

@@ -1,7 +1,9 @@
+using System.Net;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using backend.Constants;
 using backend.Data;
 using backend.Enums;
 using Microsoft.EntityFrameworkCore;
@@ -141,8 +143,15 @@ public class ShopifyRefundExecutor(
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            throw new InvalidOperationException(
-                $"Failed to decrypt the Shopify access token for business {row.BusinessId}.", ex);
+            // Decision 7 item 3, literal inclusion (design §6/§6.1) — ANY
+            // non-cancellation exception from Unprotect is classified as
+            // auth-classified. This repository draws no finer distinction
+            // (this catch was already exception-type-agnostic before this
+            // change; see §6.1's own disclosed, unresolved residual risk of
+            // a transient Data Protection fault being misclassified this
+            // way — accepted, not solved, by the locked decision).
+            await MarkAuthFailureAsync(refundId, row.BusinessId, "Shopify access token decryption failed.", cancellationToken);
+            return;
         }
 
         var shop = integration.ExternalAccountIdentifier;
@@ -173,6 +182,17 @@ public class ShopifyRefundExecutor(
 
         if (!response.IsSuccessStatusCode)
         {
+            // Decision 7 items 1/2 (design §6) — ONLY 401/403 are
+            // auth-classified. Every other non-success status (400, 404,
+            // 429, 5xx, ...) keeps the existing, unchanged uncaught-throw
+            // behavior below — this predicate must not be broadened.
+            if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+            {
+                await MarkAuthFailureAsync(
+                    refundId, row.BusinessId, $"Shopify returned HTTP {(int)response.StatusCode}.", cancellationToken);
+                return;
+            }
+
             throw new InvalidOperationException(
                 $"Shopify refundCreate returned a non-success status ({(int)response.StatusCode}).");
         }
@@ -231,6 +251,40 @@ public class ShopifyRefundExecutor(
         // Pending for a separate reconciliation service to poll.
         await refundService.MarkConfirmedAsync(
             refundId, refund.Id, refund.TotalRefundedSet.PresentmentMoney.Amount, cancellationToken);
+    }
+
+    /// <summary>
+    /// Step Shopify-auth-reauth (design §7) — the only entry point for the
+    /// auth-classified failure path (HTTP 401/403, token-decrypt failure).
+    /// Mirrors the existing userErrors branch's own shape (MarkFailedAsync +
+    /// normal return, no exception) so ExecutionOutcome's closed hierarchy
+    /// needs no change and RefundApprovedActionExecutor's existing
+    /// post-executor-call code (audit + return) runs unmodified. Wraps the
+    /// Refund.Failed transition and the Integration.ReauthorizationRequiredAt
+    /// write in one local transaction (design §11's own recommendation) —
+    /// no Shopify network I/O occurs inside it, matching the atomic-claim
+    /// discipline this codebase already uses elsewhere. Scoped to
+    /// (BusinessId, Platform), never gated on IsActive — a concurrent
+    /// disconnect racing this write is harmless (design §21): the dashboard
+    /// derives "Disconnected" whenever IsActive is false regardless of this
+    /// column's value.
+    /// </summary>
+    private async Task MarkAuthFailureAsync(
+        Guid refundId, Guid businessId, string detail, CancellationToken cancellationToken)
+    {
+        var reason = ShopifyFailureReasons.ReauthorizationRequiredPrefix + detail;
+        var now = DateTimeOffset.UtcNow;
+
+        await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
+
+        await refundService.MarkFailedAsync(refundId, reason, cancellationToken);
+
+        await db.Integrations
+            .IgnoreQueryFilters()
+            .Where(i => i.BusinessId == businessId && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName)
+            .ExecuteUpdateAsync(s => s.SetProperty(i => i.ReauthorizationRequiredAt, now), cancellationToken);
+
+        await tx.CommitAsync(cancellationToken);
     }
 
     private static object[] ToShopifyRefundMethods(RefundMethod method) => method switch

@@ -954,6 +954,9 @@ namespace backend.Migrations
                         .HasMaxLength(32)
                         .HasColumnType("character varying(32)");
 
+                    b.Property<DateTimeOffset?>("ReauthorizationRequiredAt")
+                        .HasColumnType("timestamp with time zone");
+
                     b.PrimitiveCollection<List<string>>("Scopes")
                         .IsRequired()
                         .HasColumnType("text[]");

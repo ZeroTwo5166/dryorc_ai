@@ -1,7 +1,9 @@
+using System.Net;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using backend.Constants;
 using backend.Data;
 using backend.Enums;
 using backend.Models;
@@ -95,8 +97,12 @@ public class ShopifyOrderCancellationExecutor(
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            throw new InvalidOperationException(
-                $"Failed to decrypt the Shopify access token for business {row.BusinessId}.", ex);
+            // Decision 7 item 3, literal inclusion (design §6/§6.1) — ANY
+            // non-cancellation exception from Unprotect is classified as
+            // auth-classified, mirroring ShopifyRefundExecutor's identical
+            // treatment.
+            await MarkAuthFailureAsync(orderCancellationId, row.BusinessId, "Shopify access token decryption failed.", cancellationToken);
+            return;
         }
 
         var shop = integration.ExternalAccountIdentifier;
@@ -123,6 +129,16 @@ public class ShopifyOrderCancellationExecutor(
 
         if (!response.IsSuccessStatusCode)
         {
+            // Decision 7 items 1/2 (design §6) — ONLY 401/403 are
+            // auth-classified. Every other non-success status keeps the
+            // existing, unchanged uncaught-throw behavior below.
+            if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+            {
+                await MarkAuthFailureAsync(
+                    orderCancellationId, row.BusinessId, $"Shopify returned HTTP {(int)response.StatusCode}.", cancellationToken);
+                return;
+            }
+
             throw new InvalidOperationException(
                 $"Shopify orderCancel returned a non-success status ({(int)response.StatusCode}).");
         }
@@ -160,6 +176,32 @@ public class ShopifyOrderCancellationExecutor(
         // Deliberately not marking Confirmed here even if job.done == true;
         // see the class doc comment and OrderCancellation's own doc comment
         // for why only reconciliation performs that transition.
+    }
+
+    /// <summary>
+    /// Step Shopify-auth-reauth (design §8) — mirrors ShopifyRefundExecutor's
+    /// own identical helper (see that class's doc comment for the full
+    /// rationale). This design's own §16 disclosure applies here without
+    /// change: unlike refund, this mutation carries no Shopify idempotency
+    /// key, so this classification narrows the Pending-forever gap without
+    /// altering that separately-disclosed, out-of-scope limitation.
+    /// </summary>
+    private async Task MarkAuthFailureAsync(
+        Guid orderCancellationId, Guid businessId, string detail, CancellationToken cancellationToken)
+    {
+        var reason = ShopifyFailureReasons.ReauthorizationRequiredPrefix + detail;
+        var now = DateTimeOffset.UtcNow;
+
+        await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
+
+        await orderCancellationService.MarkFailedAsync(orderCancellationId, reason, cancellationToken);
+
+        await db.Integrations
+            .IgnoreQueryFilters()
+            .Where(i => i.BusinessId == businessId && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName)
+            .ExecuteUpdateAsync(s => s.SetProperty(i => i.ReauthorizationRequiredAt, now), cancellationToken);
+
+        await tx.CommitAsync(cancellationToken);
     }
 
     private static string ToShopifyReason(OrderCancelReason reason) => reason switch

@@ -667,6 +667,152 @@ public class RefundApprovedActionExecutorTests : IAsyncLifetime
         Assert.Equal(AuditEventTypes.RefundFailed, refundLogs[0].EventType);
     }
 
+    // ── Step Shopify-auth-reauth — auth-classified mutation failure ──────
+
+    /// <summary>
+    /// Step Shopify-auth-reauth (docs/handoffs/step-shopify-auth-reauth-design.md
+    /// §7.4/§10) — an HTTP 401 at the refundCreate mutation boundary must
+    /// transition Refund to Failed with an auth-marked FailureReason (never
+    /// an uncaught exception/bare 500), set Integration.ReauthorizationRequiredAt,
+    /// leave Approval Consumed, and write both the existing RefundFailed
+    /// audit event (now carrying FailureReason) and the new
+    /// IntegrationReauthorizationRequired event.
+    /// </summary>
+    [Fact]
+    public async Task Execute_ShopifyReturns401_ResultsInFailed_WithAuthReason_SetsReauthorizationRequired_AuditsIntegration()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var tokenProtector = scope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
+        var (business, approval, _) = await SeedApprovalAsync(db, tokenProtector);
+        var staffUserId = await CreateStaffUserAsync(db, business.Id);
+        ((MutableTenantAccessor)scope.ServiceProvider.GetRequiredService<ICurrentTenantAccessor>()).CurrentBusinessId = business.Id;
+
+        var executor = await BuildExecutorAsync(
+            scope.ServiceProvider,
+            ownershipResponder: _ => JsonResponse(OrderOwnerResponse(OrderId, "gid://shopify/Customer/999")),
+            preflightResponder: _ => JsonResponse(PreflightResponse(refundableQuantity: 5)),
+            refundCreateResponder: _ => new HttpResponseMessage(System.Net.HttpStatusCode.Unauthorized));
+
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, staffUserId, CancellationToken.None);
+
+        var executed = Assert.IsType<ExecutionOutcome.Executed>(outcome);
+        Assert.Equal(ExecutionResultStatus.Failed, executed.Status);
+        Assert.StartsWith(ShopifyFailureReasons.ReauthorizationRequiredPrefix, executed.Detail);
+        Assert.Contains("401", executed.Detail);
+
+        var refund = await db.Refunds.IgnoreQueryFilters().AsNoTracking().SingleAsync(r => r.Id == executed.ExecutionIntentId);
+        Assert.Equal(RefundStatus.Failed, refund.Status);
+        Assert.StartsWith(ShopifyFailureReasons.ReauthorizationRequiredPrefix, refund.FailureReason);
+        Assert.Null(refund.TotalAmount);
+        Assert.Null(refund.ExternalRefundId);
+
+        var reloadedApproval = await db.Approvals.IgnoreQueryFilters().AsNoTracking().SingleAsync(a => a.Id == approval.Id);
+        Assert.Equal(ApprovalStatus.Consumed, reloadedApproval.Status);
+        Assert.Equal(refund.Id, reloadedApproval.RefundId);
+
+        var integration = await db.Integrations.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(i => i.BusinessId == business.Id && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName);
+        Assert.NotNull(integration.ReauthorizationRequiredAt);
+        Assert.True(integration.IsActive); // Decision 1/2 — auth failure never deactivates the integration
+
+        var refundLogs = await ReadAuditLogsAsync(business.Id, refund.Id, AuditEntityTypes.Refund);
+        var refundLog = Assert.Single(refundLogs);
+        Assert.Equal(AuditEventTypes.RefundFailed, refundLog.EventType);
+        Assert.Contains(ShopifyFailureReasons.ReauthorizationRequiredPrefix, refundLog.NewValue);
+
+        var integrationLogs = await ReadAuditLogsAsync(business.Id, integration.Id, AuditEntityTypes.Integration);
+        var integrationLog = Assert.Single(integrationLogs);
+        Assert.Equal(AuditEventTypes.IntegrationReauthorizationRequired, integrationLog.EventType);
+        Assert.Equal(staffUserId, integrationLog.ChangedByUserId);
+    }
+
+    /// <summary>Mirrors the 401 test above for HTTP 403 (Decision 7 item 2).</summary>
+    [Fact]
+    public async Task Execute_ShopifyReturns403_ResultsInFailed_WithAuthReason_SetsReauthorizationRequired()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var tokenProtector = scope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
+        var (business, approval, _) = await SeedApprovalAsync(db, tokenProtector);
+        var staffUserId = await CreateStaffUserAsync(db, business.Id);
+        ((MutableTenantAccessor)scope.ServiceProvider.GetRequiredService<ICurrentTenantAccessor>()).CurrentBusinessId = business.Id;
+
+        var executor = await BuildExecutorAsync(
+            scope.ServiceProvider,
+            ownershipResponder: _ => JsonResponse(OrderOwnerResponse(OrderId, "gid://shopify/Customer/999")),
+            preflightResponder: _ => JsonResponse(PreflightResponse(refundableQuantity: 5)),
+            refundCreateResponder: _ => new HttpResponseMessage(System.Net.HttpStatusCode.Forbidden));
+
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, staffUserId, CancellationToken.None);
+
+        var executed = Assert.IsType<ExecutionOutcome.Executed>(outcome);
+        Assert.Equal(ExecutionResultStatus.Failed, executed.Status);
+        Assert.StartsWith(ShopifyFailureReasons.ReauthorizationRequiredPrefix, executed.Detail);
+        Assert.Contains("403", executed.Detail);
+
+        var integration = await db.Integrations.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(i => i.BusinessId == business.Id && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName);
+        Assert.NotNull(integration.ReauthorizationRequiredAt);
+    }
+
+    // Token-decrypt-failure classification (Decision 7 item 3) is not
+    // exercised end-to-end at this Approval level: doing so would require
+    // corrupting the Integration's EncryptedAccessToken between the
+    // ownership-lookup step (step 10) and the refundCreate mutation, but
+    // both steps share the same scoped AppDbContext/EF identity map within
+    // one ExecuteApprovedActionAsync call — a genuinely corrupted token
+    // would already fail the earlier ownership lookup (an uncaught,
+    // pre-claim exception, not this design's concern) rather than
+    // selectively fail only at the mutation boundary, so there is no
+    // realistic single-request scenario this level could construct without
+    // an artificial setup that misrepresents production behavior. The
+    // classification itself is independently, directly verified at the
+    // ShopifyRefundExecutor unit level (ExecuteAsync_TokenDecryptFailure_...),
+    // isolated from this confound; the audit/reauthorization-state wiring
+    // this Approval level is responsible for is already proven correct by
+    // the HTTP 401/403 tests above, which exercise the identical
+    // MarkAuthFailureAsync path token-decrypt failure would also reach.
+
+    /// <summary>
+    /// Negative regression: an ordinary Shopify userErrors rejection must
+    /// never be misclassified as an auth failure — no
+    /// ReauthorizationRequiredAt write, no IntegrationReauthorizationRequired
+    /// audit event, and the FailureReason must not carry the auth marker.
+    /// </summary>
+    [Fact]
+    public async Task Execute_ShopifyRejectsMutation_DoesNotSetReauthorizationRequired_DoesNotWriteIntegrationAudit()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var tokenProtector = scope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
+        var (business, approval, _) = await SeedApprovalAsync(db, tokenProtector);
+        var staffUserId = await CreateStaffUserAsync(db, business.Id);
+        ((MutableTenantAccessor)scope.ServiceProvider.GetRequiredService<ICurrentTenantAccessor>()).CurrentBusinessId = business.Id;
+
+        const string rejection =
+            """{ "data": { "refundCreate": { "refund": null, "userErrors": [ { "field": ["refundLineItems"], "message": "Cannot refund more than purchased", "code": "OVER_REFUND" } ] } } }""";
+
+        var executor = await BuildExecutorAsync(
+            scope.ServiceProvider,
+            ownershipResponder: _ => JsonResponse(OrderOwnerResponse(OrderId, "gid://shopify/Customer/999")),
+            preflightResponder: _ => JsonResponse(PreflightResponse(refundableQuantity: 5)),
+            refundCreateResponder: _ => JsonResponse(rejection));
+
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, staffUserId, CancellationToken.None);
+
+        var executed = Assert.IsType<ExecutionOutcome.Executed>(outcome);
+        Assert.Equal(ExecutionResultStatus.Failed, executed.Status);
+        Assert.DoesNotContain(ShopifyFailureReasons.ReauthorizationRequiredPrefix, executed.Detail);
+
+        var integration = await db.Integrations.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(i => i.BusinessId == business.Id && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName);
+        Assert.Null(integration.ReauthorizationRequiredAt);
+
+        var integrationLogs = await ReadAuditLogsAsync(business.Id, integration.Id, AuditEntityTypes.Integration);
+        Assert.Empty(integrationLogs);
+    }
+
     private class MutableTenantAccessor : ICurrentTenantAccessor
     {
         public Guid? CurrentBusinessId { get; set; }

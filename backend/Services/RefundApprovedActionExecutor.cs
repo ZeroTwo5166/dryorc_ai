@@ -372,11 +372,40 @@ public class RefundApprovedActionExecutor(
             finalRow.TotalAmount,
             finalRow.Currency,
             Status = finalRow.Status.ToString(),
+            finalRow.FailureReason,
         });
         await auditLogService.LogAsync(
             approval.BusinessId, AuditEntityTypes.Refund, refundId.ToString(),
             eventType, ActorType.NivoraBusinessStaff,
             changedByUserId: executingStaffUserId, newValue: auditPayload, cancellationToken: cancellationToken);
+
+        // Step Shopify-auth-reauth (design §7.4/§10) — a second, orthogonal
+        // audit event against the Integration entity itself, written only
+        // when this Refund's own Failed transition was caused by the
+        // auth-classified path (ShopifyRefundExecutor's own reason marker),
+        // never for an ordinary Shopify userErrors rejection. Rides the same
+        // SaveChangesAsync call below as the RefundFailed/RefundIssued write
+        // above — no separate transaction needed, both live in the same
+        // tracked AppDbContext in this same method.
+        if (finalRow.Status == RefundStatus.Failed
+            && finalRow.FailureReason is not null
+            && finalRow.FailureReason.StartsWith(ShopifyFailureReasons.ReauthorizationRequiredPrefix, StringComparison.Ordinal))
+        {
+            var integrationId = await db.Integrations
+                .IgnoreQueryFilters()
+                .Where(i => i.BusinessId == approval.BusinessId && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName)
+                .Select(i => i.Id)
+                .FirstOrDefaultAsync(cancellationToken);
+
+            if (integrationId != Guid.Empty)
+            {
+                await auditLogService.LogAsync(
+                    approval.BusinessId, AuditEntityTypes.Integration, integrationId.ToString(),
+                    AuditEventTypes.IntegrationReauthorizationRequired, ActorType.NivoraBusinessStaff,
+                    changedByUserId: executingStaffUserId, cancellationToken: cancellationToken);
+            }
+        }
+
         await db.SaveChangesAsync(cancellationToken);
 
         return new ExecutionOutcome.Executed(

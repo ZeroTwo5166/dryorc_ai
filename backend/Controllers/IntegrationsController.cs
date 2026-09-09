@@ -24,7 +24,8 @@ public record ConnectIntegrationResponse(string AuthorizationUrl);
 /// </summary>
 public record IntegrationResponse(
     Guid Id, string Platform, string? ExternalAccountIdentifier, List<string> Scopes,
-    DateTimeOffset? ScopesUpdatedAt, DateTimeOffset ConnectedAt, DateTimeOffset? DisconnectedAt, bool IsActive);
+    DateTimeOffset? ScopesUpdatedAt, DateTimeOffset ConnectedAt, DateTimeOffset? DisconnectedAt, bool IsActive,
+    DateTimeOffset? ReauthorizationRequiredAt);
 
 /// <summary>
 /// Step 18: the generic OAuth integration framework — connect/callback/
@@ -244,6 +245,14 @@ public class IntegrationsController(
             integration.EncryptedAccessToken = encryptedAccessToken;
             integration.ConnectedAt = now;
             integration.DisconnectedAt = null;
+            // Step Shopify-auth-reauth (design §4.2/§12/§14) — a successful
+            // reconnect is exactly the merchant action that resolves
+            // whatever credential problem was previously classified; clear
+            // it here, in the same overwrite branch as every other
+            // credential-related field on this row. The new-row branch
+            // above needs no equivalent line — a brand-new Integration is
+            // never already flagged.
+            integration.ReauthorizationRequiredAt = null;
             integration.UpdatedAt = now;
         }
 
@@ -332,7 +341,8 @@ public class IntegrationsController(
 
     private static IntegrationResponse ToResponse(Integration integration) => new(
         integration.Id, integration.Platform, integration.ExternalAccountIdentifier, integration.Scopes,
-        integration.ScopesUpdatedAt, integration.ConnectedAt, integration.DisconnectedAt, integration.IsActive);
+        integration.ScopesUpdatedAt, integration.ConnectedAt, integration.DisconnectedAt, integration.IsActive,
+        integration.ReauthorizationRequiredAt);
 
     /// <summary>Deliberately hand-picked, safe fields only — never the
     /// encrypted token columns, per AuditLog.OldValue/NewValue's PII/secret

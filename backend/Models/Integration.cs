@@ -41,5 +41,23 @@ public class Integration : ITenantOwned
     public DateTimeOffset? DisconnectedAt { get; set; }
     public DateTimeOffset? TokenExpiresAt { get; set; }
     public bool IsActive { get; set; } = true;
+
+    /// <summary>
+    /// Step Shopify-auth-reauth (docs/handoffs/step-shopify-auth-reauth-design.md
+    /// §4) — orthogonal to IsActive, never a substitute for it. Null means
+    /// healthy (no known credential problem); non-null is the UTC instant a
+    /// Shopify mutation for this integration was most recently classified as
+    /// an authentication/authorization failure (HTTP 401/403) or a local
+    /// token-decryption failure, per the locked Decision 7 predicate — never
+    /// set from TokenExpiresAt, never set proactively, never set from an
+    /// ordinary GraphQL userErrors rejection. Cleared to null on a successful
+    /// OAuth reconnect (IntegrationsController.Callback) or a subsequent
+    /// confirmed Shopify mutation success for this integration. IsActive
+    /// takes priority over this field wherever both are consulted together:
+    /// a disconnected integration (IsActive == false) is "Disconnected," not
+    /// "Requires Reauthorization," regardless of this value.
+    /// </summary>
+    public DateTimeOffset? ReauthorizationRequiredAt { get; set; }
+
     public DateTimeOffset UpdatedAt { get; set; }
 }

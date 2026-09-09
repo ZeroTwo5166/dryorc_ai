@@ -1,3 +1,4 @@
+using System.Text.Json;
 using backend.Constants;
 using backend.Data;
 using backend.Enums;
@@ -415,6 +416,58 @@ public class OrderCancelApprovedActionExecutor(
             .IgnoreQueryFilters()
             .AsNoTracking()
             .FirstAsync(x => x.Id == orderCancellationId, cancellationToken);
+
+        // Step Shopify-auth-reauth (design §8.3/§10, F1) — deliberately
+        // scoped to ONLY the auth-classified branch (identified via
+        // ShopifyOrderCancellationExecutor's own reason marker), never the
+        // pre-existing userErrors-driven Failed path, which remains exactly
+        // as under-audited as it is today (step-43 §15.1's own disclosed,
+        // deliberate precedent) — not a fix this narrow workstream makes.
+        //
+        // Mandatory F1 detail: this method has NO other SaveChangesAsync
+        // call anywhere after the atomic claim's own transaction (which
+        // already committed and closed above, at the end of the `using`
+        // block starting at step 13, and is untouched by anything below).
+        // IAuditLogService.LogAsync never flushes on its own (see
+        // AuditLogService.LogAsync's own doc comment), so the explicit
+        // SaveChangesAsync call below is required — without it, neither
+        // audit row added in this block is ever persisted. This call exists
+        // solely to flush those two audit-log entities; the terminal Failed
+        // state and Integration.ReauthorizationRequiredAt are already
+        // durably persisted independently, via their own ExecuteUpdateAsync
+        // calls inside ShopifyOrderCancellationExecutor, before this method
+        // ever reaches this point — neither depends on this call.
+        if (finalRow.Status == OrderCancellationStatus.Failed
+            && finalRow.FailureReason is not null
+            && finalRow.FailureReason.StartsWith(ShopifyFailureReasons.ReauthorizationRequiredPrefix, StringComparison.Ordinal))
+        {
+            var cancellationAuditPayload = JsonSerializer.Serialize(new
+            {
+                finalRow.ExternalOrderId,
+                Status = finalRow.Status.ToString(),
+                finalRow.FailureReason,
+            });
+            await auditLogService.LogAsync(
+                approval.BusinessId, AuditEntityTypes.OrderCancellation, orderCancellationId.ToString(),
+                AuditEventTypes.OrderCancellationFailed, ActorType.NivoraBusinessStaff,
+                changedByUserId: executingStaffUserId, newValue: cancellationAuditPayload, cancellationToken: cancellationToken);
+
+            var integrationId = await db.Integrations
+                .IgnoreQueryFilters()
+                .Where(i => i.BusinessId == approval.BusinessId && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName)
+                .Select(i => i.Id)
+                .FirstOrDefaultAsync(cancellationToken);
+
+            if (integrationId != Guid.Empty)
+            {
+                await auditLogService.LogAsync(
+                    approval.BusinessId, AuditEntityTypes.Integration, integrationId.ToString(),
+                    AuditEventTypes.IntegrationReauthorizationRequired, ActorType.NivoraBusinessStaff,
+                    changedByUserId: executingStaffUserId, cancellationToken: cancellationToken);
+            }
+
+            await db.SaveChangesAsync(cancellationToken);
+        }
 
         return finalRow.Status switch
         {

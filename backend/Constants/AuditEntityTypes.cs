@@ -25,4 +25,10 @@ public static class AuditEntityTypes
     /// from Order (a Shopify-side concept) and from Approval (the claim
     /// audit row already uses AuditEntityTypes.Approval).</summary>
     public const string Refund = "Refund";
+
+    /// <summary>Step Shopify-auth-reauth (design §8.3/§10) — the
+    /// OrderCancellation row itself, for its own auth-classified terminal
+    /// Failed audit row. Mirrors Refund above; distinct from Order and
+    /// Approval for the same reasons.</summary>
+    public const string OrderCancellation = "OrderCancellation";
 }

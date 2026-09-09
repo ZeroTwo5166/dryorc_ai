@@ -1,3 +1,4 @@
+using System.Net;
 using backend.Constants;
 using backend.Data;
 using backend.Enums;
@@ -1125,6 +1126,209 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
             .FirstAsync(o => o.Id == executed.ExecutionIntentId);
         Assert.Equal(OrderCancellationStatus.Failed, orderCancellation.Status);
         Assert.Equal("Order already cancelled", orderCancellation.FailureReason);
+    }
+
+    // ── Step Shopify-auth-reauth — auth-classified mutation failure (F1) ──
+
+    /// <summary>
+    /// Step Shopify-auth-reauth (docs/handoffs/step-shopify-auth-reauth-design.md
+    /// §8.3/§10, F1) — the mandatory, independently-verified fix: an
+    /// HTTP 401 at the step 15 mutation boundary must transition
+    /// OrderCancellation to Failed with an auth-marked FailureReason, set
+    /// Integration.ReauthorizationRequiredAt, and — the specific thing two
+    /// independent design-verification passes existed to catch — actually
+    /// PERSIST both new audit-log rows (OrderCancellationFailed against the
+    /// OrderCancellation entity, IntegrationReauthorizationRequired against
+    /// the Integration entity). Reading them back from the database via a
+    /// fresh scope, rather than trusting an in-memory tracked entity, is
+    /// exactly the assertion that would fail if the mandatory new
+    /// db.SaveChangesAsync(cancellationToken) call (design §8.3) were ever
+    /// accidentally removed.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteApprovedActionAsync_MutationHttp401_MarksFailedWithAuthReason_SetsReauthorizationRequired_PersistsBothNewAuditRows()
+    {
+        var tenant = (MutableTenantAccessor)_provider.GetRequiredService<ICurrentTenantAccessor>();
+        const string customerExternalId = "gid://shopify/Customer/AAA";
+
+        await using var seedScope = _provider.CreateAsyncScope();
+        var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var tokenProtector = seedScope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
+        var (business, approval, _) = await SeedApprovalAsync(seedDb, customerExternalId: customerExternalId);
+        await AddIntegrationAsync(seedDb, tokenProtector, business.Id);
+        var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
+
+        tenant.CurrentBusinessId = business.Id;
+        await using var readScope = _provider.CreateAsyncScope();
+        var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var orderLookupService = NewOrderLookupService(
+            readScope.ServiceProvider,
+            SequencedResponses(
+                OrderOwnerResponse(approval.ResourceId, customerExternalId),
+                CancellationStateResponse(approval.ResourceId, null)));
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
+        var orderCancellationExecutor = NewOrderCancellationExecutor(
+            readScope.ServiceProvider, _ => new HttpResponseMessage(HttpStatusCode.Unauthorized));
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            orderCancellationExecutor);
+
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
+
+        var executed = Assert.IsType<ExecutionOutcome.Executed>(outcome);
+        Assert.Equal(ExecutionResultStatus.Failed, executed.Status);
+        Assert.StartsWith(ShopifyFailureReasons.ReauthorizationRequiredPrefix, executed.Detail);
+
+        // Re-read everything from a fresh scope/connection — never trust the
+        // in-memory `readDb` tracked state for the persistence assertions
+        // below, since that would not distinguish "actually flushed to
+        // Postgres" from "merely added to this process's change tracker."
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var orderCancellation = await verifyDb.OrderCancellations.IgnoreQueryFilters().AsNoTracking()
+            .FirstAsync(o => o.Id == executed.ExecutionIntentId);
+        Assert.Equal(OrderCancellationStatus.Failed, orderCancellation.Status);
+        Assert.NotNull(orderCancellation.FailureReason);
+        Assert.StartsWith(ShopifyFailureReasons.ReauthorizationRequiredPrefix, orderCancellation.FailureReason);
+        Assert.Contains("401", orderCancellation.FailureReason);
+
+        var integration = await verifyDb.Integrations.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(i => i.BusinessId == business.Id && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName);
+        Assert.NotNull(integration.ReauthorizationRequiredAt);
+        Assert.True(integration.IsActive); // Decision 1/2 — an auth failure never deactivates the integration
+
+        var cancellationAuditLogs = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .Where(a => a.BusinessId == business.Id
+                && a.EntityType == AuditEntityTypes.OrderCancellation
+                && a.EntityId == orderCancellation.Id.ToString())
+            .ToListAsync();
+        var cancellationLog = Assert.Single(cancellationAuditLogs);
+        Assert.Equal(AuditEventTypes.OrderCancellationFailed, cancellationLog.EventType);
+        Assert.Equal(ActorType.NivoraBusinessStaff, cancellationLog.Actor);
+        Assert.Equal(executingStaffUserId, cancellationLog.ChangedByUserId);
+        Assert.Contains(ShopifyFailureReasons.ReauthorizationRequiredPrefix, cancellationLog.NewValue);
+
+        var integrationAuditLogs = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .Where(a => a.BusinessId == business.Id
+                && a.EntityType == AuditEntityTypes.Integration
+                && a.EntityId == integration.Id.ToString())
+            .ToListAsync();
+        var integrationLog = Assert.Single(integrationAuditLogs);
+        Assert.Equal(AuditEventTypes.IntegrationReauthorizationRequired, integrationLog.EventType);
+        Assert.Equal(ActorType.NivoraBusinessStaff, integrationLog.Actor);
+        Assert.Equal(executingStaffUserId, integrationLog.ChangedByUserId);
+    }
+
+    /// <summary>Mirrors the 401 test above for HTTP 403 (Decision 7 item 2)
+    /// — lighter assertions, since the shared MarkAuthFailureAsync/audit
+    /// mechanism is already fully exercised above.</summary>
+    [Fact]
+    public async Task ExecuteApprovedActionAsync_MutationHttp403_MarksFailedWithAuthReason_SetsReauthorizationRequired()
+    {
+        var tenant = (MutableTenantAccessor)_provider.GetRequiredService<ICurrentTenantAccessor>();
+        const string customerExternalId = "gid://shopify/Customer/AAA";
+
+        await using var seedScope = _provider.CreateAsyncScope();
+        var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var tokenProtector = seedScope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
+        var (business, approval, _) = await SeedApprovalAsync(seedDb, customerExternalId: customerExternalId);
+        await AddIntegrationAsync(seedDb, tokenProtector, business.Id);
+        var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
+
+        tenant.CurrentBusinessId = business.Id;
+        await using var readScope = _provider.CreateAsyncScope();
+        var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var orderLookupService = NewOrderLookupService(
+            readScope.ServiceProvider,
+            SequencedResponses(
+                OrderOwnerResponse(approval.ResourceId, customerExternalId),
+                CancellationStateResponse(approval.ResourceId, null)));
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
+        var orderCancellationExecutor = NewOrderCancellationExecutor(
+            readScope.ServiceProvider, _ => new HttpResponseMessage(HttpStatusCode.Forbidden));
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            orderCancellationExecutor);
+
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
+
+        var executed = Assert.IsType<ExecutionOutcome.Executed>(outcome);
+        Assert.Equal(ExecutionResultStatus.Failed, executed.Status);
+        Assert.StartsWith(ShopifyFailureReasons.ReauthorizationRequiredPrefix, executed.Detail);
+        Assert.Contains("403", executed.Detail);
+
+        var integration = await readDb.Integrations.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(i => i.BusinessId == business.Id && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName);
+        Assert.NotNull(integration.ReauthorizationRequiredAt);
+    }
+
+    /// <summary>
+    /// Negative regression: an ordinary Shopify userErrors rejection (the
+    /// pre-existing, unmodified path) must NEVER be misclassified as an
+    /// auth failure — no ReauthorizationRequiredAt write, no
+    /// OrderCancellationFailed/IntegrationReauthorizationRequired audit
+    /// events, matching design §8.3's explicit narrow-scoping requirement.
+    /// </summary>
+    [Fact]
+    public async Task ExecuteApprovedActionAsync_MutationRejectedByShopify_DoesNotSetReauthorizationRequired_DoesNotWriteNewAuditEvents()
+    {
+        var tenant = (MutableTenantAccessor)_provider.GetRequiredService<ICurrentTenantAccessor>();
+        const string customerExternalId = "gid://shopify/Customer/AAA";
+
+        await using var seedScope = _provider.CreateAsyncScope();
+        var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var tokenProtector = seedScope.ServiceProvider.GetRequiredService<IIntegrationTokenProtector>();
+        var (business, approval, _) = await SeedApprovalAsync(seedDb, customerExternalId: customerExternalId);
+        await AddIntegrationAsync(seedDb, tokenProtector, business.Id);
+        var executingStaffUserId = await CreateStaffUserAsync(seedDb, business.Id);
+
+        tenant.CurrentBusinessId = business.Id;
+        await using var readScope = _provider.CreateAsyncScope();
+        var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditLogService = readScope.ServiceProvider.GetRequiredService<IAuditLogService>();
+        var level2Checker = readScope.ServiceProvider.GetRequiredService<ILevel2VerificationChecker>();
+        var orderLookupService = NewOrderLookupService(
+            readScope.ServiceProvider,
+            SequencedResponses(
+                OrderOwnerResponse(approval.ResourceId, customerExternalId),
+                CancellationStateResponse(approval.ResourceId, null)));
+        var ownershipService = new OrderOwnershipAuthorizationService(readDb);
+        var orderCancellationService = readScope.ServiceProvider.GetRequiredService<IOrderCancellationService>();
+        var orderCancellationExecutor = NewOrderCancellationExecutor(
+            readScope.ServiceProvider, _ => JsonResponse(RejectedMutationResponse));
+        var executor = new OrderCancelApprovedActionExecutor(
+            readDb, auditLogService, level2Checker, orderLookupService, ownershipService, orderCancellationService,
+            orderCancellationExecutor);
+
+        var outcome = await executor.ExecuteApprovedActionAsync(approval.Id, executingStaffUserId, CancellationToken.None);
+
+        var executed = Assert.IsType<ExecutionOutcome.Executed>(outcome);
+        Assert.Equal(ExecutionResultStatus.Failed, executed.Status);
+        Assert.DoesNotContain(ShopifyFailureReasons.ReauthorizationRequiredPrefix, executed.Detail);
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var integration = await verifyDb.Integrations.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(i => i.BusinessId == business.Id && i.Platform == ShopifyIntegrationOAuthProvider.PlatformName);
+        Assert.Null(integration.ReauthorizationRequiredAt);
+
+        var cancellationAuditLogs = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .Where(a => a.BusinessId == business.Id && a.EntityType == AuditEntityTypes.OrderCancellation)
+            .ToListAsync();
+        Assert.Empty(cancellationAuditLogs);
+
+        var integrationAuditLogs = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .Where(a => a.BusinessId == business.Id && a.EntityType == AuditEntityTypes.Integration)
+            .ToListAsync();
+        Assert.Empty(integrationAuditLogs);
     }
 
     /// <summary>
