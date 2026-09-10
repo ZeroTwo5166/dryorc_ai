@@ -217,6 +217,19 @@ public class ClaudeReplyService(
                 disabledToolNames.Add(RefundProposalTool.ToolName);
             }
 
+            // Step getOrder — Business.ShopifyReadToolsEnabled gates getOrder's
+            // own exposure identically. A third, independent per-business
+            // flag scoped to the read-only tool surface, not a reuse of
+            // CancelOrderToolEnabled/RefundToolEnabled (those gate mutation
+            // permission, this gates read permission — conflating them would
+            // let a business that never enabled cancelOrder still implicitly
+            // grant broad Shopify-read access, and vice versa). See
+            // docs/handoffs/step-getorder-implementation-design.md §1.9/§12.
+            if (!business.ShopifyReadToolsEnabled)
+            {
+                disabledToolNames.Add(GetOrderTool.ToolName);
+            }
+
             var outcome = await toolDispatchService.RunAsync(
                 dispatchContext, toolAwareSystemPrompt, messages, disabledToolNames, cancellationToken);
 

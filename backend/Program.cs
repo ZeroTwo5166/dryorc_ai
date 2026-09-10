@@ -197,6 +197,15 @@ builder.Services.AddScoped<IDispatchTool, GetCustomerTool>();
 // live for any business whose flag is false.
 builder.Services.AddScoped<IDispatchTool, OrderCancelProposalTool>();
 
+// Step getOrder — registered unconditionally at the DI level, mirroring
+// GetCustomerTool/OrderCancelProposalTool above. The shared per-business
+// kill switch (Business.ShopifyReadToolsEnabled) is enforced entirely at the
+// tool-exposure layer (ClaudeReplyService, before ToolDispatchService.RunAsync
+// is ever called), not here — registration alone does not make this tool
+// live for any business whose flag is false. See
+// docs/handoffs/step-getorder-implementation-design.md.
+builder.Services.AddScoped<IDispatchTool, GetOrderTool>();
+
 // Step 11: Voyage embeddings for KnowledgeDocument chunking/indexing — same
 // lazy pattern as Anthropic above. Startup must succeed whether or not
 // Voyage:ApiKey is configured; IKnowledgeIndexingService is always

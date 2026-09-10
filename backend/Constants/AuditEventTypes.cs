@@ -98,4 +98,15 @@ public static class AuditEventTypes
     // Extended logging (customer-level flag)
     public const string CustomerExtendedLoggingEnabled = "CustomerExtendedLoggingEnabled";
     public const string CustomerExtendedLoggingDisabled = "CustomerExtendedLoggingDisabled";
+
+    /// <summary>
+    /// Step getOrder (design §5) — written on both a successful getOrder
+    /// tool call and an ownership-refusal, never on the ordinary
+    /// unverified/not-found/ambiguous refusals (§5's own reasoning: those
+    /// are not attempts to access something unauthorized). newValue is
+    /// "Success" or "OwnershipVerificationFailed:{reason}", matching
+    /// OrderCancelApprovedActionExecutor.WriteUnauthorizedExecutionBlockedAsync's
+    /// own ownership-failure marker naming exactly.
+    /// </summary>
+    public const string OrderLookupPerformed = "OrderLookupPerformed";
 }
