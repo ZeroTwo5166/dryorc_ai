@@ -565,7 +565,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
 
     private async Task<(Business Business, Conversation Conversation)> SeedConversationWithResolvedCustomerAsync(
         AppDbContext db, string customerName, string customerEmail, string customerMessage,
-        bool cancelOrderToolEnabled = false, bool refundToolEnabled = false)
+        bool cancelOrderToolEnabled = false, bool refundToolEnabled = false, bool shopifyReadToolsEnabled = false)
     {
         var business = new Business
         {
@@ -576,6 +576,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             UpdatedAt = DateTimeOffset.UtcNow,
             CancelOrderToolEnabled = cancelOrderToolEnabled,
             RefundToolEnabled = refundToolEnabled,
+            ShopifyReadToolsEnabled = shopifyReadToolsEnabled,
         };
         var widget = new Widget
         {
@@ -790,6 +791,55 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
 
         Assert.NotNull(fakeDispatch.LastDisabledToolNames);
         Assert.DoesNotContain(RefundProposalTool.ToolName, fakeDispatch.LastDisabledToolNames!);
+    }
+
+    // ── Step getOrder: per-business Shopify read-tool kill switch ──
+    //
+    // Business.ShopifyReadToolsEnabled is checked here, in GenerateReplyAsync,
+    // identically in shape to CancelOrderToolEnabled/RefundToolEnabled above
+    // — a third, independent per-business flag, not a reuse of either. These
+    // two tests assert the disabledToolNames set FakeToolDispatchService
+    // actually received from the real GenerateReplyAsync code path, proving
+    // the gate is computed correctly in both directions — the same proof
+    // shape the existing CancelOrderToolEnabled/RefundToolEnabled pairs
+    // already establish for those tools.
+
+    [Fact]
+    public async Task GenerateReplyAsync_ShopifyReadToolsDisabled_PassesDisabledToolNameToDispatch()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithResolvedCustomerAsync(
+            db, "Test Customer", "test.customer@marker-test.invalid", "Can you look up my order?",
+            shopifyReadToolsEnabled: false);
+
+        var fakeDispatch = new FakeToolDispatchService();
+        var service = new ClaudeReplyService(
+            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, NullLogger<ClaudeReplyService>.Instance);
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.NotNull(fakeDispatch.LastDisabledToolNames);
+        Assert.Contains(GetOrderTool.ToolName, fakeDispatch.LastDisabledToolNames!);
+    }
+
+    [Fact]
+    public async Task GenerateReplyAsync_ShopifyReadToolsEnabled_DoesNotDisableIt()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithResolvedCustomerAsync(
+            db, "Test Customer", "test.customer@marker-test.invalid", "Can you look up my order?",
+            shopifyReadToolsEnabled: true);
+
+        var fakeDispatch = new FakeToolDispatchService();
+        var service = new ClaudeReplyService(
+            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, NullLogger<ClaudeReplyService>.Instance);
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.NotNull(fakeDispatch.LastDisabledToolNames);
+        Assert.DoesNotContain(GetOrderTool.ToolName, fakeDispatch.LastDisabledToolNames!);
     }
 
     [LiveClaudeFact]
