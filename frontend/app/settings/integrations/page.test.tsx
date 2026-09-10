@@ -72,6 +72,11 @@ const shopifyDisconnected = {
   disconnectedAt: new Date().toISOString(),
 };
 
+const shopifyRequiresReauth = {
+  ...shopifyConnected,
+  reauthorizationRequiredAt: new Date().toISOString(),
+};
+
 function setOwner(cancelOrderToolEnabled = false) {
   authState.user = {
     userId: "u1",
@@ -140,6 +145,81 @@ describe("SettingsIntegrationsPage", () => {
 
     expect(await screen.findByText("Disconnected")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^connect$/i })).toBeInTheDocument();
+  });
+
+  describe("Requires reauthorization", () => {
+    it("shows the orange badge, explanatory copy, a pre-filled reconnect form, and a Disconnect control", async () => {
+      apiState.listIntegrations.mockResolvedValue([shopifyRequiresReauth]);
+      renderPage();
+
+      const badge = await screen.findByText("Requires reauthorization");
+      expect(badge).toHaveClass("bg-orange-soft", "text-orange");
+      expect(badge).not.toHaveClass("bg-accent-soft");
+      expect(badge).not.toHaveClass("bg-destructive-soft");
+
+      expect(
+        screen.getByText(
+          "Shopify needs to be reconnected — your last connection to Shopify stopped working. Reconnect below to restore order lookups and cancellations.",
+        ),
+      ).toBeInTheDocument();
+
+      const input = screen.getByLabelText(/shop name/i) as HTMLInputElement;
+      // The pre-fill happens via a post-commit effect (shopNameSeededRef),
+      // not synchronously with the badge/copy above — must poll rather than
+      // read input.value immediately, or this is flaky under real timing.
+      await waitFor(() => expect(input.value).toBe("example-store"));
+      expect(screen.getByRole("button", { name: /^connect$/i })).toBeInTheDocument();
+      // Reconnecting reuses the same handler/API call as a first-time
+      // connect — no separate "reauthorize" endpoint exists (design doc §2).
+      fireEvent.click(screen.getByRole("button", { name: /^connect$/i }));
+      await waitFor(() =>
+        expect(apiState.connectIntegration).toHaveBeenCalledWith("shopify", { externalAccountIdentifier: "example-store" }),
+      );
+
+      // Disconnect must remain available here, not just in the fully
+      // connected state.
+      expect(screen.getByRole("button", { name: /^disconnect$/i })).toBeInTheDocument();
+    });
+
+    it("does not clobber a merchant's edit to the pre-filled shop name when a later, unrelated re-fetch returns an equivalent-but-new Integration object", async () => {
+      apiState.listIntegrations
+        .mockResolvedValueOnce([shopifyRequiresReauth])
+        .mockResolvedValueOnce([{ ...shopifyRequiresReauth }]);
+      const { rerender } = renderPage();
+
+      const input = (await screen.findByLabelText(/shop name/i)) as HTMLInputElement;
+      await waitFor(() => expect(input.value).toBe("example-store"));
+
+      fireEvent.change(input, { target: { value: "edited-store" } });
+      expect(input.value).toBe("edited-store");
+
+      // Simulate the same kind of unrelated `user`-reference change already
+      // covered below for the cancel-order-tool toggle (e.g. a bfcache/
+      // prerender-driven Me() refresh) — it re-runs the `listIntegrations`
+      // load effect and hands back a *new* object with the same values.
+      // The one-time seed effect must not re-fire and stomp the edit.
+      authState.user = { ...(authState.user as MockUser) };
+      rerender(
+        <ThemeProvider>
+          <SettingsIntegrationsPage />
+        </ThemeProvider>,
+      );
+
+      await waitFor(() => expect(apiState.listIntegrations).toHaveBeenCalledTimes(2));
+      expect(input.value).toBe("edited-store");
+    });
+
+    it("flips straight to disconnected (not requires_reauth) when disconnected from this state", async () => {
+      apiState.listIntegrations.mockResolvedValue([shopifyRequiresReauth]);
+      renderPage();
+
+      await screen.findByText("Requires reauthorization");
+      fireEvent.click(screen.getByRole("button", { name: /^disconnect$/i }));
+
+      await waitFor(() => expect(screen.getByText("Disconnected")).toBeInTheDocument());
+      expect(apiState.disconnectIntegration).toHaveBeenCalledWith("shopify");
+      expect(screen.queryByText("Requires reauthorization")).not.toBeInTheDocument();
+    });
   });
 
   it("rejects an invalid shop name client-side without calling the API", async () => {

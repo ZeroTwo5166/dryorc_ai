@@ -640,6 +640,7 @@ export type Integration = {
   connectedAt: string;
   disconnectedAt: string | null;
   isActive: boolean;
+  reauthorizationRequiredAt: string | null;
 };
 
 export type ConnectIntegrationRequest = {

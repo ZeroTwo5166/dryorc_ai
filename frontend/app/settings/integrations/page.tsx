@@ -41,6 +41,24 @@ const OAUTH_ERROR_COPY: Record<string, string> = {
   conflict: "Another connection attempt for Shopify was already in progress. Please try again.",
 };
 
+// Step shopify-auth-reauth (frontend design doc §3b) — IsActive takes
+// priority over ReauthorizationRequiredAt exactly as the backend design
+// locked it: a disconnected integration is always "disconnected", never
+// "requires_reauth", regardless of what reauthorizationRequiredAt holds.
+type IntegrationStatus = "connected" | "requires_reauth" | "disconnected";
+
+const INTEGRATION_STATUS_BADGE: Record<IntegrationStatus, string> = {
+  connected: "bg-accent-soft text-accent",
+  requires_reauth: "bg-orange-soft text-orange",
+  disconnected: "bg-muted text-muted-foreground",
+};
+
+const INTEGRATION_STATUS_LABEL: Record<IntegrationStatus, string> = {
+  connected: "Connected",
+  requires_reauth: "Requires reauthorization",
+  disconnected: "Disconnected",
+};
+
 // useSearchParams requires a Suspense boundary — same shape as
 // verify-email/page.tsx, the codebase's existing precedent for this.
 export default function SettingsIntegrationsPage() {
@@ -126,6 +144,24 @@ function SettingsIntegrationsContent() {
     };
   }, [user]);
 
+  // Step shopify-auth-reauth (frontend design doc §3d/owner decision #3) —
+  // pre-fills the shop-name input from the existing identifier exactly
+  // once, the first time the loaded integration is found to require
+  // reauthorization. Never re-seeds afterward, same ref-guard idiom as
+  // toolEnabledSeededRef above — a value the merchant has already edited
+  // must never be clobbered by a later render.
+  const shopNameSeededRef = useRef(false);
+  useEffect(() => {
+    if (shopNameSeededRef.current) return;
+    if (shopify?.isActive !== true || shopify.reauthorizationRequiredAt == null || !shopify.externalAccountIdentifier) return;
+    shopNameSeededRef.current = true;
+    // Syncing the input to an external signal (the just-loaded integration
+    // record needing reauthorization) — the legitimate effect case, not the
+    // cascading-render anti-pattern this lint rule otherwise guards against.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setShopName(shopify.externalAccountIdentifier);
+  }, [shopify]);
+
   async function handleConnect(e: FormEvent) {
     e.preventDefault();
     const trimmed = shopName.trim();
@@ -157,8 +193,13 @@ function SettingsIntegrationsContent() {
       await disconnectIntegration(SHOPIFY_PLATFORM);
       // 204 with no body — optimistic local flip, same idiom as
       // handleToggleExtendedLogging (customers/[id]/page.tsx), not a
-      // re-fetch (design doc §9).
-      setShopify((prev) => (prev ? { ...prev, isActive: false, disconnectedAt: new Date().toISOString() } : prev));
+      // re-fetch (design doc §9). reauthorizationRequiredAt is cleared here
+      // too — IsActive takes priority over it everywhere it's read
+      // (integrationStatus above), so its value is inert once disconnected,
+      // but null is the accurate fact regardless.
+      setShopify((prev) =>
+        prev ? { ...prev, isActive: false, disconnectedAt: new Date().toISOString(), reauthorizationRequiredAt: null } : prev,
+      );
     } catch (err) {
       // Leave state as-is — the control remains available to retry.
       setDisconnectError(err instanceof ApiError ? err.message : "Something went wrong. Please try again.");
@@ -196,6 +237,59 @@ function SettingsIntegrationsContent() {
   }
 
   const isConnected = shopify?.isActive === true;
+
+  // Step shopify-auth-reauth (frontend design doc §3b) — drives the badge
+  // and the connection detail panel only. The cancel-order-tool section
+  // below is deliberately left keyed on `isConnected` alone (unchanged).
+  const integrationStatus: IntegrationStatus =
+    shopify?.isActive !== true
+      ? "disconnected"
+      : shopify.reauthorizationRequiredAt != null
+        ? "requires_reauth"
+        : "connected";
+
+  // Shared between the `disconnected` state (first-time connect) and the
+  // `requires_reauth` state (reconnect) — same handler, same API call
+  // (connectIntegration), per design doc §3d. shopName is pre-filled from
+  // the existing identifier only in the requires_reauth case (see the
+  // seeding effect above); this markup itself has no branch on that.
+  function renderConnectForm() {
+    return (
+      <form onSubmit={handleConnect} className="mt-4 border-t border-border pt-4">
+        <label htmlFor="shopName" className="mb-1.5 block text-[13px] font-medium text-foreground">
+          Shop name
+        </label>
+        <div className="flex items-start gap-2">
+          <div className="flex-1">
+            <input
+              id="shopName"
+              type="text"
+              required
+              placeholder="example-store"
+              value={shopName}
+              onChange={(e) => {
+                setShopName(e.target.value);
+                setShopNameError(null);
+              }}
+              className="w-full rounded-xl border border-border bg-card px-3.5 py-2.5 text-sm text-foreground shadow-sm outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-accent focus:ring-2 focus:ring-accent/20"
+            />
+            <p className="mt-1 text-[12.5px] text-muted-foreground/70">
+              The bare shop name from your Shopify admin URL — not the full domain.
+            </p>
+          </div>
+          <button
+            type="submit"
+            disabled={connecting}
+            className="shrink-0 rounded-full bg-primary px-4 py-2.5 text-[13px] font-medium text-primary-foreground shadow-sm transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {connecting ? "Connecting…" : "Connect"}
+          </button>
+        </div>
+        {shopNameError && <p className="mt-2 text-[13px] text-destructive">{shopNameError}</p>}
+        {connectError && <p className="mt-2 text-[13px] text-destructive">{connectError}</p>}
+      </form>
+    );
+  }
 
   return (
     <DashboardShell>
@@ -248,70 +342,45 @@ function SettingsIntegrationsContent() {
                   </div>
                 </div>
                 <span
-                  className={`shrink-0 rounded-full px-2.5 py-1 text-[10.5px] font-semibold uppercase tracking-wider ${
-                    isConnected ? "bg-accent-soft text-accent" : "bg-muted text-muted-foreground"
-                  }`}
+                  className={`shrink-0 rounded-full px-2.5 py-1 text-[10.5px] font-semibold uppercase tracking-wider ${INTEGRATION_STATUS_BADGE[integrationStatus]}`}
                 >
-                  {isConnected ? "Connected" : "Disconnected"}
+                  {INTEGRATION_STATUS_LABEL[integrationStatus]}
                 </span>
               </div>
 
-              {isConnected ? (
-                <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
-                  <div className="min-w-0">
-                    <p className="truncate text-[13px] text-foreground">{shopify?.externalAccountIdentifier}</p>
-                    {shopify?.connectedAt && (
-                      <p className="mt-0.5 text-[12.5px] text-muted-foreground/70">
-                        Connected {formatRelativeTime(shopify.connectedAt)}
-                      </p>
-                    )}
-                    {disconnectError && <p className="mt-2 text-[13px] text-destructive">{disconnectError}</p>}
-                  </div>
-                  {canConnect && (
-                    <button
-                      type="button"
-                      onClick={handleDisconnect}
-                      disabled={disconnecting}
-                      className="shrink-0 rounded-full border border-destructive-soft px-3.5 py-1.5 text-[13px] font-medium text-destructive transition-colors hover:bg-destructive-soft disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {disconnecting ? "Disconnecting…" : "Disconnect"}
-                    </button>
-                  )}
-                </div>
-              ) : canConnect ? (
-                <form onSubmit={handleConnect} className="mt-4 border-t border-border pt-4">
-                  <label htmlFor="shopName" className="mb-1.5 block text-[13px] font-medium text-foreground">
-                    Shop name
-                  </label>
-                  <div className="flex items-start gap-2">
-                    <div className="flex-1">
-                      <input
-                        id="shopName"
-                        type="text"
-                        required
-                        placeholder="example-store"
-                        value={shopName}
-                        onChange={(e) => {
-                          setShopName(e.target.value);
-                          setShopNameError(null);
-                        }}
-                        className="w-full rounded-xl border border-border bg-card px-3.5 py-2.5 text-sm text-foreground shadow-sm outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-accent focus:ring-2 focus:ring-accent/20"
-                      />
-                      <p className="mt-1 text-[12.5px] text-muted-foreground/70">
-                        The bare shop name from your Shopify admin URL — not the full domain.
-                      </p>
+              {integrationStatus !== "disconnected" ? (
+                <>
+                  <div className="mt-4 flex items-center justify-between gap-4 border-t border-border pt-4">
+                    <div className="min-w-0">
+                      <p className="truncate text-[13px] text-foreground">{shopify?.externalAccountIdentifier}</p>
+                      {shopify?.connectedAt && (
+                        <p className="mt-0.5 text-[12.5px] text-muted-foreground/70">
+                          Connected {formatRelativeTime(shopify.connectedAt)}
+                        </p>
+                      )}
+                      {integrationStatus === "requires_reauth" && (
+                        <p className="mt-2 text-[12.5px] text-muted-foreground/70">
+                          Shopify needs to be reconnected — your last connection to Shopify stopped working. Reconnect
+                          below to restore order lookups and cancellations.
+                        </p>
+                      )}
+                      {disconnectError && <p className="mt-2 text-[13px] text-destructive">{disconnectError}</p>}
                     </div>
-                    <button
-                      type="submit"
-                      disabled={connecting}
-                      className="shrink-0 rounded-full bg-primary px-4 py-2.5 text-[13px] font-medium text-primary-foreground shadow-sm transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {connecting ? "Connecting…" : "Connect"}
-                    </button>
+                    {canConnect && (
+                      <button
+                        type="button"
+                        onClick={handleDisconnect}
+                        disabled={disconnecting}
+                        className="shrink-0 rounded-full border border-destructive-soft px-3.5 py-1.5 text-[13px] font-medium text-destructive transition-colors hover:bg-destructive-soft disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {disconnecting ? "Disconnecting…" : "Disconnect"}
+                      </button>
+                    )}
                   </div>
-                  {shopNameError && <p className="mt-2 text-[13px] text-destructive">{shopNameError}</p>}
-                  {connectError && <p className="mt-2 text-[13px] text-destructive">{connectError}</p>}
-                </form>
+                  {integrationStatus === "requires_reauth" && canConnect && renderConnectForm()}
+                </>
+              ) : canConnect ? (
+                renderConnectForm()
               ) : (
                 <p className="mt-4 border-t border-border pt-4 text-[13px] text-muted-foreground">
                   Not connected. An Owner can connect Shopify from this page.
