@@ -444,6 +444,9 @@ namespace backend.Migrations
                     b.Property<int>("RetentionDays")
                         .HasColumnType("integer");
 
+                    b.Property<bool>("ShopifyReadToolsEnabled")
+                        .HasColumnType("boolean");
+
                     b.Property<string>("Status")
                         .IsRequired()
                         .HasMaxLength(32)

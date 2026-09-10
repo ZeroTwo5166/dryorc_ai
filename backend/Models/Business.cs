@@ -71,6 +71,20 @@ public class Business
     /// </summary>
     public bool RefundToolEnabled { get; set; } = false;
 
+    /// <summary>
+    /// Step getOrder (design §0/Decision 1) — one shared, opt-in kill switch
+    /// gating exposure of all four read-only Shopify tools (getOrder,
+    /// getProduct, searchProducts, getInventory) together, not four separate
+    /// flags. Exposure/control-plane only, mirroring CancelOrderToolEnabled's
+    /// own precedent — never a substitute for getOrder's own Level 2/
+    /// ownership checks, which remain mandatory inside GetOrderTool.ExecuteAsync
+    /// regardless of this flag's value. Default false — opt-in, not opt-out.
+    /// Only getOrder is implemented as of this column's introduction; the
+    /// other three tools this flag is scoped for remain unbuilt (separate,
+    /// later passes per the read-only-tools design's own §16 phasing).
+    /// </summary>
+    public bool ShopifyReadToolsEnabled { get; set; } = false;
+
 
     /// <summary>
     /// Maximum refund amount Nivora may execute autonomously (Mode = Auto)
