@@ -329,6 +329,18 @@ builder.Services.AddTransient<IIntegrationOAuthProvider>(sp => sp.GetRequiredSer
 builder.Services.AddHttpClient<ShopifyOrderLookupService>();
 builder.Services.AddTransient<IShopifyOrderLookupService>(sp => sp.GetRequiredService<ShopifyOrderLookupService>());
 builder.Services.AddScoped<IOrderOwnershipAuthorizationService, OrderOwnershipAuthorizationService>();
+
+// Step Group B — getProduct/searchProducts, a new sibling service to
+// ShopifyOrderLookupService above (see docs/handoffs/step-group-b-implementation-design.md
+// §4.4). Same split-registration pattern, for the identical test-override
+// reason. Both tools are registered unconditionally at the DI level,
+// mirroring GetOrderTool above — the shared per-business kill switch
+// (Business.ShopifyReadToolsEnabled, already used by getOrder) is enforced
+// entirely at the tool-exposure layer (ClaudeReplyService), not here.
+builder.Services.AddHttpClient<ShopifyProductLookupService>();
+builder.Services.AddTransient<IShopifyProductLookupService>(sp => sp.GetRequiredService<ShopifyProductLookupService>());
+builder.Services.AddScoped<IDispatchTool, GetProductTool>();
+builder.Services.AddScoped<IDispatchTool, SearchProductsTool>();
 builder.Services.AddScoped<IOrderCancellationService, OrderCancellationService>();
 builder.Services.AddScoped<ICustomerUpdateActionService, CustomerUpdateActionService>();
 

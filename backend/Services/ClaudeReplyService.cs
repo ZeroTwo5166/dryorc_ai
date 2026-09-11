@@ -228,6 +228,8 @@ public class ClaudeReplyService(
             if (!business.ShopifyReadToolsEnabled)
             {
                 disabledToolNames.Add(GetOrderTool.ToolName);
+                disabledToolNames.Add(GetProductTool.ToolName);
+                disabledToolNames.Add(SearchProductsTool.ToolName);
             }
 
             var outcome = await toolDispatchService.RunAsync(
