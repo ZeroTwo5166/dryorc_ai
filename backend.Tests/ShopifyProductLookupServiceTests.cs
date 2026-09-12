@@ -1094,4 +1094,27 @@ public class ShopifyProductLookupServiceTests : IAsyncLifetime
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => service.GetInventoryBySkuAsync(businessId, "ABC-123", CancellationToken.None));
     }
+
+    [Fact]
+    public async Task GetInventoryBySkuAsync_UsesTheRequestedBusinesssOwnIntegration_NotAnotherBusinesss()
+    {
+        var shopA = $"shop-a-{Guid.NewGuid():N}";
+        var shopB = $"shop-b-{Guid.NewGuid():N}";
+        var businessAId = await CreateBusinessWithIntegrationAsync(
+            externalAccountIdentifier: shopA, plaintextAccessTokenOverride: "token-for-business-a");
+        var businessBId = await CreateBusinessWithIntegrationAsync(
+            externalAccountIdentifier: shopB, plaintextAccessTokenOverride: "token-for-business-b");
+
+        await using var scope = _provider.CreateAsyncScope();
+        var handler = new FakeShopifyHttpMessageHandler(_ => JsonResponse("""{ "data": { "productVariants": { "edges": [] } } }"""));
+        var service = NewServiceWithHandler(scope.ServiceProvider, handler);
+
+        await service.GetInventoryBySkuAsync(businessAId, "ABC-123", CancellationToken.None);
+
+        Assert.Equal(
+            $"https://{shopA}.myshopify.com/admin/api/{AdminApiVersion}/graphql.json",
+            handler.LastRequest!.RequestUri!.ToString());
+        Assert.Equal("token-for-business-a", handler.LastRequest.Headers.GetValues("X-Shopify-Access-Token").Single());
+        Assert.NotEqual(businessAId, businessBId);
+    }
 }
