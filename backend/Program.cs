@@ -341,6 +341,15 @@ builder.Services.AddHttpClient<ShopifyProductLookupService>();
 builder.Services.AddTransient<IShopifyProductLookupService>(sp => sp.GetRequiredService<ShopifyProductLookupService>());
 builder.Services.AddScoped<IDispatchTool, GetProductTool>();
 builder.Services.AddScoped<IDispatchTool, SearchProductsTool>();
+
+// Step Group C (getInventory) — registered unconditionally at the DI level,
+// mirroring GetProductTool/SearchProductsTool above. IShopifyProductLookupService
+// is already registered above (this tool reuses it, per Owner Decision 3 —
+// no new service registration needed). The shared per-business kill switch
+// (Business.ShopifyReadToolsEnabled, already used by getOrder/getProduct/
+// searchProducts) is enforced entirely at the tool-exposure layer
+// (ClaudeReplyService), not here.
+builder.Services.AddScoped<IDispatchTool, GetInventoryTool>();
 builder.Services.AddScoped<IOrderCancellationService, OrderCancellationService>();
 builder.Services.AddScoped<ICustomerUpdateActionService, CustomerUpdateActionService>();
 

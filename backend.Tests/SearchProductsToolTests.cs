@@ -276,5 +276,14 @@ public class SearchProductsToolTests : IAsyncLifetime
             SearchProductsCallCount++;
             return Task.FromResult(SearchResultFactory!.Invoke());
         }
+
+        // Step Group C (getInventory) — not exercised by this suite (see
+        // GetInventoryToolTests.cs); implemented only to satisfy the
+        // interface after its extension (Owner Decision 3).
+        public Task<InventoryLookupResult> GetInventoryByGidAsync(Guid businessId, string productGid, CancellationToken cancellationToken) =>
+            throw new NotImplementedException();
+
+        public Task<InventoryLookupResult> GetInventoryBySkuAsync(Guid businessId, string sku, CancellationToken cancellationToken) =>
+            throw new NotImplementedException();
     }
 }

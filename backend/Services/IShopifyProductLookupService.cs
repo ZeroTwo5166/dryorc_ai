@@ -67,6 +67,40 @@ public sealed record ProductLookupResult(ProductLookupOutcome Outcome, ProductSu
 public sealed record ProductSearchResult(IReadOnlyList<ProductSummaryResult> Products);
 
 /// <summary>
+/// Step Group C (getInventory). ProductId/ProductTitle/Sku/Options are
+/// identification fields only, so a formatted reply can say *what* is
+/// in/out of stock — they carry no inventory semantics of their own.
+/// InStock is the ONLY inventory-facing field (locked v1 contract,
+/// implementation design §0.1/§5.1) — sourced directly from
+/// ProductVariant.availableForSale (Owner Decision 1, design §3.5).
+/// Deliberately excluded: numeric quantity, location-level quantities,
+/// low-stock tiers, internal InventoryItem GIDs, any inventory-state name.
+/// </summary>
+public sealed record InventoryAvailabilityResult(
+    string ProductId,
+    string ProductTitle,
+    string? Sku,
+    IReadOnlyList<ProductVariantOptionValue> Options,
+    bool InStock);
+
+/// <summary>
+/// Step Group C (getInventory). Mirrors ProductLookupOutcome's naming
+/// exactly. Ambiguous covers both branches: a SKU matching 2+ variants
+/// (same mechanism as GetProductBySkuAsync, design §4.2), and a Product GID
+/// resolving to a product with 2+ variants (Owner Decision 2, design
+/// §4.3 — a deliberate divergence from GetProductByGidAsync's GID branch,
+/// which never refuses this way and instead resolves a representative
+/// variant; getInventory never does that, since a wrong yes/no
+/// availability claim is worse than a wrong descriptive detail).
+/// </summary>
+public enum InventoryLookupOutcome { Resolved, NotFound, Ambiguous }
+
+/// <summary>
+/// Availability is non-null if and only if Outcome == Resolved.
+/// </summary>
+public sealed record InventoryLookupResult(InventoryLookupOutcome Outcome, InventoryAvailabilityResult? Availability);
+
+/// <summary>
 /// Step Group B. Resolves Shopify catalog data (Product/ProductVariant) via
 /// the Shopify Admin GraphQL API, using Nivora's own authenticated
 /// integration credentials — never a caller-supplied owner identity. New
@@ -120,5 +154,41 @@ public interface IShopifyProductLookupService
     Task<ProductSearchResult> SearchProductsAsync(
         Guid businessId,
         string query,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Step Group C (getInventory) implementation design §4.3/§5.2 — GID
+    /// branch. Queries `product(id:) { variants(first: 2) }`, the same
+    /// exact-count idiom the SKU branch already uses, to detect ambiguity
+    /// without walking a full variant list: 0 variants → NotFound
+    /// (defensive; a real product always has at least one), 1 → Resolved,
+    /// 2+ → Ambiguous (Owner Decision 2 — deliberately never resolves a
+    /// representative variant the way GetProductByGidAsync does). InStock
+    /// is read directly from ProductVariant.availableForSale — no
+    /// InventoryItem/InventoryLevel query, no numeric quantity ever
+    /// fetched (Owner Decision 1). Same throw discipline as
+    /// GetProductByGidAsync: genuine infra failure throws
+    /// InvalidOperationException; 401/403 throws ShopifyAuthFailureException,
+    /// writing Integration.ReauthorizationRequiredAt inline first.
+    /// </summary>
+    Task<InventoryLookupResult> GetInventoryByGidAsync(
+        Guid businessId,
+        string productGid,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Step Group C (getInventory) implementation design §4.2/§5.2 — SKU
+    /// branch. Reuses GetProductBySkuAsync's exact query shape
+    /// (`productVariants(first: 2, query: "sku:...")` + the `.product` hop)
+    /// and identical 0/1/2+ → NotFound/Resolved/Ambiguous mapping — the
+    /// same SKU-uniqueness-is-not-guaranteed problem GetProductBySkuAsync
+    /// already solved, not re-solved differently. InStock is read directly
+    /// from ProductVariant.availableForSale — no InventoryItem/
+    /// InventoryLevel query, no numeric quantity ever fetched (Owner
+    /// Decision 1). Same throw discipline as GetProductBySkuAsync.
+    /// </summary>
+    Task<InventoryLookupResult> GetInventoryBySkuAsync(
+        Guid businessId,
+        string sku,
         CancellationToken cancellationToken);
 }

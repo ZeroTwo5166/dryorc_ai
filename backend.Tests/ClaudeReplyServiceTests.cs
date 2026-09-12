@@ -842,16 +842,16 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         Assert.DoesNotContain(GetOrderTool.ToolName, fakeDispatch.LastDisabledToolNames!);
     }
 
-    // ── Step Group B: getProduct/searchProducts share getOrder's existing
-    // Shopify read-tool kill switch ──
+    // ── Step Group B/C: getProduct/searchProducts/getInventory share
+    // getOrder's existing Shopify read-tool kill switch ──
     //
-    // Business.ShopifyReadToolsEnabled gates all three read-only tools
-    // together — not a new, fourth flag. These two tests assert the
+    // Business.ShopifyReadToolsEnabled gates all four read-only tools
+    // together — not a new, fifth flag. These two tests assert the
     // disabledToolNames set FakeToolDispatchService actually received from
     // the real GenerateReplyAsync code path, proving the gate is computed
-    // correctly in both directions for GetProductTool/SearchProductsTool,
-    // the same proof shape the existing GetOrderTool pair already
-    // establishes for that tool.
+    // correctly in both directions for GetProductTool/SearchProductsTool/
+    // GetInventoryTool, the same proof shape the existing GetOrderTool pair
+    // already establishes for that tool.
 
     [Fact]
     public async Task GenerateReplyAsync_ShopifyReadToolsDisabled_PassesGetProductAndSearchProductsToolNamesToDispatch()
@@ -871,6 +871,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         Assert.NotNull(fakeDispatch.LastDisabledToolNames);
         Assert.Contains(GetProductTool.ToolName, fakeDispatch.LastDisabledToolNames!);
         Assert.Contains(SearchProductsTool.ToolName, fakeDispatch.LastDisabledToolNames!);
+        Assert.Contains(GetInventoryTool.ToolName, fakeDispatch.LastDisabledToolNames!);
     }
 
     [Fact]
@@ -891,6 +892,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         Assert.NotNull(fakeDispatch.LastDisabledToolNames);
         Assert.DoesNotContain(GetProductTool.ToolName, fakeDispatch.LastDisabledToolNames!);
         Assert.DoesNotContain(SearchProductsTool.ToolName, fakeDispatch.LastDisabledToolNames!);
+        Assert.DoesNotContain(GetInventoryTool.ToolName, fakeDispatch.LastDisabledToolNames!);
     }
 
     [LiveClaudeFact]

@@ -230,6 +230,7 @@ public class ClaudeReplyService(
                 disabledToolNames.Add(GetOrderTool.ToolName);
                 disabledToolNames.Add(GetProductTool.ToolName);
                 disabledToolNames.Add(SearchProductsTool.ToolName);
+                disabledToolNames.Add(GetInventoryTool.ToolName);
             }
 
             var outcome = await toolDispatchService.RunAsync(

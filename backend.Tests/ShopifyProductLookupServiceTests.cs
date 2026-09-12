@@ -694,4 +694,404 @@ public class ShopifyProductLookupServiceTests : IAsyncLifetime
     {
         public Guid? BusinessId => businessId;
     }
+
+    // ── GetInventoryByGidAsync (Step Group C — implementation design
+    // §4.3/§5.2, Owner Decision 1/2) ───────────────────────────────────────
+
+    private static string InventoryVariantNodeJson(string sku, bool availableForSale) => $$"""
+        { "sku": "{{sku}}", "availableForSale": {{(availableForSale ? "true" : "false")}},
+          "selectedOptions": [ { "name": "Size", "value": "Medium" } ] }
+        """;
+
+    [Theory]
+    // Three fixture-mapping shapes proving the availableForSale -> InStock
+    // wiring is correct — not that Shopify's real-world behavior in each
+    // named scenario matches (that is the separate, still-open
+    // §3.6 live-verification gate; these tests do not close it).
+    [InlineData(true, "tracked, positive quantity, availableForSale true")]
+    [InlineData(false, "tracked, zero quantity, DENY policy, availableForSale false")]
+    public async Task GetInventoryByGidAsync_MapsAvailableForSaleDirectlyToInStock(bool availableForSale, string _)
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+        const string productId = "gid://shopify/Product/1";
+        var json = $$"""
+            { "data": { "product": { "id": "{{productId}}", "title": "Blue Hoodie",
+              "variants": { "edges": [ { "node": {{InventoryVariantNodeJson("HOODIE-BLU-M", availableForSale)}} } ] } } } }
+            """;
+
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => JsonResponse(json));
+
+        var result = await service.GetInventoryByGidAsync(businessId, productId, CancellationToken.None);
+
+        Assert.Equal(InventoryLookupOutcome.Resolved, result.Outcome);
+        Assert.NotNull(result.Availability);
+        Assert.Equal(productId, result.Availability!.ProductId);
+        Assert.Equal("Blue Hoodie", result.Availability.ProductTitle);
+        Assert.Equal("HOODIE-BLU-M", result.Availability.Sku);
+        Assert.Equal(availableForSale, result.Availability.InStock);
+        Assert.Single(result.Availability.Options);
+        Assert.Contains(result.Availability.Options, o => o.Name == "Size" && o.Value == "Medium");
+    }
+
+    /// <summary>
+    /// The third fixture-mapping shape (Owner Decision 1, design §3.5): a
+    /// tracked, zero-quantity, CONTINUE-policy variant. The fixture directly
+    /// sets availableForSale: true on the fake response — this test proves
+    /// GetInventoryByGidAsync maps that field through unchanged; it is not,
+    /// and does not claim to be, proof that a real Shopify store reports
+    /// availableForSale: true for this exact configuration (§3.6, still
+    /// OPEN — LIVE VERIFICATION REQUIRED).
+    /// </summary>
+    [Fact]
+    public async Task GetInventoryByGidAsync_MapsAvailableForSaleTrue_ForTrackedZeroContinuePolicyFixture()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+        const string productId = "gid://shopify/Product/1";
+        var json = $$"""
+            { "data": { "product": { "id": "{{productId}}", "title": "Backorder Hoodie",
+              "variants": { "edges": [ { "node": {{InventoryVariantNodeJson("HOODIE-BLU-M", availableForSale: true)}} } ] } } } }
+            """;
+
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => JsonResponse(json));
+
+        var result = await service.GetInventoryByGidAsync(businessId, productId, CancellationToken.None);
+
+        Assert.Equal(InventoryLookupOutcome.Resolved, result.Outcome);
+        Assert.True(result.Availability!.InStock);
+    }
+
+    [Fact]
+    public async Task GetInventoryByGidAsync_ReturnsNotFound_WhenProductIsNull()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => JsonResponse("""{ "data": { "product": null } }"""));
+
+        var result = await service.GetInventoryByGidAsync(businessId, "gid://shopify/Product/999", CancellationToken.None);
+
+        Assert.Equal(InventoryLookupOutcome.NotFound, result.Outcome);
+        Assert.Null(result.Availability);
+    }
+
+    [Fact]
+    public async Task GetInventoryByGidAsync_ReturnsNotFound_WhenProductHasNoVariants()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+        var json = """{ "data": { "product": { "id": "gid://shopify/Product/1", "title": "No Variants", "variants": { "edges": [] } } } }""";
+
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => JsonResponse(json));
+
+        var result = await service.GetInventoryByGidAsync(businessId, "gid://shopify/Product/1", CancellationToken.None);
+
+        Assert.Equal(InventoryLookupOutcome.NotFound, result.Outcome);
+        Assert.Null(result.Availability);
+    }
+
+    /// <summary>
+    /// Owner Decision 2 (design §4.3) — the deliberate divergence from
+    /// GetProductByGidAsync: a multi-variant product refuses (Ambiguous)
+    /// rather than silently resolving variants[0], the representative
+    /// variant GetProductByGidAsync would return instead.
+    /// </summary>
+    [Fact]
+    public async Task GetInventoryByGidAsync_ReturnsAmbiguous_WhenProductHasTwoOrMoreVariants()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+        var json = $$"""
+            { "data": { "product": { "id": "gid://shopify/Product/1", "title": "Hoodie", "variants": { "edges": [
+              { "node": {{InventoryVariantNodeJson("HOODIE-BLU-S", true)}} },
+              { "node": {{InventoryVariantNodeJson("HOODIE-BLU-M", false)}} }
+            ] } } } }
+            """;
+
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => JsonResponse(json));
+
+        var result = await service.GetInventoryByGidAsync(businessId, "gid://shopify/Product/1", CancellationToken.None);
+
+        Assert.Equal(InventoryLookupOutcome.Ambiguous, result.Outcome);
+        Assert.Null(result.Availability);
+    }
+
+    [Fact]
+    public async Task GetInventoryByGidAsync_RequestsAtMostTwoVariants_ToDetectAmbiguityWithoutFullPagination()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+        await using var scope = _provider.CreateAsyncScope();
+        string? capturedBody = null;
+        var service = NewService(scope.ServiceProvider, req =>
+        {
+            capturedBody = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            return JsonResponse("""{ "data": { "product": null } }""");
+        });
+
+        await service.GetInventoryByGidAsync(businessId, "gid://shopify/Product/1", CancellationToken.None);
+
+        Assert.Contains("variants(first: 2", capturedBody);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.Unauthorized)]
+    [InlineData(HttpStatusCode.Forbidden)]
+    public async Task GetInventoryByGidAsync_Throws_ShopifyAuthFailureException_AndSetsReauthorizationRequiredAt(HttpStatusCode status)
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => new HttpResponseMessage(status));
+
+        await Assert.ThrowsAsync<ShopifyAuthFailureException>(
+            () => service.GetInventoryByGidAsync(businessId, "gid://shopify/Product/1", CancellationToken.None));
+
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var integration = await db.Integrations.IgnoreQueryFilters().AsNoTracking().SingleAsync(i => i.BusinessId == businessId);
+        Assert.NotNull(integration.ReauthorizationRequiredAt);
+    }
+
+    [Fact]
+    public async Task GetInventoryByGidAsync_Throws_InvalidOperationException_OnOtherNonSuccessStatus()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => new HttpResponseMessage(HttpStatusCode.InternalServerError));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.GetInventoryByGidAsync(businessId, "gid://shopify/Product/1", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GetInventoryByGidAsync_Throws_OnMalformedJson()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => JsonResponse("this is not json"));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.GetInventoryByGidAsync(businessId, "gid://shopify/Product/1", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GetInventoryByGidAsync_Throws_OnGraphQlErrors()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => JsonResponse(
+            """{ "errors": [ { "message": "Field 'product' doesn't exist" } ] }"""));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.GetInventoryByGidAsync(businessId, "gid://shopify/Product/1", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GetInventoryByGidAsync_UsesTheRequestedBusinesssOwnIntegration_NotAnotherBusinesss()
+    {
+        var shopA = $"shop-a-{Guid.NewGuid():N}";
+        var shopB = $"shop-b-{Guid.NewGuid():N}";
+        var businessAId = await CreateBusinessWithIntegrationAsync(
+            externalAccountIdentifier: shopA, plaintextAccessTokenOverride: "token-for-business-a");
+        var businessBId = await CreateBusinessWithIntegrationAsync(
+            externalAccountIdentifier: shopB, plaintextAccessTokenOverride: "token-for-business-b");
+
+        await using var scope = _provider.CreateAsyncScope();
+        var handler = new FakeShopifyHttpMessageHandler(_ => JsonResponse("""{ "data": { "product": null } }"""));
+        var service = NewServiceWithHandler(scope.ServiceProvider, handler);
+
+        await service.GetInventoryByGidAsync(businessAId, "gid://shopify/Product/1", CancellationToken.None);
+
+        Assert.Equal(
+            $"https://{shopA}.myshopify.com/admin/api/{AdminApiVersion}/graphql.json",
+            handler.LastRequest!.RequestUri!.ToString());
+        Assert.Equal("token-for-business-a", handler.LastRequest.Headers.GetValues("X-Shopify-Access-Token").Single());
+        Assert.NotEqual(businessAId, businessBId);
+    }
+
+    // ── GetInventoryBySkuAsync (implementation design §4.2/§5.2) ───────────
+
+    [Fact]
+    public async Task GetInventoryBySkuAsync_ReturnsResolved_OnExactlyOneMatch()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+        var json = """
+            { "data": { "productVariants": { "edges": [
+              { "node": { "sku": "SKU-1", "availableForSale": true,
+                "selectedOptions": [ { "name": "Size", "value": "Large" } ],
+                "product": { "id": "gid://shopify/Product/1", "title": "Red Shirt" } } }
+            ] } } }
+            """;
+
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => JsonResponse(json));
+
+        var result = await service.GetInventoryBySkuAsync(businessId, "SKU-1", CancellationToken.None);
+
+        Assert.Equal(InventoryLookupOutcome.Resolved, result.Outcome);
+        Assert.Equal("gid://shopify/Product/1", result.Availability!.ProductId);
+        Assert.Equal("Red Shirt", result.Availability.ProductTitle);
+        Assert.Equal("SKU-1", result.Availability.Sku);
+        Assert.True(result.Availability.InStock);
+    }
+
+    [Fact]
+    public async Task GetInventoryBySkuAsync_ReturnsNotFound_OnZeroMatches()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => JsonResponse(
+            """{ "data": { "productVariants": { "edges": [] } } }"""));
+
+        var result = await service.GetInventoryBySkuAsync(businessId, "NO-SUCH-SKU", CancellationToken.None);
+
+        Assert.Equal(InventoryLookupOutcome.NotFound, result.Outcome);
+        Assert.Null(result.Availability);
+    }
+
+    /// <summary>
+    /// Mirrors GetProductBySkuAsync_ReturnsAmbiguous_WhenTwoVariantsOfTheSameProductShareASku
+    /// exactly (design §4.2) — same-product SKU collision, same
+    /// productVariants(query:"sku:...") ambiguity-detection mechanism.
+    /// </summary>
+    [Fact]
+    public async Task GetInventoryBySkuAsync_ReturnsAmbiguous_WhenTwoVariantsOfTheSameProductShareASku()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+        const string sameProductId = "gid://shopify/Product/1";
+        var json = $$"""
+            { "data": { "productVariants": { "edges": [
+              { "node": { "sku": "DUP-SKU", "availableForSale": true,
+                "selectedOptions": [ { "name": "Color", "value": "Red" } ],
+                "product": { "id": "{{sameProductId}}", "title": "Shirt" } } },
+              { "node": { "sku": "DUP-SKU", "availableForSale": false,
+                "selectedOptions": [ { "name": "Color", "value": "Blue" } ],
+                "product": { "id": "{{sameProductId}}", "title": "Shirt" } } }
+            ] } } }
+            """;
+
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => JsonResponse(json));
+
+        var result = await service.GetInventoryBySkuAsync(businessId, "DUP-SKU", CancellationToken.None);
+
+        Assert.Equal(InventoryLookupOutcome.Ambiguous, result.Outcome);
+        Assert.Null(result.Availability);
+    }
+
+    /// <summary>
+    /// Mirrors GetProductBySkuAsync_ReturnsAmbiguous_WhenTwoDifferentProductsShareASku
+    /// exactly (design §4.2) — the other ambiguity shape, two different
+    /// products' variants sharing a SKU.
+    /// </summary>
+    [Fact]
+    public async Task GetInventoryBySkuAsync_ReturnsAmbiguous_WhenTwoDifferentProductsShareASku()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+        var json = """
+            { "data": { "productVariants": { "edges": [
+              { "node": { "sku": "DUP-SKU", "availableForSale": true, "selectedOptions": [],
+                "product": { "id": "gid://shopify/Product/1", "title": "Shirt" } } },
+              { "node": { "sku": "DUP-SKU", "availableForSale": true, "selectedOptions": [],
+                "product": { "id": "gid://shopify/Product/2", "title": "Hat" } } }
+            ] } } }
+            """;
+
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => JsonResponse(json));
+
+        var result = await service.GetInventoryBySkuAsync(businessId, "DUP-SKU", CancellationToken.None);
+
+        Assert.Equal(InventoryLookupOutcome.Ambiguous, result.Outcome);
+        Assert.Null(result.Availability);
+    }
+
+    [Fact]
+    public async Task GetInventoryBySkuAsync_SendsTheRawValueUnmodified_PrefixedWithSku()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+        await using var scope = _provider.CreateAsyncScope();
+        string? capturedBody = null;
+        var service = NewService(scope.ServiceProvider, req =>
+        {
+            capturedBody = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            return JsonResponse("""{ "data": { "productVariants": { "edges": [] } } }""");
+        });
+
+        await service.GetInventoryBySkuAsync(businessId, "ABC-123", CancellationToken.None);
+
+        using var json = JsonDocument.Parse(capturedBody!);
+        Assert.Equal("sku:ABC-123", json.RootElement.GetProperty("variables").GetProperty("query").GetString());
+    }
+
+    [Fact]
+    public async Task GetInventoryBySkuAsync_RequestsAtMostTwo_ToDistinguishOneFromMoreThanOne()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+        await using var scope = _provider.CreateAsyncScope();
+        string? capturedBody = null;
+        var service = NewService(scope.ServiceProvider, req =>
+        {
+            capturedBody = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            return JsonResponse("""{ "data": { "productVariants": { "edges": [] } } }""");
+        });
+
+        await service.GetInventoryBySkuAsync(businessId, "ABC-123", CancellationToken.None);
+
+        Assert.Contains("productVariants(first: 2", capturedBody);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.Unauthorized)]
+    [InlineData(HttpStatusCode.Forbidden)]
+    public async Task GetInventoryBySkuAsync_Throws_ShopifyAuthFailureException_AndSetsReauthorizationRequiredAt(HttpStatusCode status)
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => new HttpResponseMessage(status));
+
+        await Assert.ThrowsAsync<ShopifyAuthFailureException>(
+            () => service.GetInventoryBySkuAsync(businessId, "ABC-123", CancellationToken.None));
+
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var integration = await db.Integrations.IgnoreQueryFilters().AsNoTracking().SingleAsync(i => i.BusinessId == businessId);
+        Assert.NotNull(integration.ReauthorizationRequiredAt);
+    }
+
+    [Fact]
+    public async Task GetInventoryBySkuAsync_Throws_InvalidOperationException_OnOtherNonSuccessStatus()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => new HttpResponseMessage(HttpStatusCode.InternalServerError));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.GetInventoryBySkuAsync(businessId, "ABC-123", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GetInventoryBySkuAsync_Throws_OnMalformedJson()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => JsonResponse("this is not json"));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.GetInventoryBySkuAsync(businessId, "ABC-123", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GetInventoryBySkuAsync_Throws_OnGraphQlErrors()
+    {
+        var businessId = await CreateBusinessWithIntegrationAsync();
+        await using var scope = _provider.CreateAsyncScope();
+        var service = NewService(scope.ServiceProvider, _ => JsonResponse(
+            """{ "errors": [ { "message": "Field 'productVariants' doesn't exist" } ] }"""));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.GetInventoryBySkuAsync(businessId, "ABC-123", CancellationToken.None));
+    }
 }
