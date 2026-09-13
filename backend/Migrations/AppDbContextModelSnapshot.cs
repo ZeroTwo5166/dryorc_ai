@@ -580,6 +580,9 @@ namespace backend.Migrations
                     b.Property<DateTimeOffset?>("Level2VerifiedUntil")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<string>("PrimaryTag")
+                        .HasColumnType("text");
+
                     b.Property<string>("Status")
                         .IsRequired()
                         .HasMaxLength(32)

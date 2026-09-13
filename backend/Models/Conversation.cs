@@ -53,6 +53,15 @@ public class Conversation : ITenantOwned
     public List<string> Tags { get; set; } = [];
 
     /// <summary>
+    /// The most specific tag classification currently assigned, if any —
+    /// display/UI concern only. Independent of Tags, which continues to
+    /// hold the complete set (primary included, normalized) and is what
+    /// ConversationModeService's matching actually reads; this column has
+    /// zero effect on mode computation (step-22 design doc §D).
+    /// </summary>
+    public string? PrimaryTag { get; set; }
+
+    /// <summary>
     /// Persisted, monotonically-non-decreasing ratchet over
     /// ConversationModeService.ComputeEffectiveModeAsync's own, unchanged,
     /// per-call result — only ComputeAndRatchetEffectiveModeAsync may ever

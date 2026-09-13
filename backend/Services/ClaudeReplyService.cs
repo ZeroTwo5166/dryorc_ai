@@ -64,6 +64,7 @@ public class ClaudeReplyService(
     IMessageService messageService,
     IKnowledgeRetrievalService retrievalService,
     IToolDispatchService toolDispatchService,
+    IConversationClassificationService classificationService,
     ILogger<ClaudeReplyService> logger) : IClaudeReplyService
 {
     private const int MaxReplyTokens = 1024;
@@ -349,6 +350,31 @@ public class ClaudeReplyService(
         conversation.UpdatedAt = now;
 
         await db.SaveChangesAsync(cancellationToken);
+
+        // Step 22 §A — exactly one classification attempt per successful
+        // reply, regardless of which branch above produced replyText: this
+        // is the single point both branches converge on (each sets
+        // replyText and falls through to this shared tail; neither branch
+        // calls classification itself). Deliberately AFTER the reply is
+        // already committed, using the same messages list that produced
+        // it — mirrors WidgetConversationService.NotifyStaffOfCustomerReplyAsync's
+        // own documented reasoning for its broad try/catch(Exception): a
+        // secondary, already-optional side effect must never be able to
+        // fail an already-succeeded, already-persisted primary result.
+        // ConversationClassificationService.ClassifyAsync already narrowly
+        // catches every expected Claude/HTTP failure internally (logging
+        // its own outcome) — this is defense-in-depth against a genuinely
+        // unexpected exception only.
+        try
+        {
+            await classificationService.ClassifyAsync(businessId, conversationId, messages, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                ex, "Unexpected failure running conversation classification for {ConversationId}; reply already succeeded.",
+                conversationId);
+        }
 
         return new AiReplyResult(aiMessage.Id, replyText, now);
     }

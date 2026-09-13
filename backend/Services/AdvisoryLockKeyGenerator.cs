@@ -105,6 +105,18 @@ public static class AdvisoryLockKeyGenerator
     public static long ForCustomerEmailResolution(Guid businessId, string normalizedEmail) =>
         PackToLong($"{businessId:D}:customer-email:{normalizedEmail}");
 
+    /// <summary>
+    /// Step 22 — scopes a lock to one conversation's Tags/EffectiveMode
+    /// read-modify-write (ConversationModeService.ApplyTagsAndRatchetAsync).
+    /// Every writer participating in this invariant — AI classification and
+    /// staff tag correction alike — must acquire this exact key, not a
+    /// separately-scoped one per writer: a distinct lock per caller would
+    /// technically satisfy "has a lock" while defeating the actual
+    /// serialization guarantee between them (step-22 design doc §C).
+    /// </summary>
+    public static long ForConversationTagState(Guid businessId, Guid conversationId) =>
+        PackToLong($"{businessId:D}:tag-state:{conversationId:D}");
+
     private static long PackToLong(string canonical)
     {
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));

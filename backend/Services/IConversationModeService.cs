@@ -30,4 +30,25 @@ public interface IConversationModeService
     /// unchanged — see step-22 design doc §C.
     /// </summary>
     Task<ConversationMode> ComputeAndRatchetEffectiveModeAsync(Conversation conversation, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Step 22 — the shared, lock-guarded entry point every Tags mutation
+    /// must go through: AI classification (Phase 2) and staff tag
+    /// correction (Phase 3) alike. Opens its own transaction, acquires
+    /// AdvisoryLockKeyGenerator.ForConversationTagState(businessId,
+    /// conversationId), loads the Conversation fresh under that lock (never
+    /// a pre-lock copy — same discipline as ConversationsController.ReturnToAi),
+    /// invokes applyTagChange to mutate Tags/PrimaryTag, calls the unchanged
+    /// ComputeAndRatchetEffectiveModeAsync, then SaveChangesAsync + commits —
+    /// unlike ComputeAndRatchetEffectiveModeAsync itself, this method owns
+    /// and flushes its own transaction, since it also owns the lock that
+    /// transaction holds. Two concurrent callers for the same conversation
+    /// serialize on the DB-level advisory lock; the second one's fresh read
+    /// always observes the first one's already-committed write, so the
+    /// final EffectiveMode is always the Stricter of both computations,
+    /// never a lost update (step-22 design doc §C).
+    /// </summary>
+    Task<ConversationMode> ApplyTagsAndRatchetAsync(
+        Guid businessId, Guid conversationId, Func<Conversation, CancellationToken, Task> applyTagChange,
+        CancellationToken cancellationToken = default);
 }

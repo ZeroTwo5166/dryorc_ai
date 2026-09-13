@@ -659,6 +659,79 @@ public class ConversationModeServiceTests : IAsyncLifetime
         Assert.Equal(ConversationMode.Auto, persisted); // still Auto in the DB — the method never flushed on its own
     }
 
+    // ── Step 22: ApplyTagsAndRatchetAsync — genuine concurrency ──────
+
+    /// <summary>
+    /// Two callers, each on its own DbContext/DB connection (a single
+    /// connection cannot self-block on pg_advisory_xact_lock, so two
+    /// separate scopes are required for real contention — matching this
+    /// fixture's own CreateAsyncScope-per-caller convention elsewhere in
+    /// this file). Genuinely overlapping, not sequential-and-hoping:
+    /// call 1's mutator deliberately blocks on a TaskCompletionSource
+    /// after the lock is already held, call 2 is only started once call 1
+    /// is confirmed to hold the lock, and the test asserts call 2 is still
+    /// incomplete (Assert.False(task2.IsCompleted)) after a real wait —
+    /// direct proof it is blocked on the DB-level lock, not racing freely.
+    /// Only then is call 1 released. The two calls compute two genuinely
+    /// different modes (Assist vs. Manual) so the final assertion — the
+    /// stricter of the two survives regardless of which committed first —
+    /// is a real test of the ratchet under concurrency, not just "neither
+    /// threw."
+    /// </summary>
+    [Fact]
+    public async Task ApplyTagsAndRatchetAsync_TwoGenuinelyOverlappingCalls_SerializeAndPersistTheStricterResult()
+    {
+        await using var scope1 = _provider.CreateAsyncScope();
+        var db1 = scope1.ServiceProvider.GetRequiredService<AppDbContext>();
+        var service1 = scope1.ServiceProvider.GetRequiredService<IConversationModeService>();
+
+        var businessId = await CreateBusinessAsync(db1);
+        var widgetId = await CreateWidgetAsync(db1, businessId);
+        await SeedTagModeMappingAsync(db1, businessId, "shipping", ConversationMode.Assist, isMinimumFloor: false);
+        await SeedTagModeMappingAsync(db1, businessId, "refund", ConversationMode.Manual, isMinimumFloor: false);
+        var conversation = await CreateConversationAsync(
+            db1, businessId, widgetId, [], level2VerifiedUntil: DateTimeOffset.UtcNow.AddHours(1));
+
+        await using var scope2 = _provider.CreateAsyncScope();
+        var service2 = scope2.ServiceProvider.GetRequiredService<IConversationModeService>();
+
+        var call1HoldsLock = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCall1 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var task1 = service1.ApplyTagsAndRatchetAsync(businessId, conversation.Id, async (c, ct) =>
+        {
+            call1HoldsLock.SetResult();
+            await releaseCall1.Task; // holds the transaction (and the lock) open until released below
+            c.Tags = ["shipping"]; // Assist — the weaker of the two outcomes
+        });
+
+        await call1HoldsLock.Task; // wait until call 1 genuinely holds the DB-level lock
+
+        var task2 = service2.ApplyTagsAndRatchetAsync(businessId, conversation.Id, (c, ct) =>
+        {
+            c.Tags = ["refund"]; // Manual — the stricter of the two outcomes
+            return Task.CompletedTask;
+        });
+
+        // Real wait, then a direct assertion that call 2 is still blocked —
+        // not inferred from timing alone, an explicit proof of serialization.
+        await Task.Delay(500);
+        Assert.False(task2.IsCompleted);
+
+        releaseCall1.SetResult();
+        await Task.WhenAll(task1, task2);
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var persisted = await verifyDb.Conversations.IgnoreQueryFilters()
+            .Where(c => c.Id == conversation.Id).Select(c => c.EffectiveMode).SingleAsync();
+
+        // Manual (Stricter(Assist, Manual)) regardless of which of the two
+        // genuinely concurrent calls' write happened to commit last — this
+        // is what a plain unlocked read-modify-write could NOT guarantee.
+        Assert.Equal(ConversationMode.Manual, persisted);
+    }
+
     private class FixedTenantAccessor(Guid? businessId) : ICurrentTenantAccessor
     {
         public Guid? BusinessId => businessId;

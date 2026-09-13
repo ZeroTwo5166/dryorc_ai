@@ -59,6 +59,44 @@ public class ConversationModeService(AppDbContext db) : IConversationModeService
         return conversation.EffectiveMode;
     }
 
+    /// <inheritdoc />
+    public async Task<ConversationMode> ApplyTagsAndRatchetAsync(
+        Guid businessId, Guid conversationId, Func<Conversation, CancellationToken, Task> applyTagChange,
+        CancellationToken cancellationToken = default)
+    {
+        var lockKey = AdvisoryLockKeyGenerator.ForConversationTagState(businessId, conversationId);
+
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+        try
+        {
+            // Blocks until any other transaction holding this exact
+            // (BusinessId, ConversationId) tag-state lock commits or rolls
+            // back — serializing this read-modify-write against every other
+            // caller of this method for the same conversation.
+            await db.Database.ExecuteSqlInterpolatedAsync(
+                $"SELECT pg_advisory_xact_lock({lockKey})", cancellationToken);
+
+            // Fresh read, acquired only after the lock — never a pre-lock
+            // copy, same discipline ConversationsController.ReturnToAi
+            // already established for HandledBy.
+            var conversation = await db.Conversations
+                .IgnoreQueryFilters()
+                .FirstAsync(c => c.Id == conversationId && c.BusinessId == businessId, cancellationToken);
+
+            await applyTagChange(conversation, cancellationToken);
+            var mode = await ComputeAndRatchetEffectiveModeAsync(conversation, cancellationToken);
+
+            await db.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return mode;
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            throw;
+        }
+    }
+
     private async Task<ConversationMode> ComputeBaseModeAsync(
         Guid businessId, List<string> tags, CancellationToken cancellationToken)
     {

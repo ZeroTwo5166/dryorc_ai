@@ -242,6 +242,7 @@ builder.Services.AddScoped<IKnowledgeRetrievalService, KnowledgeRetrievalService
 // PII-allowlist validation; exists only so TagModeMappingsController has
 // something real to call.
 builder.Services.AddScoped<IConversationModeService, ConversationModeService>();
+builder.Services.AddScoped<IConversationClassificationService, ConversationClassificationService>();
 builder.Services.AddScoped<ITicketSlaService, TicketSlaService>();
 builder.Services.AddScoped<IAuditLogService, AuditLogService>();
 
