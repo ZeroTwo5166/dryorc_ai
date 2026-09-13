@@ -289,43 +289,38 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
     /// <summary>
     /// Two genuinely different writers — not two instances of the same
     /// method, unlike Phase 2's concurrency test — contending on the same
-    /// conversation. Deterministic, no wall-clock:
+    /// conversation. Deterministic, no wall-clock for the positive
+    /// (lock-holds) proof. Paused via UpdateCommandPauseInterceptor, which
+    /// fires immediately BEFORE call 1's SaveChangesAsync-issued UPDATE to
+    /// "Conversations" is sent — earlier in the pipeline than a pre-commit
+    /// hook, and deliberately so: by this checkpoint call 1 has already
+    /// executed a real "SELECT pg_advisory_xact_lock(...)" but has NOT yet
+    /// taken Postgres's own row-level lock (that only happens once the
+    /// UPDATE is sent). This removes the row-lock confound an earlier,
+    /// pre-commit-pause version of this test had — see the commit message
+    /// for the investigation that found it, including an empirical
+    /// break-and-restore proving that earlier version's pause point let the
+    /// row lock alone mask a fully-neutered advisory lock, undetected.
     ///
-    /// 1. Call 1 (staff correction) is held open at its own commit point —
-    ///    not inside its mutator (that delegate is internal to
-    ///    ConversationTagCorrectionService, not exposed to callers), but via
-    ///    TransactionCommitGateInterceptor.BeforeCommit, which fires
-    ///    immediately before EF Core commits ANY transaction on that
-    ///    DbContext, regardless of which service/method opened it. This is
-    ///    the "hold one path's lock open under direct test control" the
-    ///    Phase 3 gate asked for — a general mechanism, not something that
-    ///    depends on access to a specific mutator lambda.
-    /// 2. The test awaits call1AtCommitGate (a TaskCompletionSource) before
-    ///    starting call 2 at all — by this point call 1 has genuinely
-    ///    acquired the lock, loaded, mutated, and flushed its UPDATE inside
-    ///    its still-open transaction.
-    /// 3. Call 2 (classification) is given its own LockAcquisitionInterceptor
-    ///    (the same class Phase 2's cleanup introduced, reused verbatim),
-    ///    whose OnBeforeLockAcquisition drives call2AboutToAcquireLock.
-    /// 4. The test awaits that checkpoint, then asserts task2.IsCompleted is
-    ///    still false — deterministic by construction: call 1 provably still
-    ///    holds the lock (releaseCall1 not yet set), so Postgres guarantees
-    ///    call 2's own lock attempt cannot have returned yet.
-    /// 5. Call 1 is released, both calls are awaited.
+    /// task2.IsCompleted, checked immediately after call 2's own
+    /// call2AboutToAcquireLock checkpoint, is kept as a corroborating check
+    /// but is explicitly NOT claimed as an airtight negative proof on its
+    /// own — see its own inline comment and the commit message for why
+    /// (classification has several real DB round trips left after its own
+    /// lock attempt, so "not yet completed" is unsurprising regardless of
+    /// whether the lock is actually blocking anything). A genuine attempt
+    /// was made to replace it with a fully deterministic, DB-state-level
+    /// proof (polling pg_stat_activity.wait_event_type for call 2's own
+    /// backend process) and abandoned after empirical investigation — see
+    /// the commit message for the precise reason (this project's Neon
+    /// connection is pooled, and the pooled-session id Npgsql reports does
+    /// not correspond to any row in pg_stat_activity on the real backend).
     ///
     /// Final assertion proves genuine cross-writer composition, not just
     /// "neither threw": call 1 commits Tags=["shipping"] first (ratchet:
     /// Auto -> Assist); call 2 then genuinely observes that already-committed
-    /// Assist via its own fresh read (not a stale pre-call-1 snapshot) before
-    /// replacing Tags with ["refund"] and computing Stricter(Assist, Manual)
-    /// = Manual. If call 2 had instead raced ahead on a mismatched lock key
-    /// and read the pre-call-1 state, the final mode would be Assist, not
-    /// Manual — see this test's own commit message for the empirical
-    /// break-and-restore confirming exactly that failure mode, performed as
-    /// a manual, uncommitted verification pass (this specific single
-    /// committed run cannot also deterministically force the broken-lock
-    /// ordering — see the commit message for why, honestly, not smoothed
-    /// over).
+    /// Assist via its own fresh read before replacing Tags with ["refund"]
+    /// and computing Stricter(Assist, Manual) = Manual.
     /// </summary>
     [Fact]
     public async Task CorrectTagsAsync_ConcurrentWithClassification_SerializesOnTheSharedLock_RatchetComposesAcrossWriters()
@@ -337,23 +332,26 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
         await SeedTagModeMappingAsync(seedDb, businessId, "refund", ConversationMode.Manual);
         var conversation = await CreateConversationAsync(seedDb, businessId, widgetId, []);
 
-        var call1AtCommitGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var call1BeforeUpdate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseCall1 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var commitGate = new TransactionCommitGateInterceptor
+        var updatePause = new UpdateCommandPauseInterceptor
         {
-            BeforeCommit = async () =>
+            BeforeUpdate = async () =>
             {
-                call1AtCommitGate.TrySetResult();
+                call1BeforeUpdate.TrySetResult();
                 await releaseCall1.Task;
             },
         };
         var lockInterceptor1 = new LockAcquisitionInterceptor();
-        await using var db1 = CreateDbContext(lockInterceptor1, commitGate);
+        await using var db1 = CreateDbContext(lockInterceptor1, updatePause);
         var staffCorrectionService = new ConversationTagCorrectionService(new ConversationModeService(db1));
 
         var task1 = staffCorrectionService.CorrectTagsAsync(businessId, conversation.Id, ["shipping"]);
 
-        await call1AtCommitGate.Task; // deterministic — call 1 has flushed its write and is paused right before commit
+        // Deterministic — call 1 has genuinely acquired the real advisory
+        // lock and read the conversation, and is paused strictly before its
+        // own UPDATE is sent (so no row lock exists for it yet).
+        await call1BeforeUpdate.Task;
 
         var lockInterceptor2 = new LockAcquisitionInterceptor();
         var call2AboutToAcquireLock = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -368,9 +366,18 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
 
         await call2AboutToAcquireLock.Task; // deterministic — call 2 has genuinely reached its own lock attempt
 
-        // Deterministic by construction, not by luck: call 1 still holds
-        // the lock (releaseCall1 not yet set), so Postgres itself
-        // guarantees task2 cannot have completed yet.
+        // NOTE — this check is a known-imperfect corroborating signal, not a
+        // proven, airtight guarantee: see this test's own commit message.
+        // "Not yet completed" is expected here regardless of whether the
+        // lock actually blocks anything, since classification has several
+        // real DB round trips left after its own lock attempt. It is kept
+        // because it holds unconditionally when the lock genuinely blocks,
+        // and removing it would prove less than keeping it, not because it
+        // is, on its own, a reliable negative proof of the advisory lock's
+        // specific contribution. A pg_stat_activity-based attempt at a
+        // stronger, DB-state-level proof was made and abandoned — see the
+        // commit message for why it doesn't work against this specific
+        // Neon (pooled) connection.
         Assert.False(task2.IsCompleted);
 
         releaseCall1.SetResult();
@@ -383,6 +390,7 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
         await using var verifyScope = _provider.CreateAsyncScope();
         var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var persisted = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        Console.WriteLine($"DEBUG persisted: Tags=[{string.Join(",", persisted.Tags)}] EffectiveMode={persisted.EffectiveMode}");
 
         Assert.Equal(["refund"], persisted.Tags); // call 2 (classification) committed last — its own replace wins for Tags
         Assert.Equal(ConversationMode.Manual, persisted.EffectiveMode); // Stricter(Assist [call 1's committed value], Manual) — genuine cross-writer composition
