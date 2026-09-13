@@ -662,28 +662,65 @@ public class ConversationModeServiceTests : IAsyncLifetime
     // ── Step 22: ApplyTagsAndRatchetAsync — genuine concurrency ──────
 
     /// <summary>
+    /// Builds a standalone AppDbContext (bypassing the shared fixture's
+    /// single registration) with a LockAcquisitionInterceptor attached —
+    /// needed only by tests that must observe the real
+    /// pg_advisory_xact_lock command as it's actually sent. Zero production
+    /// configuration is touched; this is a test-only DbContextOptions.
+    /// </summary>
+    private static AppDbContext CreateDbContextWithLockInterceptor(LockAcquisitionInterceptor interceptor)
+    {
+        var configuration = new ConfigurationBuilder().AddUserSecrets<Program>().Build();
+        var connectionUri = configuration.GetConnectionString("DefaultConnection")
+            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
+
+        var options = new DbContextOptionsBuilder<AppDbContext>()
+            .UseNpgsql(PostgresConnectionString.FromUri(connectionUri), x => x.UseVector())
+            .AddInterceptors(interceptor)
+            .Options;
+
+        return new AppDbContext(options, new FixedTenantAccessor(null));
+    }
+
+    /// <summary>
     /// Two callers, each on its own DbContext/DB connection (a single
     /// connection cannot self-block on pg_advisory_xact_lock, so two
-    /// separate scopes are required for real contention — matching this
-    /// fixture's own CreateAsyncScope-per-caller convention elsewhere in
-    /// this file). Genuinely overlapping, not sequential-and-hoping:
-    /// call 1's mutator deliberately blocks on a TaskCompletionSource
-    /// after the lock is already held, call 2 is only started once call 1
-    /// is confirmed to hold the lock, and the test asserts call 2 is still
-    /// incomplete (Assert.False(task2.IsCompleted)) after a real wait —
-    /// direct proof it is blocked on the DB-level lock, not racing freely.
-    /// Only then is call 1 released. The two calls compute two genuinely
-    /// different modes (Assist vs. Manual) so the final assertion — the
-    /// stricter of the two survives regardless of which committed first —
-    /// is a real test of the ratchet under concurrency, not just "neither
-    /// threw."
+    /// separate connections are required for real contention). Genuinely
+    /// overlapping, and — unlike an earlier version of this test — proven
+    /// via application-state signals throughout, never wall-clock time:
+    ///
+    /// 1. Call 1's mutator signals call1HoldsLock only once it is actually
+    ///    running inside the acquired lock, then blocks on releaseCall1.
+    /// 2. The test awaits call1HoldsLock (a TaskCompletionSource, not a
+    ///    timer) before starting call 2 at all.
+    /// 3. Call 2 is given its own LockAcquisitionInterceptor, whose
+    ///    OnBeforeLockAcquisition fires synchronously, driven by EF Core
+    ///    actually sending the pg_advisory_xact_lock command — not a
+    ///    timer — the instant call 2 genuinely attempts the lock.
+    /// 4. The test awaits that firing (call2AboutToAcquireLock), then
+    ///    immediately asserts task2.IsCompleted is still false. This is
+    ///    deterministic, not probabilistic: call 1 provably still holds
+    ///    the lock at this point (releaseCall1 has not been set), and
+    ///    Postgres guarantees pg_advisory_xact_lock cannot return to call 2
+    ///    while call 1's transaction holds it — so task2 physically cannot
+    ///    have completed, regardless of scheduling or network speed. This
+    ///    replaces an earlier version of this test that used
+    ///    Task.Delay(500) before the same check — confirmed non-load-bearing
+    ///    (see this test's own history: it passed even with the lock
+    ///    removed, because it was measuring elapsed time, not contention).
+    /// 5. Only then is call 1 released; both calls are awaited.
+    ///
+    /// The two calls compute two genuinely different modes (Assist vs.
+    /// Manual) so the final assertion — the stricter of the two survives
+    /// regardless of which committed first — is a real test of the ratchet
+    /// under concurrency, not just "neither threw."
     /// </summary>
     [Fact]
     public async Task ApplyTagsAndRatchetAsync_TwoGenuinelyOverlappingCalls_SerializeAndPersistTheStricterResult()
     {
-        await using var scope1 = _provider.CreateAsyncScope();
-        var db1 = scope1.ServiceProvider.GetRequiredService<AppDbContext>();
-        var service1 = scope1.ServiceProvider.GetRequiredService<IConversationModeService>();
+        var interceptor1 = new LockAcquisitionInterceptor();
+        await using var db1 = CreateDbContextWithLockInterceptor(interceptor1);
+        var service1 = new ConversationModeService(db1);
 
         var businessId = await CreateBusinessAsync(db1);
         var widgetId = await CreateWidgetAsync(db1, businessId);
@@ -692,20 +729,23 @@ public class ConversationModeServiceTests : IAsyncLifetime
         var conversation = await CreateConversationAsync(
             db1, businessId, widgetId, [], level2VerifiedUntil: DateTimeOffset.UtcNow.AddHours(1));
 
-        await using var scope2 = _provider.CreateAsyncScope();
-        var service2 = scope2.ServiceProvider.GetRequiredService<IConversationModeService>();
+        var interceptor2 = new LockAcquisitionInterceptor();
+        await using var db2 = CreateDbContextWithLockInterceptor(interceptor2);
+        var service2 = new ConversationModeService(db2);
 
         var call1HoldsLock = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseCall1 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var call2AboutToAcquireLock = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        interceptor2.OnBeforeLockAcquisition = _ => call2AboutToAcquireLock.TrySetResult();
 
         var task1 = service1.ApplyTagsAndRatchetAsync(businessId, conversation.Id, async (c, ct) =>
         {
-            call1HoldsLock.SetResult();
+            call1HoldsLock.SetResult(); // fires only once genuinely inside the acquired lock
             await releaseCall1.Task; // holds the transaction (and the lock) open until released below
             c.Tags = ["shipping"]; // Assist — the weaker of the two outcomes
         });
 
-        await call1HoldsLock.Task; // wait until call 1 genuinely holds the DB-level lock
+        await call1HoldsLock.Task; // deterministic — wait until call 1 genuinely holds the DB-level lock
 
         var task2 = service2.ApplyTagsAndRatchetAsync(businessId, conversation.Id, (c, ct) =>
         {
@@ -713,9 +753,12 @@ public class ConversationModeServiceTests : IAsyncLifetime
             return Task.CompletedTask;
         });
 
-        // Real wait, then a direct assertion that call 2 is still blocked —
-        // not inferred from timing alone, an explicit proof of serialization.
-        await Task.Delay(500);
+        await call2AboutToAcquireLock.Task; // deterministic — call 2 has genuinely reached the lock attempt
+
+        // Deterministic by construction, not by luck: call 1 still holds
+        // the lock (releaseCall1 not yet set), so Postgres itself
+        // guarantees task2 cannot have completed yet — no sleep, no
+        // elapsed-time assumption.
         Assert.False(task2.IsCompleted);
 
         releaseCall1.SetResult();
@@ -730,6 +773,8 @@ public class ConversationModeServiceTests : IAsyncLifetime
         // genuinely concurrent calls' write happened to commit last — this
         // is what a plain unlocked read-modify-write could NOT guarantee.
         Assert.Equal(ConversationMode.Manual, persisted);
+
+        _businessIdsToClean.Add(businessId); // db1/db2 are standalone, not the shared fixture — register for cleanup
     }
 
     private class FixedTenantAccessor(Guid? businessId) : ICurrentTenantAccessor
