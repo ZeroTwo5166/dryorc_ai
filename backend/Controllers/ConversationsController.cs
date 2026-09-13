@@ -426,7 +426,7 @@ public class ConversationsController(
             return NotFound();
         }
 
-        await tagCorrectionService.CorrectTagsAsync(conversation.BusinessId, conversation.Id, request.Tags ?? []);
+        await tagCorrectionService.CorrectTagsAsync(conversation.BusinessId, conversation.Id, request.Tags ?? [], CurrentUserId);
 
         await db.Entry(conversation).ReloadAsync();
 

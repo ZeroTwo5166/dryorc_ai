@@ -80,6 +80,16 @@ public static class AuditEventTypes
 
     // Conversation / ticket
     public const string ConversationModeOverridden = "ConversationModeOverridden";
+
+    /// <summary>
+    /// Step 22 Phase 3 — written by ConversationTagCorrectionService on every
+    /// successful staff correction of Conversation.Tags, in the same
+    /// transaction as the Tags mutation and the
+    /// ComputeAndRatchetEffectiveModeAsync call it triggers. Same category as
+    /// TagModeMappingChanged/ApprovalApproved/ApprovalDenied — a write path
+    /// that directly feeds AI-autonomy mode computation.
+    /// </summary>
+    public const string ConversationTagsCorrected = "ConversationTagsCorrected";
     public const string TicketReopened = "TicketReopened";
     public const string TicketCreated = "TicketCreated";
     public const string TicketClaimed = "TicketClaimed";

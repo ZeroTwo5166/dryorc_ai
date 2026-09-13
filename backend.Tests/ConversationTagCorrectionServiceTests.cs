@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Anthropic.Models.Messages;
+using backend.Constants;
 using backend.Data;
 using backend.Enums;
 using backend.Interfaces;
@@ -26,6 +27,7 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
 {
     private ServiceProvider _provider = null!;
     private readonly List<Guid> _businessIdsToClean = [];
+    private readonly List<Guid> _userIdsToClean = [];
     private string _connectionUri = null!;
 
     public Task InitializeAsync()
@@ -38,6 +40,7 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(PostgresConnectionString.FromUri(_connectionUri), x => x.UseVector()))
             .AddScoped<IConversationModeService, ConversationModeService>()
+            .AddScoped<IAuditLogService, AuditLogService>()
             .AddScoped<IConversationTagCorrectionService, ConversationTagCorrectionService>()
             .BuildServiceProvider();
 
@@ -51,7 +54,15 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
             await using var scope = _provider.CreateAsyncScope();
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
             var ids = _businessIdsToClean.ToArray();
+            var userIds = _userIdsToClean.ToArray();
 
+            // AuditLog.BusinessId and ApplicationUser.BusinessId are both
+            // Restrict-on-delete against Business — must go first.
+            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AuditLogs\" WHERE \"BusinessId\" = ANY({ids})");
+            if (userIds.Length > 0)
+            {
+                await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AspNetUsers\" WHERE \"Id\" = ANY({userIds})");
+            }
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Widgets\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"TagModeMappings\" WHERE \"BusinessId\" = ANY({ids})");
@@ -129,6 +140,23 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
         return conversation;
     }
 
+    private async Task<Guid> CreateStaffUserAsync(AppDbContext db, Guid businessId)
+    {
+        var user = new ApplicationUser
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            UserName = $"staff-{Guid.NewGuid():N}@marker-test.invalid",
+            Email = $"staff-{Guid.NewGuid():N}@marker-test.invalid",
+            EmailConfirmed = true,
+            CreatedAt = DateTimeOffset.UtcNow,
+        };
+        db.Users.Add(user);
+        await db.SaveChangesAsync();
+        _userIdsToClean.Add(user.Id);
+        return user.Id;
+    }
+
     private static async Task SeedTagModeMappingAsync(AppDbContext db, Guid businessId, string tag, ConversationMode mode)
     {
         db.TagModeMappings.Add(new TagModeMapping
@@ -192,8 +220,9 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
         var conversation = await CreateConversationAsync(db, businessId, widgetId, ["shipping"]);
         conversation.PrimaryTag = "shipping";
         await db.SaveChangesAsync();
+        var staffUserId = await CreateStaffUserAsync(db, businessId);
 
-        await service.CorrectTagsAsync(businessId, conversation.Id, ["  Refund  "]); // deliberately unnormalized input
+        await service.CorrectTagsAsync(businessId, conversation.Id, ["  Refund  "], staffUserId); // deliberately unnormalized input
 
         var persisted = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
         Assert.Equal(["refund"], persisted.Tags); // normalized, replaced (shipping gone)
@@ -224,14 +253,63 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
         });
         var afterClassification = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
         Assert.Equal(ConversationMode.Manual, afterClassification.EffectiveMode); // sanity: legitimately reached Manual
+        var staffUserId = await CreateStaffUserAsync(db, businessId);
 
         // Staff removes the "refund" tag entirely — recomputed alone, this
         // would be Auto (no tags => Auto, per ComputeBaseModeAsync).
-        await tagService.CorrectTagsAsync(businessId, conversation.Id, []);
+        await tagService.CorrectTagsAsync(businessId, conversation.Id, [], staffUserId);
 
         var afterCorrection = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
         Assert.Empty(afterCorrection.Tags); // the removal itself took effect
         Assert.Equal(ConversationMode.Manual, afterCorrection.EffectiveMode); // but the ratchet held — no downgrade
+    }
+
+    // ── Audit trail: one AuditLog row per successful correction ──────
+
+    /// <summary>
+    /// Step 22 Phase 3 audit requirement (owner decision, locked): every
+    /// successful staff tag correction writes exactly one AuditLog row, in
+    /// the same transaction as the Tags mutation/ratchet. Asserts the row's
+    /// EntityType/EventType/Actor/ChangedByUserId/ConversationId directly
+    /// against the real persisted row, and that OldValue/NewValue carry only
+    /// the added/removed tag names — never a full conversation snapshot or
+    /// anything PII-shaped.
+    /// </summary>
+    [Fact]
+    public async Task CorrectTagsAsync_SuccessfulCorrection_WritesExactlyOneAuditLogRow_WithNoDisallowedContent()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var service = scope.ServiceProvider.GetRequiredService<IConversationTagCorrectionService>();
+        var businessId = await CreateBusinessAsync(db);
+        var widgetId = await CreateWidgetAsync(db, businessId);
+        var conversation = await CreateConversationAsync(db, businessId, widgetId, ["shipping"]);
+        var staffUserId = await CreateStaffUserAsync(db, businessId);
+
+        await service.CorrectTagsAsync(businessId, conversation.Id, ["Refund", "shipping"], staffUserId);
+
+        var auditLogs = await db.AuditLogs.IgnoreQueryFilters()
+            .Where(a => a.BusinessId == businessId)
+            .ToListAsync();
+        var auditLog = Assert.Single(auditLogs);
+
+        Assert.Equal(AuditEntityTypes.Conversation, auditLog.EntityType);
+        Assert.Equal(conversation.Id.ToString(), auditLog.EntityId);
+        Assert.Equal(AuditEventTypes.ConversationTagsCorrected, auditLog.EventType);
+        Assert.Equal(ActorType.NivoraBusinessStaff, auditLog.Actor);
+        Assert.Equal(staffUserId, auditLog.ChangedByUserId);
+        Assert.Equal(conversation.Id, auditLog.ConversationId);
+
+        // Content discipline: only the tag names that changed (["refund"]
+        // added, nothing removed — "shipping" was already present), never a
+        // full Tags/PrimaryTag snapshot and never any customer-identifying
+        // field.
+        Assert.Equal("""{"removedTags":[]}""", auditLog.OldValue);
+        Assert.Equal("""{"addedTags":["refund"]}""", auditLog.NewValue);
+        Assert.DoesNotContain("PrimaryTag", auditLog.OldValue);
+        Assert.DoesNotContain("PrimaryTag", auditLog.NewValue);
+        Assert.DoesNotContain("@", auditLog.OldValue!);
+        Assert.DoesNotContain("@", auditLog.NewValue!);
     }
 
     // ── Lock-identity proof: real captured runtime values, not
@@ -265,12 +343,13 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
 
         await classificationService.ClassifyAsync(businessId, conversation.Id, EmptyHistory, CancellationToken.None);
 
+        var staffUserId = await CreateStaffUserAsync(seedDb, businessId);
         var staffCorrectionInterceptor = new LockAcquisitionInterceptor();
         await using var staffDb = CreateDbContext(staffCorrectionInterceptor);
         var staffModeService = new ConversationModeService(staffDb);
-        var staffCorrectionService = new ConversationTagCorrectionService(staffModeService);
+        var staffCorrectionService = new ConversationTagCorrectionService(staffModeService, new AuditLogService(staffDb));
 
-        await staffCorrectionService.CorrectTagsAsync(businessId, conversation.Id, ["shipping"]);
+        await staffCorrectionService.CorrectTagsAsync(businessId, conversation.Id, ["shipping"], staffUserId);
 
         var classificationKey = Assert.Single(classificationInterceptor.ObservedLockKeys);
         var staffCorrectionKey = Assert.Single(staffCorrectionInterceptor.ObservedLockKeys);
@@ -331,6 +410,7 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
         await SeedTagModeMappingAsync(seedDb, businessId, "shipping", ConversationMode.Assist);
         await SeedTagModeMappingAsync(seedDb, businessId, "refund", ConversationMode.Manual);
         var conversation = await CreateConversationAsync(seedDb, businessId, widgetId, []);
+        var staffUserId = await CreateStaffUserAsync(seedDb, businessId);
 
         var call1BeforeUpdate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var releaseCall1 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -344,9 +424,9 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
         };
         var lockInterceptor1 = new LockAcquisitionInterceptor();
         await using var db1 = CreateDbContext(lockInterceptor1, updatePause);
-        var staffCorrectionService = new ConversationTagCorrectionService(new ConversationModeService(db1));
+        var staffCorrectionService = new ConversationTagCorrectionService(new ConversationModeService(db1), new AuditLogService(db1));
 
-        var task1 = staffCorrectionService.CorrectTagsAsync(businessId, conversation.Id, ["shipping"]);
+        var task1 = staffCorrectionService.CorrectTagsAsync(businessId, conversation.Id, ["shipping"], staffUserId);
 
         // Deterministic — call 1 has genuinely acquired the real advisory
         // lock and read the conversation, and is paused strictly before its

@@ -26,7 +26,11 @@ public class AuditLog : ITenantOwned
     /// <summary>Populated only when Actor == NivoraBusinessStaff.</summary>
     public Guid? ChangedByUserId { get; set; }
 
-    /// <summary>Populated only when Actor == Ai.</summary>
+    /// <summary>Populated whenever the event is scoped to a specific
+    /// conversation — not exclusive to Actor == Ai. VerificationCodeService
+    /// already sets it for Actor == Customer, and
+    /// ConversationTagCorrectionService (Step 22 Phase 3) sets it for
+    /// Actor == NivoraBusinessStaff alongside ChangedByUserId.</summary>
     public Guid? ConversationId { get; set; }
 
     /// <summary>
