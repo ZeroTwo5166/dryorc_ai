@@ -52,6 +52,18 @@ public class Conversation : ITenantOwned
     /// </summary>
     public List<string> Tags { get; set; } = [];
 
+    /// <summary>
+    /// Persisted, monotonically-non-decreasing ratchet over
+    /// ConversationModeService.ComputeEffectiveModeAsync's own, unchanged,
+    /// per-call result — only ComputeAndRatchetEffectiveModeAsync may ever
+    /// advance this field, and only upward (Stricter/Max against the
+    /// previous value). Defaults to Auto, the enum's own weakest value: a
+    /// deliberate "start most-permissive" choice, safe because nothing
+    /// enforces this field as an autonomy gate until a real consumer is
+    /// wired in (step-22 design doc §C).
+    /// </summary>
+    public ConversationMode EffectiveMode { get; set; } = ConversationMode.Auto;
+
     /// <summary>Level 2 verification expiry (Section 4, OTP path).</summary>
     public DateTimeOffset? Level2VerifiedUntil { get; set; }
 

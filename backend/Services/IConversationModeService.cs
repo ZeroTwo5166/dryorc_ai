@@ -17,4 +17,17 @@ namespace backend.Services;
 public interface IConversationModeService
 {
     Task<ConversationMode> ComputeEffectiveModeAsync(Conversation conversation, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Step 22 — calls the unchanged ComputeEffectiveModeAsync, then applies
+    /// Stricter(conversation.EffectiveMode, computedMode) and sets the
+    /// result on conversation.EffectiveMode before returning it. Mutates the
+    /// tracked entity only — does not call SaveChangesAsync; the caller's
+    /// own transaction commits it, matching this codebase's established
+    /// pattern (e.g. WidgetConversationService's LastMessageAt write). The
+    /// persisted field only ever moves upward: a lower computedMode (e.g.
+    /// after a tag is removed) leaves the existing, stricter value
+    /// unchanged — see step-22 design doc §C.
+    /// </summary>
+    Task<ConversationMode> ComputeAndRatchetEffectiveModeAsync(Conversation conversation, CancellationToken cancellationToken = default);
 }

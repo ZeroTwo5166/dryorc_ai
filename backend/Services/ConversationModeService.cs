@@ -50,6 +50,15 @@ public class ConversationModeService(AppDbContext db) : IConversationModeService
         return mode;
     }
 
+    /// <inheritdoc />
+    public async Task<ConversationMode> ComputeAndRatchetEffectiveModeAsync(
+        Conversation conversation, CancellationToken cancellationToken = default)
+    {
+        var computedMode = await ComputeEffectiveModeAsync(conversation, cancellationToken);
+        conversation.EffectiveMode = Stricter(conversation.EffectiveMode, computedMode);
+        return conversation.EffectiveMode;
+    }
+
     private async Task<ConversationMode> ComputeBaseModeAsync(
         Guid businessId, List<string> tags, CancellationToken cancellationToken)
     {
@@ -125,6 +134,6 @@ public class ConversationModeService(AppDbContext db) : IConversationModeService
         return Stricter(currentMode, ConversationMode.Manual);
     }
 
-    private static ConversationMode Stricter(ConversationMode a, ConversationMode b) =>
+    internal static ConversationMode Stricter(ConversationMode a, ConversationMode b) =>
         (ConversationMode)Math.Max((int)a, (int)b);
 }

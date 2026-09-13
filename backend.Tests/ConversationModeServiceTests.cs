@@ -485,6 +485,180 @@ public class ConversationModeServiceTests : IAsyncLifetime
         Assert.Equal(ConversationMode.Auto, mode); // steps 1/3/4 alone yield Auto; step 2 never ran to force Manual
     }
 
+    // ── Step 22: Conversation.EffectiveMode defaults ─────────────────
+
+    /// <summary>
+    /// C# property-initializer default — no DB involved. A freshly
+    /// constructed Conversation (the in-application path, e.g.
+    /// WidgetConversationService's `new Conversation { ... }`) must default
+    /// to Auto without EffectiveMode being set explicitly, matching
+    /// Status/HandledBy's own established convention.
+    /// </summary>
+    [Fact]
+    public void Conversation_ConstructedWithoutSettingEffectiveMode_DefaultsToAuto()
+    {
+        var conversation = new Conversation
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = Guid.NewGuid(),
+            WidgetId = Guid.NewGuid(),
+            Channel = "Website",
+        };
+
+        Assert.Equal(ConversationMode.Auto, conversation.EffectiveMode);
+    }
+
+    /// <summary>
+    /// DB-level column default (the migration's own `defaultValue: "Auto"`,
+    /// materialized as a real Postgres column DEFAULT) — proven by inserting
+    /// a row via raw SQL that omits the EffectiveMode column entirely, the
+    /// same shape any pre-existing row backfilled by the migration itself
+    /// took. Distinct from the C# initializer test above: this exercises
+    /// the actual applied migration/schema, not application code.
+    /// </summary>
+    [Fact]
+    public async Task Conversations_RowInsertedWithoutEffectiveModeColumn_DefaultsToAutoAtDbLevel()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var businessId = await CreateBusinessAsync(db);
+        var widgetId = await CreateWidgetAsync(db, businessId);
+        var conversationId = Guid.NewGuid();
+        var now = DateTimeOffset.UtcNow;
+
+        // Deliberately omits "EffectiveMode" from the column list — relies
+        // entirely on the migration's DB-level DEFAULT, not EF/application
+        // code, mirroring exactly how every pre-existing row was backfilled
+        // when the migration ran.
+        await db.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO "Conversations"
+                ("Id", "BusinessId", "WidgetId", "Status", "HandledBy", "Channel", "Tags", "CreatedAt", "UpdatedAt")
+            VALUES
+                ({conversationId}, {businessId}, {widgetId}, 'Open', 'Ai', 'Website', ARRAY[]::text[], {now}, {now})
+            """);
+
+        var effectiveMode = await db.Conversations
+            .IgnoreQueryFilters()
+            .Where(c => c.Id == conversationId)
+            .Select(c => c.EffectiveMode)
+            .SingleAsync();
+
+        Assert.Equal(ConversationMode.Auto, effectiveMode);
+    }
+
+    // ── Step 22: Stricter — Max-like, symmetric ratchet primitive ────
+
+    [Theory]
+    [InlineData(ConversationMode.Auto, ConversationMode.Auto, ConversationMode.Auto)]
+    [InlineData(ConversationMode.Auto, ConversationMode.Assist, ConversationMode.Assist)]
+    [InlineData(ConversationMode.Auto, ConversationMode.Manual, ConversationMode.Manual)]
+    [InlineData(ConversationMode.Assist, ConversationMode.Manual, ConversationMode.Manual)]
+    [InlineData(ConversationMode.Manual, ConversationMode.Manual, ConversationMode.Manual)]
+    public void Stricter_ReturnsTheStricterOfTheTwoValues_RegardlessOfArgumentOrder(
+        ConversationMode a, ConversationMode b, ConversationMode expected)
+    {
+        Assert.Equal(expected, ConversationModeService.Stricter(a, b));
+        Assert.Equal(expected, ConversationModeService.Stricter(b, a)); // symmetric — Max-like, not "first wins"/"second wins"
+    }
+
+    // ── Step 22: ComputeAndRatchetEffectiveModeAsync ─────────────────
+
+    /// <summary>
+    /// The exact worked example from the step-22 design doc §C: an
+    /// existing Auto row, a customer message classified with a tag whose
+    /// TagModeMapping specifies Manual, ratchets EffectiveMode from Auto to
+    /// Manual and persists it. Conversation is created the same way every
+    /// pre-migration row would have looked (EffectiveMode left at its Auto
+    /// default), not pre-seeded with a mode.
+    /// </summary>
+    [Fact]
+    public async Task ComputeAndRatchetEffectiveModeAsync_ExistingAutoRow_RatchetsToManualOnMatchingTag()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var service = scope.ServiceProvider.GetRequiredService<IConversationModeService>();
+        var businessId = await CreateBusinessAsync(db);
+        var widgetId = await CreateWidgetAsync(db, businessId);
+        await SeedTagModeMappingAsync(db, businessId, "refund", ConversationMode.Manual, isMinimumFloor: false);
+        var conversation = await CreateConversationAsync(
+            db, businessId, widgetId, ["refund"], level2VerifiedUntil: DateTimeOffset.UtcNow.AddHours(1));
+        Assert.Equal(ConversationMode.Auto, conversation.EffectiveMode); // starting point, per the worked example
+
+        var result = await service.ComputeAndRatchetEffectiveModeAsync(conversation);
+        await db.SaveChangesAsync();
+
+        Assert.Equal(ConversationMode.Manual, result);
+        Assert.Equal(ConversationMode.Manual, conversation.EffectiveMode);
+        var persisted = await db.Conversations.IgnoreQueryFilters()
+            .Where(c => c.Id == conversation.Id).Select(c => c.EffectiveMode).SingleAsync();
+        Assert.Equal(ConversationMode.Manual, persisted); // actually persisted, not just held on the tracked entity
+    }
+
+    /// <summary>
+    /// Second half of the worked example: a later reclassification that
+    /// would, on its own, compute something less strict (shipping-only, no
+    /// matching mapping => Auto) must not move the already-ratcheted
+    /// EffectiveMode backward. This is the entire point of §C's persisted
+    /// ratchet — proven here against the real persisted value, not just the
+    /// in-memory Stricter() primitive tested above in isolation.
+    /// </summary>
+    [Fact]
+    public async Task ComputeAndRatchetEffectiveModeAsync_SubsequentLessStrictComputation_DoesNotMoveBackward()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var service = scope.ServiceProvider.GetRequiredService<IConversationModeService>();
+        var businessId = await CreateBusinessAsync(db);
+        var widgetId = await CreateWidgetAsync(db, businessId);
+        await SeedTagModeMappingAsync(db, businessId, "refund", ConversationMode.Manual, isMinimumFloor: false);
+        var conversation = await CreateConversationAsync(
+            db, businessId, widgetId, ["refund"], level2VerifiedUntil: DateTimeOffset.UtcNow.AddHours(1));
+        await service.ComputeAndRatchetEffectiveModeAsync(conversation);
+        await db.SaveChangesAsync();
+        Assert.Equal(ConversationMode.Manual, conversation.EffectiveMode); // ratcheted first, per the test above
+
+        // Reclassifies to shipping-only — no TagModeMapping for it, so this
+        // computation alone would yield Auto.
+        conversation.Tags = ["shipping"];
+        var result = await service.ComputeAndRatchetEffectiveModeAsync(conversation);
+        await db.SaveChangesAsync();
+
+        Assert.Equal(ConversationMode.Manual, result); // Stricter(Manual, Auto) = Manual — does not move backward
+        var persisted = await db.Conversations.IgnoreQueryFilters()
+            .Where(c => c.Id == conversation.Id).Select(c => c.EffectiveMode).SingleAsync();
+        Assert.Equal(ConversationMode.Manual, persisted);
+    }
+
+    /// <summary>
+    /// ComputeAndRatchetEffectiveModeAsync must not itself call
+    /// SaveChangesAsync — mutating the tracked entity and leaving the
+    /// commit to the caller's own transaction is the documented contract
+    /// (IConversationModeService.cs's own doc comment). Proven by NOT
+    /// calling SaveChangesAsync after the method returns, reloading via a
+    /// fresh, untracked query, and confirming the DB still shows the
+    /// pre-call value.
+    /// </summary>
+    [Fact]
+    public async Task ComputeAndRatchetEffectiveModeAsync_DoesNotItselfCallSaveChanges()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var service = scope.ServiceProvider.GetRequiredService<IConversationModeService>();
+        var businessId = await CreateBusinessAsync(db);
+        var widgetId = await CreateWidgetAsync(db, businessId);
+        await SeedTagModeMappingAsync(db, businessId, "refund", ConversationMode.Manual, isMinimumFloor: false);
+        var conversation = await CreateConversationAsync(
+            db, businessId, widgetId, ["refund"], level2VerifiedUntil: DateTimeOffset.UtcNow.AddHours(1));
+
+        await service.ComputeAndRatchetEffectiveModeAsync(conversation); // caller deliberately does NOT SaveChangesAsync
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var persisted = await verifyDb.Conversations.IgnoreQueryFilters()
+            .Where(c => c.Id == conversation.Id).Select(c => c.EffectiveMode).SingleAsync();
+        Assert.Equal(ConversationMode.Auto, persisted); // still Auto in the DB — the method never flushed on its own
+    }
+
     private class FixedTenantAccessor(Guid? businessId) : ICurrentTenantAccessor
     {
         public Guid? BusinessId => businessId;

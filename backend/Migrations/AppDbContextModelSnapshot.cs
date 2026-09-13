@@ -561,6 +561,11 @@ namespace backend.Migrations
                     b.Property<Guid?>("CustomerId")
                         .HasColumnType("uuid");
 
+                    b.Property<string>("EffectiveMode")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
                     b.Property<string>("HandledBy")
                         .IsRequired()
                         .HasMaxLength(32)

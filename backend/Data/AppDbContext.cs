@@ -230,6 +230,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
         {
             c.Property(x => x.Status).HasConversion<string>().HasMaxLength(32);
             c.Property(x => x.HandledBy).HasConversion<string>().HasMaxLength(32);
+            c.Property(x => x.EffectiveMode).HasConversion<string>().HasMaxLength(32);
             c.Property(x => x.Channel).HasMaxLength(32);
 
             c.HasIndex(x => new { x.BusinessId, x.CreatedAt });
