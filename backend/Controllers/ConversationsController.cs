@@ -45,6 +45,10 @@ public record ConversationDetailResponse(string HandledBy, List<ConversationMess
 
 public record CreateConversationMessageRequest(string Content);
 
+public record UpdateConversationTagsRequest(List<string>? Tags);
+
+public record ConversationTagsResponse(List<string> Tags, string? PrimaryTag, string EffectiveMode);
+
 /// <summary>
 /// Backend verification/read surface for Steps 6-7, now also the Step 9
 /// Business Inbox read+reply API. Same AnyStaff + SameTenant two-layer
@@ -54,7 +58,11 @@ public record CreateConversationMessageRequest(string Content);
 [ApiController]
 [Route("api/conversations")]
 [Authorize(Policy = NivoraPolicies.AnyStaff)]
-public class ConversationsController(AppDbContext db, IAuthorizationService authorizationService, ITicketSlaService ticketSlaService) : ControllerBase
+public class ConversationsController(
+    AppDbContext db,
+    IAuthorizationService authorizationService,
+    ITicketSlaService ticketSlaService,
+    IConversationTagCorrectionService tagCorrectionService) : ControllerBase
 {
     private const int PreviewMaxLength = 120;
 
@@ -384,6 +392,45 @@ public class ConversationsController(AppDbContext db, IAuthorizationService auth
         }
 
         return Ok(new ConversationMessageResponse(message.Id, message.Role.ToString(), message.Content, message.CreatedAt));
+    }
+
+    /// <summary>
+    /// Step 22 Phase 3 — minimal staff correction of an AI-assigned (or
+    /// staff-assigned) classification. Full-replace semantics, matching
+    /// ConversationClassificationService's own write shape — the request
+    /// supplies the complete desired Tags set, not an add/remove delta.
+    /// AnyStaff, same as CreateMessage/ReturnToAi above — no per-handler
+    /// ownership concept exists on Conversation. Deliberately thin: all
+    /// actual mutation/ratchet logic lives in
+    /// IConversationTagCorrectionService.CorrectTagsAsync, which this
+    /// action only authorizes for and delegates to — see that service's own
+    /// doc comment for why EffectiveMode can never move backward as a
+    /// result of this endpoint. conversation is re-read via ReloadAsync
+    /// after the correction call rather than assumed already up to date —
+    /// defensive, not required by IConversationModeService's own DbContext-
+    /// sharing guarantee, matching this controller's existing
+    /// ReloadAsync-after-lock convention elsewhere.
+    /// </summary>
+    [HttpPut("{id:guid}/tags")]
+    public async Task<IActionResult> UpdateTags(Guid id, [FromBody] UpdateConversationTagsRequest request)
+    {
+        var conversation = await db.Conversations.FirstOrDefaultAsync(c => c.Id == id);
+        if (conversation is null)
+        {
+            return NotFound();
+        }
+
+        var authResult = await authorizationService.AuthorizeAsync(User, conversation, NivoraPolicies.SameTenant);
+        if (!authResult.Succeeded)
+        {
+            return NotFound();
+        }
+
+        await tagCorrectionService.CorrectTagsAsync(conversation.BusinessId, conversation.Id, request.Tags ?? []);
+
+        await db.Entry(conversation).ReloadAsync();
+
+        return Ok(new ConversationTagsResponse(conversation.Tags, conversation.PrimaryTag, conversation.EffectiveMode.ToString()));
     }
 
     /// <summary>

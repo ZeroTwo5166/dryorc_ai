@@ -243,6 +243,7 @@ builder.Services.AddScoped<IKnowledgeRetrievalService, KnowledgeRetrievalService
 // something real to call.
 builder.Services.AddScoped<IConversationModeService, ConversationModeService>();
 builder.Services.AddScoped<IConversationClassificationService, ConversationClassificationService>();
+builder.Services.AddScoped<IConversationTagCorrectionService, ConversationTagCorrectionService>();
 builder.Services.AddScoped<ITicketSlaService, TicketSlaService>();
 builder.Services.AddScoped<IAuditLogService, AuditLogService>();
 
