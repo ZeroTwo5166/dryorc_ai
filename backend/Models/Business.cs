@@ -85,6 +85,17 @@ public class Business
     /// </summary>
     public bool ShopifyReadToolsEnabled { get; set; } = false;
 
+    /// <summary>
+    /// Step 23 Phase 1 (design §4) — kill switch for the AI Business Analyst
+    /// feature. Unlike ShopifyReadToolsEnabled/CancelOrderToolEnabled, which
+    /// gate whether a tool is offered inside an existing conversation, the
+    /// Analyst is its own entire request surface — this flag is checked once,
+    /// at the top of the (not-yet-built, Phase 5) Analyst endpoint, before any
+    /// Claude call. Default false — opt-in, not opt-out, matching every other
+    /// kill switch in this file.
+    /// </summary>
+    public bool AiBusinessAnalystEnabled { get; set; } = false;
+
 
     /// <summary>
     /// Maximum refund amount Nivora may execute autonomously (Mode = Auto)

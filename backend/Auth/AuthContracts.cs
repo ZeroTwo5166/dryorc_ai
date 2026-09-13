@@ -23,7 +23,8 @@ public record MeResponse(
     string? PlanTier,
     IReadOnlyList<string> Roles,
     DateTimeOffset ExpiresAtUtc,
-    bool CancelOrderToolEnabled);
+    bool CancelOrderToolEnabled,
+    bool AiBusinessAnalystEnabled);
 
 public record ConfirmEmailRequest(Guid UserId, string Token);
 

@@ -406,6 +406,9 @@ namespace backend.Migrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("uuid");
 
+                    b.Property<bool>("AiBusinessAnalystEnabled")
+                        .HasColumnType("boolean");
+
                     b.Property<decimal?>("AutoRefundLimit")
                         .HasColumnType("numeric");
 

@@ -17,6 +17,10 @@ public record SetCancelOrderToolEnabledRequest(bool Enabled);
 
 public record SetCancelOrderToolEnabledResponse(bool CancelOrderToolEnabled);
 
+public record SetAiBusinessAnalystEnabledRequest(bool Enabled);
+
+public record SetAiBusinessAnalystEnabledResponse(bool AiBusinessAnalystEnabled);
+
 /// <summary>
 /// Step 49b — Business-level settings. First real caller of AuditEntityTypes.Business.
 /// Reads: AnyStaff (matches MeResponse, which already exposes CancelOrderToolEnabled
@@ -123,9 +127,62 @@ public class BusinessController(
         return Ok(new SetCancelOrderToolEnabledResponse(business.CancelOrderToolEnabled));
     }
 
+    /// <summary>
+    /// Step 23 Phase 1 (design §4) — kill switch for the AI Business Analyst
+    /// feature. Modeled directly on SetCancelOrderToolEnabled above: OwnerOnly
+    /// (stricter than the AnyStaff read path Phase 5's Analyst endpoint will
+    /// use), idempotent (no write/audit on a same-value request), audits every
+    /// real transition. Unlike SetCancelOrderToolEnabled, there is no
+    /// precondition to check here — the Analyst has no external-integration
+    /// dependency comparable to Shopify.
+    /// </summary>
+    [HttpPut("ai-business-analyst")]
+    [Authorize(Policy = NivoraPolicies.OwnerOnly)]
+    public async Task<IActionResult> SetAiBusinessAnalystEnabled([FromBody] SetAiBusinessAnalystEnabledRequest request)
+    {
+        var businessId = tenantAccessor.BusinessId
+            ?? throw new InvalidOperationException("Authenticated but no tenant resolved — unreachable behind [Authorize].");
+
+        var business = await db.Businesses.FirstOrDefaultAsync(b => b.Id == businessId);
+        if (business is null)
+        {
+            return Unauthorized();
+        }
+
+        // Idempotent no-op — matching SetCancelOrderToolEnabled's own
+        // convention of only auditing real transitions.
+        if (business.AiBusinessAnalystEnabled == request.Enabled)
+        {
+            return Ok(new SetAiBusinessAnalystEnabledResponse(business.AiBusinessAnalystEnabled));
+        }
+
+        var oldValue = SerializeAiBusinessAnalystAuditValue(business);
+        business.AiBusinessAnalystEnabled = request.Enabled;
+        business.UpdatedAt = DateTimeOffset.UtcNow;
+
+        await auditLogService.LogAsync(
+            businessId,
+            AuditEntityTypes.Business,
+            businessId.ToString(),
+            request.Enabled ? AuditEventTypes.BusinessAiBusinessAnalystEnabled : AuditEventTypes.BusinessAiBusinessAnalystDisabled,
+            ActorType.NivoraBusinessStaff,
+            changedByUserId: CurrentUserId,
+            oldValue: oldValue,
+            newValue: SerializeAiBusinessAnalystAuditValue(business));
+
+        await db.SaveChangesAsync();
+
+        return Ok(new SetAiBusinessAnalystEnabledResponse(business.AiBusinessAnalystEnabled));
+    }
+
     /// <summary>Deliberately hand-picked, safe fields only — never the full
     /// Business entity, never PII, matching
     /// IntegrationsController.SerializeAuditValue's own convention.</summary>
     private static string SerializeAuditValue(Business business) =>
         JsonSerializer.Serialize(new { business.CancelOrderToolEnabled });
+
+    /// <summary>Same convention as SerializeAuditValue above, scoped to the
+    /// AiBusinessAnalystEnabled field.</summary>
+    private static string SerializeAiBusinessAnalystAuditValue(Business business) =>
+        JsonSerializer.Serialize(new { business.AiBusinessAnalystEnabled });
 }

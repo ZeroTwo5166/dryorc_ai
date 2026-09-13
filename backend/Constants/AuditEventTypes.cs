@@ -20,6 +20,11 @@ public static class AuditEventTypes
     public const string BusinessCancelOrderToolEnabled = "BusinessCancelOrderToolEnabled";
     public const string BusinessCancelOrderToolDisabled = "BusinessCancelOrderToolDisabled";
 
+    // Business — AI Business Analyst kill switch (Step 23 Phase 1). Named
+    // like BusinessCancelOrderToolEnabled/Disabled above, for the same reason.
+    public const string BusinessAiBusinessAnalystEnabled = "BusinessAiBusinessAnalystEnabled";
+    public const string BusinessAiBusinessAnalystDisabled = "BusinessAiBusinessAnalystDisabled";
+
     // Customer
     public const string CustomerFieldUpdated = "CustomerFieldUpdated";
     public const string CustomerDeleted = "CustomerDeleted";

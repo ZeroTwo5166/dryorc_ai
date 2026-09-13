@@ -389,7 +389,7 @@ public class AuthController(
 
         return Ok(new MeResponse(
             user.Id, user.BusinessId, user.Email!, business.Name, business.PlanTier, roles.ToList(),
-            await GetSessionExpiresAtUtcAsync(), business.CancelOrderToolEnabled));
+            await GetSessionExpiresAtUtcAsync(), business.CancelOrderToolEnabled, business.AiBusinessAnalystEnabled));
     }
 
     /// <summary>
