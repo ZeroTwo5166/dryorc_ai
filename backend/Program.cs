@@ -247,6 +247,11 @@ builder.Services.AddScoped<IConversationTagCorrectionService, ConversationTagCor
 builder.Services.AddScoped<ITicketSlaService, TicketSlaService>();
 builder.Services.AddScoped<IAuditLogService, AuditLogService>();
 builder.Services.AddScoped<IAnalyticsQueryService, AnalyticsQueryService>();
+builder.Services.AddScoped<IAnalystCapability, GetConversationsByDayCapability>();
+builder.Services.AddScoped<IAnalystCapability, GetConversationStatusDistributionCapability>();
+builder.Services.AddScoped<IAnalystCapability, GetHandledBySnapshotCapability>();
+builder.Services.AddScoped<IAnalystCapability, GetHandoffsByDayCapability>();
+builder.Services.AddScoped<IAnalystCapability, GetTicketStatusDistributionCapability>();
 
 // Step 18: Business Integration Framework (generic OAuth connect/callback/
 // disconnect — see Controllers/IntegrationsController.cs). Encryption rides
