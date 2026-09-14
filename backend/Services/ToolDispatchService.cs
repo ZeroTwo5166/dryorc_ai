@@ -63,6 +63,17 @@ public class ToolDispatchService(
                             InputSchema = t.InputSchema,
                         })
                         .ToList(),
+                    // This loop never reads or persists reasoning content
+                    // (see ToAssistantParam below) and never requested it —
+                    // claude-sonnet-5's adaptive thinking default was
+                    // producing ThinkingBlocks on tool-selection turns
+                    // regardless, which ToAssistantParam had no case for (a
+                    // real crash on this exact call shape, found via Step
+                    // 23's live validation). Disabling it here makes that
+                    // block type unreachable by construction on every
+                    // iteration of this loop, since this same object
+                    // initializer is reused each pass.
+                    Thinking = new ThinkingConfigDisabled(),
                 }, cancellationToken);
             }
             // Same typed hierarchy and reasoning as ClaudeReplyService's own
@@ -112,10 +123,30 @@ public class ToolDispatchService(
             // shape (a tool_result must follow the tool_use it answers in
             // the next user turn, and the assistant turn that produced it
             // must be present in history).
+            //
+            // ToAssistantParam throws NotSupportedException for any
+            // content-block type outside its currently-recognized set —
+            // Thinking is disabled on the call above specifically to keep
+            // that unreachable in the common case, but the SDK's
+            // ContentBlock union is extensible beyond what this method
+            // maps today. Treated the same as a genuine Claude-call
+            // problem, not a new failure mode: caught here and degraded to
+            // ClaudeCallFailed, exactly like every typed exception from the
+            // call above.
+            List<ContentBlockParam> assistantContent;
+            try
+            {
+                assistantContent = response.Content.Select(ToAssistantParam).ToList();
+            }
+            catch (NotSupportedException)
+            {
+                return ToolDispatchOutcome.ClaudeCallFailed();
+            }
+
             messages.Add(new MessageParam
             {
                 Role = Role.Assistant,
-                Content = response.Content.Select(ToAssistantParam).ToList(),
+                Content = assistantContent,
             });
 
             var resultBlocks = new List<ContentBlockParam>();
@@ -214,6 +245,16 @@ public class ToolDispatchService(
         }
     }
 
+    // Deliberately still throws for anything outside this recognized set,
+    // rather than silently omitting the block — omission is a replay-
+    // fidelity decision this class has no basis to make on its own. Its one
+    // caller (in the loop above) catches this and degrades the whole
+    // iteration to ClaudeCallFailed instead — this method's contract is
+    // "map what I recognize, refuse to guess about what I don't," not "map
+    // what I recognize, drop the rest." Same policy as
+    // AnalystOrchestrationService.ToAssistantParam, kept identical
+    // deliberately even though the surrounding loop/call-count shape
+    // differs between the two services.
     private static ContentBlockParam ToAssistantParam(ContentBlock block) => block.Value switch
     {
         TextBlock t => new ContentBlockParam(new TextBlockParam(t.Text), null),

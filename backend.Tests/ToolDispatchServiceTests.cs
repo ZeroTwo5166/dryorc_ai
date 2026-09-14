@@ -119,6 +119,99 @@ public class ToolDispatchServiceTests
     private static Dictionary<string, JsonElement> Args(object anonymous) =>
         JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(JsonSerializer.Serialize(anonymous))!;
 
+    // A tool_use response that also carries a ThinkingBlock — the exact
+    // shape a real claude-sonnet-5 tool-selection turn produced in Step 23's
+    // live validation (adaptive thinking, on by default when Thinking is
+    // omitted), which crashed ToAssistantParam before this fix.
+    private static Message ToolUseWithThinkingResponse(string toolName, Dictionary<string, JsonElement> input, string toolUseId, string messageId = "msg_tool_thinking") => new()
+    {
+        ID = messageId,
+        Container = null,
+        Content =
+        [
+            new ThinkingBlock { Thinking = "Considering which tool best answers this question.", Signature = "sig_fake" },
+            new ToolUseBlock { ID = toolUseId, Name = toolName, Input = input, Caller = null },
+        ],
+        Model = "claude-sonnet-5",
+        StopDetails = null,
+        StopReason = "tool_use",
+        StopSequence = null,
+        Usage = FakeUsage(),
+    };
+
+    // A tool_use response carrying a block type unrelated to thinking
+    // entirely (a code-execution container-upload block) — proving the
+    // graceful-degradation fix is general, not special-cased to
+    // ThinkingBlock. Not reachable under this service's current tool
+    // configuration (no server tool is ever offered), but the defensive
+    // handling must not assume that stays true.
+    private static Message ToolUseWithUnrecognizedBlockResponse(string toolName, Dictionary<string, JsonElement> input, string toolUseId, string messageId = "msg_tool_unrecognized") => new()
+    {
+        ID = messageId,
+        Container = null,
+        Content =
+        [
+            new ContainerUploadBlock("file_abc123"),
+            new ToolUseBlock { ID = toolUseId, Name = toolName, Input = input, Caller = null },
+        ],
+        Model = "claude-sonnet-5",
+        StopDetails = null,
+        StopReason = "tool_use",
+        StopSequence = null,
+        Usage = FakeUsage(),
+    };
+
+    // ── Step 23 ThinkingBlock crash fix — adversarial coverage ─────────
+
+    [Fact]
+    public async Task RunAsync_ToolUseResponseAlsoContainsThinkingBlock_DegradesToClaudeCallFailed_NeverThrows()
+    {
+        var readTool = new RecordingReadOnlyTool();
+        var fakeMessages = new SequencedFakeMessageService();
+        fakeMessages.Enqueue(ToolUseWithThinkingResponse("getOrderStatus", Args(new { orderId = "1" }), "toolu_1"));
+        var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+
+        var outcome = await service.RunAsync(Context, "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
+
+        Assert.Equal(ToolDispatchStatus.ClaudeCallFailed, outcome.Status);
+        Assert.Equal(1, fakeMessages.CallCount); // the crash happens before any tool executes or a second call is made
+        Assert.Equal(0, readTool.CallCount);
+    }
+
+    [Fact]
+    public async Task RunAsync_ToolUseResponseAlsoContainsUnrecognizedBlockType_DegradesToClaudeCallFailed_NeverThrows()
+    {
+        var readTool = new RecordingReadOnlyTool();
+        var fakeMessages = new SequencedFakeMessageService();
+        fakeMessages.Enqueue(ToolUseWithUnrecognizedBlockResponse("getOrderStatus", Args(new { orderId = "1" }), "toolu_1"));
+        var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+
+        var outcome = await service.RunAsync(Context, "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
+
+        Assert.Equal(ToolDispatchStatus.ClaudeCallFailed, outcome.Status);
+        Assert.Equal(1, fakeMessages.CallCount);
+        Assert.Equal(0, readTool.CallCount);
+    }
+
+    [Fact]
+    public async Task RunAsync_EveryRequest_ExplicitlyDisablesAdaptiveThinking()
+    {
+        var readTool = new RecordingReadOnlyTool();
+        var fakeMessages = new SequencedFakeMessageService();
+        fakeMessages.Enqueue(ToolUseResponse("getOrderStatus", Args(new { orderId = "1" }), "toolu_1"));
+        fakeMessages.Enqueue(TextResponse("Done."));
+        var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+
+        await service.RunAsync(Context, "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
+
+        Assert.Equal(2, fakeMessages.Requests.Count);
+        Assert.All(fakeMessages.Requests, r =>
+        {
+            Assert.NotNull(r.Thinking);
+            Assert.IsType<ThinkingConfigDisabled>(r.Thinking!.Value);
+        });
+    }
+
     [Fact]
     public async Task RunAsync_NoToolUse_ReturnsCompletedWithText_AndCallsClaudeOnce()
     {

@@ -84,6 +84,15 @@ public class AnalystOrchestrationService(
                 Tools = _capabilitiesByName.Values
                     .Select(c => (ToolUnion)new Tool { Name = c.Name, Description = c.Description, InputSchema = c.InputSchema })
                     .ToList(),
+                // This orchestration never reads or persists reasoning
+                // content (see ToAssistantParam below and this class's own
+                // doc comment) and never requested it — claude-sonnet-5's
+                // adaptive thinking default was producing ThinkingBlocks on
+                // this turn regardless, which ToAssistantParam had no case
+                // for (a real crash, found via live validation). Disabling
+                // it here makes that block type unreachable by construction
+                // on this call, rather than something replay has to handle.
+                Thinking = new ThinkingConfigDisabled(),
             }, cancellationToken);
         }
         // Same typed hierarchy and reasoning as ToolDispatchService/
@@ -136,10 +145,30 @@ public class AnalystOrchestrationService(
         // Echo the assistant's own selection turn back into history verbatim
         // before appending tool results — required by the Messages API
         // shape, same reasoning as ToolDispatchService.cs:110-114.
+        //
+        // ToAssistantParam throws NotSupportedException for any content-
+        // block type outside its currently-recognized set — Thinking is
+        // disabled on the call above specifically to keep that unreachable
+        // in the common case, but the SDK's ContentBlock union is
+        // extensible beyond what this method maps today (see the
+        // catalogued block types in this class's own discovery record).
+        // Treated the same as a genuine Claude-call problem, not a new
+        // failure mode: caught here and degraded to ClaudeCallFailed,
+        // exactly like every other typed exception from the call above.
+        List<ContentBlockParam> selectionAssistantContent;
+        try
+        {
+            selectionAssistantContent = selectionResponse.Content.Select(ToAssistantParam).ToList();
+        }
+        catch (NotSupportedException)
+        {
+            return Finish(AnalystOutcomeType.ClaudeCallFailed, ClaudeCallFailedMessage, stopwatch, [], selectionResponse.Usage, null);
+        }
+
         messages.Add(new MessageParam
         {
             Role = Role.Assistant,
-            Content = selectionResponse.Content.Select(ToAssistantParam).ToList(),
+            Content = selectionAssistantContent,
         });
 
         var capabilityNames = toolUses.Select(t => t.Name).ToList();
@@ -188,6 +217,15 @@ public class AnalystOrchestrationService(
                 // with the selection call above, never more than 2 real
                 // Anthropic API calls total for any path that reaches here.
                 Tools = [],
+                // Not strictly required for crash-safety on this specific
+                // call — Tools being empty means this response is never
+                // replayed through ToAssistantParam, so an unhandled block
+                // type here couldn't crash this path today regardless. Set
+                // anyway to establish one clear invariant for this whole
+                // service: it does not use adaptive thinking, full stop —
+                // not a behavior that happens to hold only because Tools is
+                // empty on this particular call.
+                Thinking = new ThinkingConfigDisabled(),
             }, cancellationToken);
         }
         catch (AnthropicRateLimitException)
@@ -252,6 +290,13 @@ public class AnalystOrchestrationService(
         }
     }
 
+    // Deliberately still throws for anything outside this recognized set,
+    // rather than silently omitting the block — omission is a replay-
+    // fidelity decision this class has no basis to make on its own (see
+    // this class's own discovery record). Its one caller catches this and
+    // degrades the whole response to ClaudeCallFailed instead — this
+    // method's contract is "map what I recognize, refuse to guess about
+    // what I don't," not "map what I recognize, drop the rest."
     private static ContentBlockParam ToAssistantParam(ContentBlock block) => block.Value switch
     {
         TextBlock t => new ContentBlockParam(new TextBlockParam(t.Text), null),

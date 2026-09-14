@@ -119,6 +119,99 @@ public class AnalystOrchestrationServiceTests
     private static Dictionary<string, JsonElement> Args(object anonymous) =>
         JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(JsonSerializer.Serialize(anonymous))!;
 
+    // A tool_use selection response that also carries a ThinkingBlock — the
+    // exact shape a real claude-sonnet-5 selection turn produced in Step
+    // 23's live validation (adaptive thinking, on by default when Thinking
+    // is omitted), which crashed ToAssistantParam before this fix.
+    private static Message ToolUseWithThinkingResponse(string toolName, Dictionary<string, JsonElement> input, string toolUseId, string messageId = "msg_tool_thinking") => new()
+    {
+        ID = messageId,
+        Container = null,
+        Content =
+        [
+            new ThinkingBlock { Thinking = "Considering which capability best answers this question.", Signature = "sig_fake" },
+            new ToolUseBlock { ID = toolUseId, Name = toolName, Input = input, Caller = null },
+        ],
+        Model = "claude-sonnet-5",
+        StopDetails = null,
+        StopReason = "tool_use",
+        StopSequence = null,
+        Usage = FakeUsage(),
+    };
+
+    // A tool_use selection response carrying a block type unrelated to
+    // thinking entirely (a code-execution container-upload block) —
+    // proving the graceful-degradation fix is general, not special-cased
+    // to ThinkingBlock. Not reachable under this service's current
+    // capability configuration (no server tool is ever offered), but the
+    // defensive handling must not assume that stays true.
+    private static Message ToolUseWithUnrecognizedBlockResponse(string toolName, Dictionary<string, JsonElement> input, string toolUseId, string messageId = "msg_tool_unrecognized") => new()
+    {
+        ID = messageId,
+        Container = null,
+        Content =
+        [
+            new ContainerUploadBlock("file_abc123"),
+            new ToolUseBlock { ID = toolUseId, Name = toolName, Input = input, Caller = null },
+        ],
+        Model = "claude-sonnet-5",
+        StopDetails = null,
+        StopReason = "tool_use",
+        StopSequence = null,
+        Usage = FakeUsage(),
+    };
+
+    // ── Step 23 ThinkingBlock crash fix — adversarial coverage ─────────
+
+    [Fact]
+    public async Task AnswerAsync_SelectionResponseAlsoContainsThinkingBlock_DegradesToClaudeCallFailed_NeverThrows()
+    {
+        var capability = new RecordingAnalystCapability { Name = "getConversationsByDay" };
+        var fakeMessages = new SequencedFakeMessageService();
+        fakeMessages.Enqueue(ToolUseWithThinkingResponse("getConversationsByDay", Args(new { range = "7d" }), "tu_1"));
+        var service = new AnalystOrchestrationService([capability], fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+
+        var outcome = await service.AnswerAsync(BusinessId, "How many conversations this week?", CancellationToken.None);
+
+        Assert.Equal(AnalystOutcomeType.ClaudeCallFailed, outcome.Type);
+        Assert.Equal(1, fakeMessages.CallCount); // the crash happens before any capability executes or synthesis is called
+        Assert.Equal(0, capability.CallCount);
+    }
+
+    [Fact]
+    public async Task AnswerAsync_SelectionResponseAlsoContainsUnrecognizedBlockType_DegradesToClaudeCallFailed_NeverThrows()
+    {
+        var capability = new RecordingAnalystCapability { Name = "getConversationsByDay" };
+        var fakeMessages = new SequencedFakeMessageService();
+        fakeMessages.Enqueue(ToolUseWithUnrecognizedBlockResponse("getConversationsByDay", Args(new { range = "7d" }), "tu_1"));
+        var service = new AnalystOrchestrationService([capability], fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+
+        var outcome = await service.AnswerAsync(BusinessId, "How many conversations this week?", CancellationToken.None);
+
+        Assert.Equal(AnalystOutcomeType.ClaudeCallFailed, outcome.Type);
+        Assert.Equal(1, fakeMessages.CallCount);
+        Assert.Equal(0, capability.CallCount);
+    }
+
+    [Fact]
+    public async Task AnswerAsync_BothSelectionAndSynthesisCalls_ExplicitlyDisableAdaptiveThinking()
+    {
+        var capability = new RecordingAnalystCapability { Name = "getConversationsByDay" };
+        var fakeMessages = new SequencedFakeMessageService();
+        fakeMessages.Enqueue(ToolUseResponse("getConversationsByDay", Args(new { range = "7d" }), "tu_1"));
+        fakeMessages.Enqueue(TextResponse("Here is the summary."));
+        var service = new AnalystOrchestrationService([capability], fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+
+        await service.AnswerAsync(BusinessId, "How many conversations this week?", CancellationToken.None);
+
+        Assert.Equal(2, fakeMessages.Requests.Count); // selection + synthesis
+        Assert.All(fakeMessages.Requests, r =>
+        {
+            Assert.NotNull(r.Thinking);
+            Assert.IsType<ThinkingConfigDisabled>(r.Thinking!.Value);
+        });
+    }
+
     // ── The single most important test in this phase ──────────────────
     // Design §3a/§3b: a zero-tool Phase-1 selection must NEVER surface
     // Claude's own text as the answer, no matter how plausible it looks.
