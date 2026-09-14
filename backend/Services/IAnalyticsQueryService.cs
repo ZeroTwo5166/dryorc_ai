@@ -11,7 +11,20 @@ namespace backend.Services;
 /// date-window computation, grouping, zero-fill, status mappings,
 /// GetHandledBySnapshotAsync's all-history behavior) — this is not a
 /// rewrite. AnalyticsController.Get and the Step 23 Phase 3 capability tools
-/// are the two intended callers.
+/// are the two intended callers of the six members above the Step 24
+/// section below.
+///
+/// Step 24 Phase 4 (design §6.2) adds BuildCalendarWindow and five
+/// `...ForBusinessAsync` methods, purely additively — every member above
+/// this comment keeps its exact original signature and ambient-tenant
+/// behavior, unchanged, still relying entirely on AppDbContext's global
+/// query filter exactly as before. The new members below exist because
+/// those six cannot be safely called from a context with no HttpContext
+/// (Step 24's background scheduler, Phase 5/6) — see AnalyticsQueryService.cs's
+/// own doc comment and design §3.1/§6.1 for the full reasoning: the ambient
+/// ICurrentTenantAccessor resolves to null outside a request, and the
+/// existing methods would then silently return zero-filled analytics
+/// rather than failing or returning real data.
 /// </summary>
 public interface IAnalyticsQueryService
 {
@@ -43,6 +56,44 @@ public interface IAnalyticsQueryService
     Task<List<DayCountEntry>> GetHandoffsByDayAsync(AnalyticsRangeWindow window, CancellationToken cancellationToken);
 
     Task<List<StatusCountEntry>> GetTicketStatusDistributionAsync(AnalyticsRangeWindow window, CancellationToken cancellationToken);
+
+    // ─────────────────────────────────────────────────────────────────
+    // Step 24 Phase 4 (design §6.2) — additive only. See this interface's
+    // own doc comment above.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Builds an AnalyticsRangeWindow from explicit calendar-period
+    /// boundaries (Phase 2's BusinessWeekPeriodCalculator output) instead
+    /// of parsing a range key. Range is set to "calendar" — a label never
+    /// validated against ValidRangeKeys by any caller of this method
+    /// (design §6.2). Does not alter TryParseRange or the 7d/30d/90d
+    /// semantics in any way.
+    /// </summary>
+    AnalyticsRangeWindow BuildCalendarWindow(
+        DateOnly periodStartDate, DateOnly periodEndDateExclusive,
+        DateTimeOffset periodStartUtc, DateTimeOffset periodEndUtcExclusive);
+
+    /// <summary>
+    /// Explicit-tenant counterpart of GetConversationsByDayAsync — for
+    /// callers with no ambient HttpContext (design §6.2). businessId is
+    /// authoritative: the query uses IgnoreQueryFilters() plus an explicit
+    /// BusinessId predicate, never the ambient ICurrentTenantAccessor. See
+    /// AnalyticsQueryService.cs for the concrete mechanism.
+    /// </summary>
+    Task<List<DayCountEntry>> GetConversationsByDayForBusinessAsync(Guid businessId, AnalyticsRangeWindow window, CancellationToken cancellationToken);
+
+    /// <summary>Explicit-tenant counterpart of GetConversationStatusDistributionAsync. See GetConversationsByDayForBusinessAsync's doc comment.</summary>
+    Task<List<StatusCountEntry>> GetConversationStatusDistributionForBusinessAsync(Guid businessId, AnalyticsRangeWindow window, CancellationToken cancellationToken);
+
+    /// <summary>Explicit-tenant counterpart of GetHandledBySnapshotAsync — still takes no window (design §9 Decision 1 is unaffected). See GetConversationsByDayForBusinessAsync's doc comment.</summary>
+    Task<List<StatusCountEntry>> GetHandledBySnapshotForBusinessAsync(Guid businessId, CancellationToken cancellationToken);
+
+    /// <summary>Explicit-tenant counterpart of GetHandoffsByDayAsync. See GetConversationsByDayForBusinessAsync's doc comment.</summary>
+    Task<List<DayCountEntry>> GetHandoffsByDayForBusinessAsync(Guid businessId, AnalyticsRangeWindow window, CancellationToken cancellationToken);
+
+    /// <summary>Explicit-tenant counterpart of GetTicketStatusDistributionAsync. See GetConversationsByDayForBusinessAsync's doc comment.</summary>
+    Task<List<StatusCountEntry>> GetTicketStatusDistributionForBusinessAsync(Guid businessId, AnalyticsRangeWindow window, CancellationToken cancellationToken);
 }
 
 /// <summary>
