@@ -186,6 +186,11 @@ export type MeResponse = {
   // Step 49b — Business.CancelOrderToolEnabled, already loaded by Me() for
   // every page load; see settings/integrations/page.tsx.
   cancelOrderToolEnabled: boolean;
+  // Step 23 Phase 1 — Business.AiBusinessAnalystEnabled. Exposed since
+  // a1dea09, but this field's first frontend reader is analyst/page.tsx —
+  // gates both the Sidebar nav entry and the page itself (design §4: "the
+  // client hides/removes the entry point entirely").
+  aiBusinessAnalystEnabled: boolean;
 };
 
 export function register(body: RegisterRequest): Promise<RegisterResponse> {
@@ -662,6 +667,55 @@ export type AnalyticsResponse = {
 
 export function getAnalytics(range: AnalyticsRange): Promise<AnalyticsResponse> {
   return api.get(`/api/analytics?range=${range}`);
+}
+
+// Talks to backend/Controllers/AnalystController.cs (Step 23 Phase 5).
+
+export type AnalystOutcome = "Answered" | "Refused" | "CapabilityFailed" | "ClaudeCallFailed" | "Disabled";
+
+export type AnalystAnswerResponse = {
+  outcome: AnalystOutcome;
+  message: string; // never null — the synthesized answer, or a fixed backend-authored explanation for every other outcome
+};
+
+// Deliberately bypasses api.post()/apiFetch() — every one of this
+// endpoint's outcomes (Answered/Refused at 200, Disabled at 403,
+// CapabilityFailed at 500, ClaudeCallFailed at 502) returns a well-formed
+// { outcome, message } body meant to be rendered as a real analyst
+// response, not a network/request failure. apiFetch's parseErrorBody only
+// unwraps ASP.NET's own {errors}/{title} shapes; for anything else
+// (this one included) it falls through to the raw JSON text, which would
+// force the caller to re-parse ApiError.message itself. Handling all four
+// statuses directly here instead keeps analyst/page.tsx's render logic to
+// one path for every outcome.
+//
+// A real 401 (no body, standard [Authorize] behavior) still means "your
+// session died" exactly like every other authenticated endpoint, so it
+// still goes through the same centralized unauthorizedHandler apiFetch
+// itself can't reach (see setUnauthorizedHandler above). A 400
+// (blank/whitespace question) should be unreachable in practice —
+// analyst/page.tsx guards against submitting an empty question before
+// this is ever called — so it's treated as a generic request failure
+// rather than given its own outcome handling.
+export async function askAnalyst(question: string): Promise<AnalystAnswerResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/analyst`, {
+    method: "POST",
+    credentials: "include",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question }),
+  });
+
+  if (res.status === 401) {
+    unauthorizedHandler?.();
+    throw new ApiError(401, "Your session has expired.");
+  }
+
+  if (res.status === 200 || res.status === 403 || res.status === 500 || res.status === 502) {
+    return res.json();
+  }
+
+  throw new ApiError(res.status, parseErrorBody(await res.text().catch(() => "")) || `Request failed (${res.status}).`);
 }
 
 // ── Step 18: Business Integration Framework ─────────────────────────────

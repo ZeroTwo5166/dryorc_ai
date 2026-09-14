@@ -14,6 +14,7 @@ import {
   IconSend,
   IconSettings,
   IconShieldCheck,
+  IconTarget,
   IconUserCheck,
   IconWorkflow,
 } from "../landing/icons";
@@ -38,40 +39,18 @@ type NavSection = {
 // Icon choices below all come from the existing hand-drawn set in
 // ../landing/icons — none of the "ideal" icons for these items (a
 // dashboard-grid glyph, an inbox tray, a people glyph, a book, a ticket, a
-// user-cog, a plug, a combo chart) actually exist there, and this app's
-// icon system is a small closed set of custom SVGs, not a swappable library
-// — so each item below uses the closest existing icon instead of a new
-// one-off implementation: IconMonitor (a screen) for the dashboard-like
-// Overview, IconMail (a literal inbox) for Inbox, IconUserCheck (a person)
-// for Customers, IconWorkflow (connected content blocks) for Knowledge
-// base, IconMessageSquare (a ticket-as-conversation) for Tickets,
-// IconShieldCheck (roles/trust) for Team, IconSend (data in/out) for
-// Integrations, and IconRadar (live metrics) for Analytics.
-const navSections: NavSection[] = [
-  {
-    label: "Main",
-    items: [
-      { label: "Overview", icon: IconMonitor, href: "/home" },
-      { label: "Inbox", icon: IconMail, href: "/conversations" },
-      { label: "Customers", icon: IconUserCheck, href: "/customers" },
-      { label: "Knowledge base", icon: IconWorkflow, href: "/knowledge" },
-      { label: "Tickets", icon: IconMessageSquare, href: "/tickets" },
-    ],
-  },
-  {
-    label: "Manage",
-    items: [
-      { label: "Team", icon: IconShieldCheck, soon: true },
-      { label: "Integrations", icon: IconSend, soon: true },
-      { label: "Analytics", icon: IconRadar, href: "/analytics" },
-    ],
-  },
-  {
-    label: "System",
-    items: [{ label: "Settings", icon: IconSettings, href: "/settings/integrations" }],
-  },
-];
-
+// user-cog, a plug, a combo chart, a chat-bot/insight glyph) actually exist
+// there, and this app's icon system is a small closed set of custom SVGs,
+// not a swappable library — so each item below uses the closest existing
+// icon instead of a new one-off implementation: IconMonitor (a screen) for
+// the dashboard-like Overview, IconMail (a literal inbox) for Inbox,
+// IconUserCheck (a person) for Customers, IconWorkflow (connected content
+// blocks) for Knowledge base, IconMessageSquare (a ticket-as-conversation)
+// for Tickets, IconShieldCheck (roles/trust) for Team, IconSend (data in/
+// out) for Integrations, IconRadar (live metrics) for Analytics, and
+// IconTarget (precision/insight) for Analyst — unused anywhere else in the
+// dashboard, closest available stand-in for "ask a question, get an
+// answer."
 const STORAGE_KEY = "nivora.sidebar.collapsed";
 
 // Follows the theme like everything else (white/light-grey in light mode,
@@ -143,6 +122,39 @@ export function Sidebar() {
 
   const nivora = theme === "nivora";
   const initial = user.businessName.trim().charAt(0).toUpperCase() || "N";
+
+  // Computed per-render (not a static module-level const, unlike before) —
+  // the Analyst item's presence depends on user.aiBusinessAnalystEnabled,
+  // per design §4's "the client hides/removes the entry point entirely."
+  // A disabled business must see no trace of this item, not a disabled/
+  // "Soon" row like Team/Integrations get.
+  const navSections: NavSection[] = [
+    {
+      label: "Main",
+      items: [
+        { label: "Overview", icon: IconMonitor, href: "/home" },
+        { label: "Inbox", icon: IconMail, href: "/conversations" },
+        { label: "Customers", icon: IconUserCheck, href: "/customers" },
+        { label: "Knowledge base", icon: IconWorkflow, href: "/knowledge" },
+        { label: "Tickets", icon: IconMessageSquare, href: "/tickets" },
+      ],
+    },
+    {
+      label: "Manage",
+      items: [
+        { label: "Team", icon: IconShieldCheck, soon: true },
+        { label: "Integrations", icon: IconSend, soon: true },
+        { label: "Analytics", icon: IconRadar, href: "/analytics" },
+        ...(user.aiBusinessAnalystEnabled
+          ? [{ label: "Analyst", icon: IconTarget, href: "/analyst" }]
+          : []),
+      ],
+    },
+    {
+      label: "System",
+      items: [{ label: "Settings", icon: IconSettings, href: "/settings/integrations" }],
+    },
+  ];
 
   // Unchanged from the original single-list render — just factored out so
   // it can run once per section instead of once for the whole flat list.
