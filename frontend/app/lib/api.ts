@@ -629,6 +629,41 @@ export function updateTicketPriority(id: string, priority: TicketPriority): Prom
   return api.put(`/api/tickets/${id}/priority`, { priority });
 }
 
+// Talks to backend/Controllers/AnalyticsController.cs (Step 21).
+
+export type AnalyticsRange = "7d" | "30d" | "90d";
+
+export type DayCountEntry = {
+  day: string; // DateOnly, "YYYY-MM-DD"
+  count: number;
+};
+
+export type StatusCountEntry = {
+  status: string;
+  count: number;
+};
+
+// ConversationStatusDistribution/TicketStatusDistribution are scoped to
+// [rangeStart, rangeEnd) like ConversationsByDay/HandoffsByDay. HandledBySnapshot
+// is the one exception: an all-history current-state snapshot that ignores
+// range/rangeStart/rangeEnd entirely (backend/Services/AnalyticsQueryService.cs
+// GetHandledBySnapshotAsync) — locked by docs/handoffs/step-21-analytics-design.md
+// §9 Decision 1. Never present it as scoped to the selected range.
+export type AnalyticsResponse = {
+  range: AnalyticsRange;
+  rangeStart: string; // DateOnly, "YYYY-MM-DD"
+  rangeEnd: string; // DateOnly, "YYYY-MM-DD", exclusive upper bound
+  conversationsByDay: DayCountEntry[];
+  conversationStatusDistribution: StatusCountEntry[];
+  handledBySnapshot: StatusCountEntry[];
+  handoffsByDay: DayCountEntry[];
+  ticketStatusDistribution: StatusCountEntry[];
+};
+
+export function getAnalytics(range: AnalyticsRange): Promise<AnalyticsResponse> {
+  return api.get(`/api/analytics?range=${range}`);
+}
+
 // ── Step 18: Business Integration Framework ─────────────────────────────
 
 export type Integration = {

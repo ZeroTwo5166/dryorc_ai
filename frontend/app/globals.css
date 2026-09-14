@@ -34,6 +34,18 @@
   --destructive-soft: #fdecef;
 
   --ring: #4a5cff;
+
+  /*
+   * Chart-only token, Step 21 (Analytics). The generic --orange above is
+   * validated CVD-safe (dataviz skill's validate_palette.js) for status-
+   * distribution chart marks on the LIGHT chart surface only — on the dark
+   * surface it fails the lightness-band check (too light against a dark
+   * background), so it gets its own darker step, matching this file's
+   * existing per-token dark-override convention. No other categorical chart
+   * color (accent/success/purple/pink) needed a chart-specific override —
+   * only this one failed the dark check.
+   */
+  --chart-orange: #f97316;
 }
 
 /*
@@ -72,6 +84,8 @@
   --orange-soft: #2e1d10;
   --pink-soft: #2e1626;
   --destructive-soft: #341620;
+
+  --chart-orange: #c2410c;
 }
 
 /*
@@ -141,6 +155,8 @@
   --color-destructive-soft: var(--destructive-soft);
 
   --color-ring: var(--ring);
+
+  --color-chart-orange: var(--chart-orange);
 
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);

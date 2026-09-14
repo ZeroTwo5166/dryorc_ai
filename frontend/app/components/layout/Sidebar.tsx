@@ -63,7 +63,7 @@ const navSections: NavSection[] = [
     items: [
       { label: "Team", icon: IconShieldCheck, soon: true },
       { label: "Integrations", icon: IconSend, soon: true },
-      { label: "Analytics", icon: IconRadar, soon: true },
+      { label: "Analytics", icon: IconRadar, href: "/analytics" },
     ],
   },
   {
