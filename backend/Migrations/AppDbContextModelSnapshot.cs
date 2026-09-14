@@ -1480,6 +1480,56 @@ namespace backend.Migrations
                         });
                 });
 
+            modelBuilder.Entity("backend.Models.ScheduledReportRun", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("uuid");
+
+                    b.Property<Guid>("BusinessId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTimeOffset>("ClaimedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("FailureReason")
+                        .HasMaxLength(512)
+                        .HasColumnType("character varying(512)");
+
+                    b.Property<Guid?>("RecipientOwnerId")
+                        .HasColumnType("uuid");
+
+                    b.Property<DateTimeOffset>("ReportPeriodEnd")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset>("ReportPeriodStart")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<DateTimeOffset?>("SentAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("BusinessId")
+                        .HasDatabaseName("IX_ScheduledReportRuns_BusinessId_Processing")
+                        .HasFilter("\"Status\" = 'Processing'");
+
+                    b.HasIndex("RecipientOwnerId");
+
+                    b.HasIndex("BusinessId", "ReportPeriodStart")
+                        .IsUnique();
+
+                    b.ToTable("ScheduledReportRuns", t =>
+                        {
+                            t.HasCheckConstraint("CK_ScheduledReportRuns_SentAt", "(\"Status\" = 'Sent' AND \"SentAt\" IS NOT NULL)\r\nOR\r\n(\"Status\" <> 'Sent' AND \"SentAt\" IS NULL)");
+                        });
+                });
+
             modelBuilder.Entity("backend.Models.SlaTarget", b =>
                 {
                     b.Property<Guid>("Id")
@@ -2212,6 +2262,20 @@ namespace backend.Migrations
                         .HasForeignKey("RefundId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
+                });
+
+            modelBuilder.Entity("backend.Models.ScheduledReportRun", b =>
+                {
+                    b.HasOne("backend.Models.Business", null)
+                        .WithMany()
+                        .HasForeignKey("BusinessId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+
+                    b.HasOne("backend.Models.ApplicationUser", null)
+                        .WithMany()
+                        .HasForeignKey("RecipientOwnerId")
+                        .OnDelete(DeleteBehavior.SetNull);
                 });
 
             modelBuilder.Entity("backend.Models.SlaTarget", b =>

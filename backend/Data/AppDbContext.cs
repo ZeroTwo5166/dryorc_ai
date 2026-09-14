@@ -65,6 +65,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
     public DbSet<BusinessSigningKey> BusinessSigningKeys => Set<BusinessSigningKey>();
     public DbSet<ConsumedSignedIdentityToken> ConsumedSignedIdentityTokens => Set<ConsumedSignedIdentityToken>();
     public DbSet<Approval> Approvals => Set<Approval>();
+    public DbSet<ScheduledReportRun> ScheduledReportRuns => Set<ScheduledReportRun>();
 
     // Step 18: the ASP.NET Core Data Protection key ring, persisted here
     // (Postgres) instead of the framework's filesystem default — see
@@ -937,6 +938,48 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
             ap.HasOne<Refund>().WithMany()
                 .HasForeignKey(x => x.RefundId)
                 .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        // ─────────────────────────────────────────────────────────────
+        // ScheduledReportRun — Step 24 Phase 3. Persistence only; see
+        // ScheduledReportRun.cs's own doc comment.
+        // ─────────────────────────────────────────────────────────────
+        builder.Entity<ScheduledReportRun>(r =>
+        {
+            r.Property(x => x.Status).HasConversion<string>().HasMaxLength(32);
+            r.Property(x => x.FailureReason).HasMaxLength(512);
+
+            // The locked uniqueness requirement - the sole idempotency
+            // arbiter's DB-level backstop (design §12.2).
+            r.HasIndex(x => new { x.BusinessId, x.ReportPeriodStart }).IsUnique();
+
+            // Due-polling support index (design §15.3) - Processing rows
+            // are what a future stuck-row sweep or operational query would
+            // scan for; a partial index keeps it cheap regardless of total
+            // historical row count, matching
+            // IX_OrderCancellations_BusinessId_ExternalOrderId_Pending's
+            // established partial-index shape, though this one is
+            // non-unique (multiple businesses can legitimately be
+            // Processing at once).
+            r.HasIndex(x => x.BusinessId)
+                .HasDatabaseName("IX_ScheduledReportRuns_BusinessId_Processing")
+                .HasFilter("\"Status\" = 'Processing'");
+
+            r.ToTable(t => t.HasCheckConstraint(
+                "CK_ScheduledReportRuns_SentAt",
+                """
+                ("Status" = 'Sent' AND "SentAt" IS NOT NULL)
+                OR
+                ("Status" <> 'Sent' AND "SentAt" IS NULL)
+                """));
+
+            r.HasOne<Business>().WithMany()
+                .HasForeignKey(x => x.BusinessId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            r.HasOne<ApplicationUser>().WithMany()
+                .HasForeignKey(x => x.RecipientOwnerId)
+                .OnDelete(DeleteBehavior.SetNull);
         });
 
         // ─────────────────────────────────────────────────────────────
