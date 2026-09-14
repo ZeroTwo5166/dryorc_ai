@@ -96,6 +96,21 @@ public class Business
     /// </summary>
     public bool AiBusinessAnalystEnabled { get; set; } = false;
 
+    /// <summary>
+    /// Step 24 Phase 1 — kill switch for the Scheduled AI Reports feature
+    /// (docs/handoffs/step-24-scheduled-ai-reports-design.md, locked Decision
+    /// 3: "disabled by default; Owner-controlled; enablement checked at
+    /// send/execution time, not discovery time"). Read here (this column's
+    /// persisted value) is what the not-yet-built Step 24 scheduler will
+    /// check, both at discovery time (as an optimization) and again,
+    /// authoritatively, immediately before send — this column itself does
+    /// not distinguish the two checks, that distinction lives entirely in
+    /// the future scheduler/execution service, not in this flag. Default
+    /// false — opt-in, not opt-out, matching every other kill switch in this
+    /// file (ShopifyReadToolsEnabled, AiBusinessAnalystEnabled above).
+    /// </summary>
+    public bool ScheduledReportsEnabled { get; set; } = false;
+
 
     /// <summary>
     /// Maximum refund amount Nivora may execute autonomously (Mode = Auto)

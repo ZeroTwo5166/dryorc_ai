@@ -24,7 +24,8 @@ public record MeResponse(
     IReadOnlyList<string> Roles,
     DateTimeOffset ExpiresAtUtc,
     bool CancelOrderToolEnabled,
-    bool AiBusinessAnalystEnabled);
+    bool AiBusinessAnalystEnabled,
+    bool ScheduledReportsEnabled);
 
 public record ConfirmEmailRequest(Guid UserId, string Token);
 

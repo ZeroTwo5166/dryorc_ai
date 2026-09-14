@@ -447,6 +447,9 @@ namespace backend.Migrations
                     b.Property<int>("RetentionDays")
                         .HasColumnType("integer");
 
+                    b.Property<bool>("ScheduledReportsEnabled")
+                        .HasColumnType("boolean");
+
                     b.Property<bool>("ShopifyReadToolsEnabled")
                         .HasColumnType("boolean");
 

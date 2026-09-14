@@ -25,6 +25,11 @@ public static class AuditEventTypes
     public const string BusinessAiBusinessAnalystEnabled = "BusinessAiBusinessAnalystEnabled";
     public const string BusinessAiBusinessAnalystDisabled = "BusinessAiBusinessAnalystDisabled";
 
+    // Business — Scheduled AI Reports kill switch (Step 24 Phase 1). Named
+    // like BusinessAiBusinessAnalystEnabled/Disabled above, for the same reason.
+    public const string BusinessScheduledReportsEnabled = "BusinessScheduledReportsEnabled";
+    public const string BusinessScheduledReportsDisabled = "BusinessScheduledReportsDisabled";
+
     // Customer
     public const string CustomerFieldUpdated = "CustomerFieldUpdated";
     public const string CustomerDeleted = "CustomerDeleted";

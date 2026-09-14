@@ -21,6 +21,10 @@ public record SetAiBusinessAnalystEnabledRequest(bool Enabled);
 
 public record SetAiBusinessAnalystEnabledResponse(bool AiBusinessAnalystEnabled);
 
+public record SetScheduledReportsEnabledRequest(bool Enabled);
+
+public record SetScheduledReportsEnabledResponse(bool ScheduledReportsEnabled);
+
 /// <summary>
 /// Step 49b — Business-level settings. First real caller of AuditEntityTypes.Business.
 /// Reads: AnyStaff (matches MeResponse, which already exposes CancelOrderToolEnabled
@@ -175,6 +179,58 @@ public class BusinessController(
         return Ok(new SetAiBusinessAnalystEnabledResponse(business.AiBusinessAnalystEnabled));
     }
 
+    /// <summary>
+    /// Step 24 Phase 1 (design §20; plan §2 Phase 1) — kill switch for the
+    /// Scheduled AI Reports feature. Modeled directly on
+    /// SetAiBusinessAnalystEnabled above, mechanically: OwnerOnly, idempotent
+    /// (no write/audit on a same-value request), audits every real
+    /// transition. Like AiBusinessAnalystEnabled and unlike
+    /// CancelOrderToolEnabled, there is no precondition to check here — this
+    /// flag has no external-integration dependency comparable to Shopify.
+    /// This phase creates only the flag and this toggle — no scheduler, no
+    /// execution logic, no background-service DI registration exists yet;
+    /// per the locked opt-in decision, existing businesses stay disabled
+    /// (this endpoint is the only way the flag will ever become true).
+    /// </summary>
+    [HttpPut("scheduled-reports")]
+    [Authorize(Policy = NivoraPolicies.OwnerOnly)]
+    public async Task<IActionResult> SetScheduledReportsEnabled([FromBody] SetScheduledReportsEnabledRequest request)
+    {
+        var businessId = tenantAccessor.BusinessId
+            ?? throw new InvalidOperationException("Authenticated but no tenant resolved — unreachable behind [Authorize].");
+
+        var business = await db.Businesses.FirstOrDefaultAsync(b => b.Id == businessId);
+        if (business is null)
+        {
+            return Unauthorized();
+        }
+
+        // Idempotent no-op — matching SetAiBusinessAnalystEnabled's own
+        // convention of only auditing real transitions.
+        if (business.ScheduledReportsEnabled == request.Enabled)
+        {
+            return Ok(new SetScheduledReportsEnabledResponse(business.ScheduledReportsEnabled));
+        }
+
+        var oldValue = SerializeScheduledReportsAuditValue(business);
+        business.ScheduledReportsEnabled = request.Enabled;
+        business.UpdatedAt = DateTimeOffset.UtcNow;
+
+        await auditLogService.LogAsync(
+            businessId,
+            AuditEntityTypes.Business,
+            businessId.ToString(),
+            request.Enabled ? AuditEventTypes.BusinessScheduledReportsEnabled : AuditEventTypes.BusinessScheduledReportsDisabled,
+            ActorType.NivoraBusinessStaff,
+            changedByUserId: CurrentUserId,
+            oldValue: oldValue,
+            newValue: SerializeScheduledReportsAuditValue(business));
+
+        await db.SaveChangesAsync();
+
+        return Ok(new SetScheduledReportsEnabledResponse(business.ScheduledReportsEnabled));
+    }
+
     /// <summary>Deliberately hand-picked, safe fields only — never the full
     /// Business entity, never PII, matching
     /// IntegrationsController.SerializeAuditValue's own convention.</summary>
@@ -185,4 +241,9 @@ public class BusinessController(
     /// AiBusinessAnalystEnabled field.</summary>
     private static string SerializeAiBusinessAnalystAuditValue(Business business) =>
         JsonSerializer.Serialize(new { business.AiBusinessAnalystEnabled });
+
+    /// <summary>Same convention as SerializeAuditValue above, scoped to the
+    /// ScheduledReportsEnabled field.</summary>
+    private static string SerializeScheduledReportsAuditValue(Business business) =>
+        JsonSerializer.Serialize(new { business.ScheduledReportsEnabled });
 }
