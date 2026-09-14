@@ -246,6 +246,7 @@ builder.Services.AddScoped<IConversationClassificationService, ConversationClass
 builder.Services.AddScoped<IConversationTagCorrectionService, ConversationTagCorrectionService>();
 builder.Services.AddScoped<ITicketSlaService, TicketSlaService>();
 builder.Services.AddScoped<IAuditLogService, AuditLogService>();
+builder.Services.AddScoped<IAnalyticsQueryService, AnalyticsQueryService>();
 
 // Step 18: Business Integration Framework (generic OAuth connect/callback/
 // disconnect — see Controllers/IntegrationsController.cs). Encryption rides

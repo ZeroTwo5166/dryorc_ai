@@ -4,6 +4,7 @@ using backend.Data;
 using backend.Enums;
 using backend.Interfaces;
 using backend.Models;
+using backend.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -199,11 +200,11 @@ public class AnalyticsControllerTests : IAsyncLifetime
         }
 
         await using var dbA = DbFor(bizA);
-        var resultA = await new AnalyticsController(dbA).Get("7d", CancellationToken.None);
+        var resultA = await new AnalyticsController(new AnalyticsQueryService(dbA)).Get("7d", CancellationToken.None);
         var responseA = Assert.IsType<AnalyticsResponse>(Assert.IsType<Microsoft.AspNetCore.Mvc.OkObjectResult>(resultA.Result).Value);
 
         await using var dbB = DbFor(bizB);
-        var resultB = await new AnalyticsController(dbB).Get("7d", CancellationToken.None);
+        var resultB = await new AnalyticsController(new AnalyticsQueryService(dbB)).Get("7d", CancellationToken.None);
         var responseB = Assert.IsType<AnalyticsResponse>(Assert.IsType<Microsoft.AspNetCore.Mvc.OkObjectResult>(resultB.Result).Value);
 
         Assert.Equal(5, responseA.ConversationsByDay.Sum(d => d.Count));
@@ -241,9 +242,9 @@ public class AnalyticsControllerTests : IAsyncLifetime
         }
 
         await using var dbA = DbFor(bizA);
-        var responseA = OkValue(await new AnalyticsController(dbA).Get("7d", CancellationToken.None));
+        var responseA = OkValue(await new AnalyticsController(new AnalyticsQueryService(dbA)).Get("7d", CancellationToken.None));
         await using var dbB = DbFor(bizB);
-        var responseB = OkValue(await new AnalyticsController(dbB).Get("7d", CancellationToken.None));
+        var responseB = OkValue(await new AnalyticsController(new AnalyticsQueryService(dbB)).Get("7d", CancellationToken.None));
 
         Assert.Equal(2, responseA.ConversationStatusDistribution.Single(s => s.Status == "Open").Count);
         Assert.Equal(1, responseA.ConversationStatusDistribution.Single(s => s.Status == "Closed").Count);
@@ -281,9 +282,9 @@ public class AnalyticsControllerTests : IAsyncLifetime
         foreach (var range in new[] { "7d", "90d" })
         {
             await using var dbA = DbFor(bizA);
-            var responseA = OkValue(await new AnalyticsController(dbA).Get(range, CancellationToken.None));
+            var responseA = OkValue(await new AnalyticsController(new AnalyticsQueryService(dbA)).Get(range, CancellationToken.None));
             await using var dbB = DbFor(bizB);
-            var responseB = OkValue(await new AnalyticsController(dbB).Get(range, CancellationToken.None));
+            var responseB = OkValue(await new AnalyticsController(new AnalyticsQueryService(dbB)).Get(range, CancellationToken.None));
 
             // Decision 1: identical regardless of range — the 250/300-day-old
             // rows still count, proving no range filter leaked in.
@@ -318,9 +319,9 @@ public class AnalyticsControllerTests : IAsyncLifetime
         }
 
         await using var dbA = DbFor(bizA);
-        var responseA = OkValue(await new AnalyticsController(dbA).Get("7d", CancellationToken.None));
+        var responseA = OkValue(await new AnalyticsController(new AnalyticsQueryService(dbA)).Get("7d", CancellationToken.None));
         await using var dbB = DbFor(bizB);
-        var responseB = OkValue(await new AnalyticsController(dbB).Get("7d", CancellationToken.None));
+        var responseB = OkValue(await new AnalyticsController(new AnalyticsQueryService(dbB)).Get("7d", CancellationToken.None));
 
         Assert.Equal(3, responseA.HandoffsByDay.Single(d => d.Day == todayOnly).Count);
         Assert.Equal(1, responseB.HandoffsByDay.Single(d => d.Day == todayOnly).Count);
@@ -352,9 +353,9 @@ public class AnalyticsControllerTests : IAsyncLifetime
         }
 
         await using var dbA = DbFor(bizA);
-        var responseA = OkValue(await new AnalyticsController(dbA).Get("7d", CancellationToken.None));
+        var responseA = OkValue(await new AnalyticsController(new AnalyticsQueryService(dbA)).Get("7d", CancellationToken.None));
         await using var dbB = DbFor(bizB);
-        var responseB = OkValue(await new AnalyticsController(dbB).Get("7d", CancellationToken.None));
+        var responseB = OkValue(await new AnalyticsController(new AnalyticsQueryService(dbB)).Get("7d", CancellationToken.None));
 
         Assert.Equal(2, responseA.TicketStatusDistribution.Single(s => s.Status == "Open").Count);
         Assert.Equal(1, responseA.TicketStatusDistribution.Single(s => s.Status == "InProgress").Count);
@@ -375,7 +376,7 @@ public class AnalyticsControllerTests : IAsyncLifetime
         var (bizA, _, _) = await SeedBusinessAsync("Analytics Biz Empty");
 
         await using var dbA = DbFor(bizA);
-        var response = OkValue(await new AnalyticsController(dbA).Get("7d", CancellationToken.None));
+        var response = OkValue(await new AnalyticsController(new AnalyticsQueryService(dbA)).Get("7d", CancellationToken.None));
 
         Assert.Equal(7, response.ConversationsByDay.Count);
         Assert.All(response.ConversationsByDay, d => Assert.Equal(0, d.Count));
@@ -411,7 +412,7 @@ public class AnalyticsControllerTests : IAsyncLifetime
         }
 
         await using var dbA = DbFor(bizA);
-        var response = OkValue(await new AnalyticsController(dbA).Get("30d", CancellationToken.None));
+        var response = OkValue(await new AnalyticsController(new AnalyticsQueryService(dbA)).Get("30d", CancellationToken.None));
 
         Assert.Equal(30, response.ConversationsByDay.Count);
         Assert.Equal(1, response.ConversationsByDay.Single(d => d.Day == todayOnly).Count);
@@ -429,7 +430,7 @@ public class AnalyticsControllerTests : IAsyncLifetime
         var (bizA, _, _) = await SeedBusinessAsync($"Analytics Biz Boundary {range}");
 
         await using var dbA = DbFor(bizA);
-        var response = OkValue(await new AnalyticsController(dbA).Get(range, CancellationToken.None));
+        var response = OkValue(await new AnalyticsController(new AnalyticsQueryService(dbA)).Get(range, CancellationToken.None));
 
         Assert.Equal(expectedDays, response.ConversationsByDay.Count);
         Assert.Equal(expectedDays, response.HandoffsByDay.Count);
@@ -451,7 +452,7 @@ public class AnalyticsControllerTests : IAsyncLifetime
         var (bizA, _, _) = await SeedBusinessAsync("Analytics Biz Invalid Range");
         await using var dbA = DbFor(bizA);
 
-        var result = await new AnalyticsController(dbA).Get("14d", CancellationToken.None);
+        var result = await new AnalyticsController(new AnalyticsQueryService(dbA)).Get("14d", CancellationToken.None);
 
         Assert.IsType<Microsoft.AspNetCore.Mvc.BadRequestObjectResult>(result.Result);
     }
