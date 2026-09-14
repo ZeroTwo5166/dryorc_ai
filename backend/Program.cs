@@ -252,6 +252,7 @@ builder.Services.AddScoped<IAnalystCapability, GetConversationStatusDistribution
 builder.Services.AddScoped<IAnalystCapability, GetHandledBySnapshotCapability>();
 builder.Services.AddScoped<IAnalystCapability, GetHandoffsByDayCapability>();
 builder.Services.AddScoped<IAnalystCapability, GetTicketStatusDistributionCapability>();
+builder.Services.AddScoped<IAnalystOrchestrationService, AnalystOrchestrationService>();
 
 // Step 18: Business Integration Framework (generic OAuth connect/callback/
 // disconnect — see Controllers/IntegrationsController.cs). Encryption rides
