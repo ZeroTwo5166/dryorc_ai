@@ -101,6 +101,15 @@ public static class AuditEventTypes
     public const string ConversationModeOverridden = "ConversationModeOverridden";
 
     /// <summary>
+    /// Step 25 Candidate 2, Phase 3 (design §6, Decision 4) — written by
+    /// ConversationInactivityCloseService on every successful automated
+    /// close, ActorType.NivoraSystem, in the same transaction as the
+    /// Conversation.Status mutation (Option A — see design §6 for why this
+    /// is achievable, not merely best-effort).
+    /// </summary>
+    public const string ConversationAutoClosed = "ConversationAutoClosed";
+
+    /// <summary>
     /// Step 22 Phase 3 — written by ConversationTagCorrectionService on every
     /// successful staff correction of Conversation.Tags, in the same
     /// transaction as the Tags mutation and the
