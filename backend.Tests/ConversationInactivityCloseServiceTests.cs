@@ -32,6 +32,7 @@ namespace backend.Tests;
 ///    verification (not committed as a permanent test) — see the
 ///    accompanying handoff/commit message, not this file, for that record.
 /// </summary>
+[Collection("ConversationAutoClose")]
 public class ConversationInactivityCloseServiceTests : IAsyncLifetime
 {
     private ServiceProvider _provider = null!;

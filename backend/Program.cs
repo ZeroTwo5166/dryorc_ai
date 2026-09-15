@@ -123,6 +123,16 @@ builder.Services.AddScoped<IConversationPurgeService, ConversationPurgeService>(
 builder.Services.AddScoped<ICustomerErasureService, CustomerErasureService>();
 builder.Services.AddScoped<IRetentionEnforcementService, RetentionEnforcementService>();
 builder.Services.AddScoped<IVerificationCodeCleanupService, VerificationCodeCleanupService>();
+// Step 25 Candidate 2, Phase 4 — stale/inactive Conversation auto-close,
+// the fourth job DataLifecycleBackgroundService runs each tick (design
+// docs/handoffs/step-25-candidate2-stale-conversation-autoclose-design.md).
+// Business.ConversationAutoCloseEnabled defaults to false for every
+// existing business, so this registration changes production behavior
+// for zero real businesses until an Owner explicitly opts in via
+// PUT /api/business/conversation-auto-close — the same "ship dark,
+// opt-in later" pattern every other kill switch in this file already
+// used (CancelOrderToolEnabled/AiBusinessAnalystEnabled/ScheduledReportsEnabled).
+builder.Services.AddScoped<IConversationInactivityCloseService, ConversationInactivityCloseService>();
 builder.Services.AddHostedService<DataLifecycleBackgroundService>();
 
 // Notification system — no live caller yet, registered as ready-to-call

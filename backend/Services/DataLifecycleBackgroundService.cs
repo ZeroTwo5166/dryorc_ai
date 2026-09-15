@@ -14,8 +14,8 @@ namespace backend.Services;
 /// BackgroundService is host-lifecycle glue, not something worth
 /// exercising through its own timer in a test.
 ///
-/// Step 25 Candidate 2, Phase 2 — each job now runs behind its own
-/// independent error boundary (RunJobAsync below), mirroring
+/// Step 25 Candidate 2, Phase 2 — each job runs behind its own independent
+/// error boundary (RunJobAsync below), mirroring
 /// ScheduledReportBackgroundService's own already-proven per-run
 /// catch/log/continue shape (ScheduledReportBackgroundService.cs:79-94),
 /// applied here at per-JOB granularity instead of per-claimed-run.
@@ -25,11 +25,17 @@ namespace backend.Services;
 /// unconfigured .NET default BackgroundServiceExceptionBehavior.StopHost
 /// taking down the entire application host over one job's failure — a
 /// real, pre-existing risk (present since this class's original three-job
-/// form), closed here for all three jobs. See
+/// form), closed here. See
 /// docs/handoffs/step-25-candidate2-stale-conversation-autoclose-design.md
-/// §1.2/§1.3 for the full analysis this refactor implements. This phase
-/// deliberately does not add a fourth job (auto-close) — that is Phase 4's
-/// own, later scope.
+/// §1.2/§1.3 for the full analysis this refactor implements.
+///
+/// Step 25 Candidate 2, Phase 4 — the fourth job, stale/inactive
+/// Conversation auto-close (ConversationInactivityCloseService), added
+/// through the exact same RunJobAsync boundary Phase 2 already built and
+/// adversarially proved for the original three jobs — no bespoke handling
+/// for this one. Business.ConversationAutoCloseEnabled defaults to false
+/// for every business, so this job is a correct no-op everywhere until an
+/// Owner explicitly opts in (Phase 1's endpoint).
 ///
 /// AppDbContext is Scoped, so a fresh DI scope is created per tick rather
 /// than resolving the two services once at startup.
@@ -58,6 +64,10 @@ public class DataLifecycleBackgroundService(
 
             await RunJobAsync(scope.ServiceProvider, "ConsumedSignedIdentityTokenCleanup",
                 sp => sp.GetRequiredService<IConsumedSignedIdentityTokenCleanupService>().CleanupExpiredAsync(stoppingToken),
+                stoppingToken);
+
+            await RunJobAsync(scope.ServiceProvider, "ConversationInactivityClose",
+                sp => sp.GetRequiredService<IConversationInactivityCloseService>().CloseInactiveConversationsAsync(stoppingToken),
                 stoppingToken);
         } while (await timer.WaitForNextTickAsync(stoppingToken));
     }
