@@ -356,7 +356,7 @@ public class ConversationInactivityCloseServiceTests : IAsyncLifetime
     // ── Condition 1 — still Open ─────────────────────────────────────
 
     [Fact]
-    public async Task TryCloseConversation_AlreadyClosedByAnotherWorker_NotReprocessed_NoAuditRow()
+    public async Task TryCloseConversation_AlreadyClosedByAnotherWorker_NotReprocessed_NoDuplicateAudit()
     {
         await using var scope = _provider.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -367,19 +367,23 @@ public class ConversationInactivityCloseServiceTests : IAsyncLifetime
         var now = DateTimeOffset.UtcNow;
         var conversationId = await CreateConversationAsync(db, businessId, widgetId, now.AddDays(-90), now.AddDays(-20));
 
-        // Simulate another worker closing it first, via a second, independent context.
-        await using (var otherWorkerDb = DbFor())
-        {
-            var conv = await otherWorkerDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversationId);
-            conv.Status = ConversationStatus.Closed;
-            conv.UpdatedAt = now;
-            await otherWorkerDb.SaveChangesAsync();
-        }
+        // Two GENUINELY separate claim attempts against the same guarded
+        // UPDATE — not a raw state poke standing in for "already closed."
+        // A second, independent ConversationInactivityCloseService (its
+        // own AppDbContext, its own AuditLogService) performs a real claim
+        // attempt first and must actually win it.
+        await using var otherWorkerDb = DbFor();
+        var otherWorkerService = new ConversationInactivityCloseService(
+            otherWorkerDb, new AuditLogService(otherWorkerDb), NullLogger<ConversationInactivityCloseService>.Instance);
+        var otherWorkerResult = await otherWorkerService.TryCloseConversationAsync(businessId, conversationId, now, CancellationToken.None);
+        Assert.True(otherWorkerResult); // the other worker's own claim genuinely succeeded
 
+        // THIS worker's own claim attempt, on the same conversation,
+        // through the same guarded UPDATE — must lose the race.
         var result = await service.TryCloseConversationAsync(businessId, conversationId, now, CancellationToken.None);
 
         Assert.False(result);
-        Assert.Equal(0, await AuditCountAsync(conversationId)); // no duplicate audit for the already-closed row
+        Assert.Equal(1, await AuditCountAsync(conversationId)); // exactly one — the winner's — never a duplicate
     }
 
     // ── Condition 2 — still past the inactivity threshold ────────────
