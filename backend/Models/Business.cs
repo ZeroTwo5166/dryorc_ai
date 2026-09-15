@@ -111,6 +111,32 @@ public class Business
     /// </summary>
     public bool ScheduledReportsEnabled { get; set; } = false;
 
+    /// <summary>
+    /// Step 25 Candidate 2, Phase 1 — kill switch for the stale/inactive
+    /// Conversation auto-close feature (docs/handoffs/step-25-candidate2-
+    /// stale-conversation-autoclose-design.md, locked decisions 1A/2A/3B/4B).
+    /// Default false — opt-in, not opt-out, matching every other kill switch
+    /// in this file (ShopifyReadToolsEnabled, AiBusinessAnalystEnabled,
+    /// ScheduledReportsEnabled above). Explicitly NOT Decision 8's deferred
+    /// per-write-tool AI-autonomy automation-tier system — this governs a
+    /// scheduled/triggered business automation (closing stale conversations),
+    /// unrelated to AI write-tool authorization.
+    /// </summary>
+    public bool ConversationAutoCloseEnabled { get; set; } = false;
+
+    /// <summary>
+    /// Step 25 Candidate 2, Phase 1 — the inactivity threshold (days since
+    /// Conversation.LastMessageAt, or CreatedAt for a zero-message
+    /// Conversation) past which an Open Conversation with no active linked
+    /// Ticket becomes eligible for auto-close. Non-nullable and CHECK-bounded
+    /// (see CK_Business_ConversationInactivityCloseDays_Range in
+    /// AppDbContext) — deliberately NOT the AutoRefundLimit nullable-as-
+    /// disabled pattern (design §5): a business always has a valid threshold
+    /// even while ConversationAutoCloseEnabled is false. Shaped after
+    /// RetentionDays/RetentionPolicyLimits above.
+    /// </summary>
+    public int ConversationInactivityCloseDays { get; set; } = ConversationAutoCloseLimits.DefaultDays;
+
 
     /// <summary>
     /// Maximum refund amount Nivora may execute autonomously (Mode = Auto)

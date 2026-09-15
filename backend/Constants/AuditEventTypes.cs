@@ -30,6 +30,15 @@ public static class AuditEventTypes
     public const string BusinessScheduledReportsEnabled = "BusinessScheduledReportsEnabled";
     public const string BusinessScheduledReportsDisabled = "BusinessScheduledReportsDisabled";
 
+    // Business — Stale/Inactive Conversation Auto-Close (Step 25 Candidate 2,
+    // Phase 1). Named like BusinessScheduledReportsEnabled/Disabled above,
+    // for the same reason. BusinessConversationInactivityCloseDaysChanged is
+    // a single "changed" event (not an Enabled/Disabled pair) since the
+    // underlying field is a bounded integer, not a boolean.
+    public const string BusinessConversationAutoCloseEnabled = "BusinessConversationAutoCloseEnabled";
+    public const string BusinessConversationAutoCloseDisabled = "BusinessConversationAutoCloseDisabled";
+    public const string BusinessConversationInactivityCloseDaysChanged = "BusinessConversationInactivityCloseDaysChanged";
+
     // Customer
     public const string CustomerFieldUpdated = "CustomerFieldUpdated";
     public const string CustomerDeleted = "CustomerDeleted";

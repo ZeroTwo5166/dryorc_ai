@@ -428,6 +428,14 @@ namespace backend.Migrations
                     b.Property<string>("ContactPhone")
                         .HasColumnType("text");
 
+                    b.Property<bool>("ConversationAutoCloseEnabled")
+                        .HasColumnType("boolean");
+
+                    b.Property<int>("ConversationInactivityCloseDays")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer")
+                        .HasDefaultValue(14);
+
                     b.Property<DateTimeOffset>("CreatedAt")
                         .HasColumnType("timestamp with time zone");
 
@@ -478,6 +486,8 @@ namespace backend.Migrations
                             t.HasCheckConstraint("CK_Business_AutoRefundLimit_NonNegative", "\"AutoRefundLimit\" IS NULL OR \"AutoRefundLimit\" >= 0");
 
                             t.HasCheckConstraint("CK_Business_AutoRefundLimit_Pairing", "(\"AutoRefundLimit\" IS NULL AND \"AutoRefundLimitCurrency\" IS NULL) OR (\"AutoRefundLimit\" IS NOT NULL AND \"AutoRefundLimitCurrency\" IS NOT NULL)");
+
+                            t.HasCheckConstraint("CK_Business_ConversationInactivityCloseDays_Range", "\"ConversationInactivityCloseDays\" BETWEEN 1 AND 365");
 
                             t.HasCheckConstraint("CK_Business_RetentionDays_Range", "\"RetentionDays\" BETWEEN 30 AND 730");
                         });

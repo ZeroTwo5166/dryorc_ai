@@ -88,6 +88,18 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
             b.Property(x => x.Status).HasConversion<string>().HasMaxLength(32);
             b.Property(x => x.AutoRefundLimitCurrency).HasMaxLength(3);
 
+            // The C# property initializer alone (Business.cs) is NOT picked
+            // up by EF Core's migration scaffolding for the DB-level column
+            // default on an ADD COLUMN against an existing table — without
+            // this explicit HasDefaultValue, the scaffolder emits the CLR
+            // default (0), which would violate
+            // CK_Business_ConversationInactivityCloseDays_Range (1-365) for
+            // every pre-existing Business row the moment this migration
+            // applies. Caught during Phase 1's own migration review, before
+            // ever being applied to the real dev DB.
+            b.Property(x => x.ConversationInactivityCloseDays)
+                .HasDefaultValue(ConversationAutoCloseLimits.DefaultDays);
+
             b.ToTable(t =>
             {
                 t.HasCheckConstraint(
@@ -100,6 +112,9 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
                     "CK_Business_AutoRefundLimit_Pairing",
                     "(\"AutoRefundLimit\" IS NULL AND \"AutoRefundLimitCurrency\" IS NULL) " +
                     "OR (\"AutoRefundLimit\" IS NOT NULL AND \"AutoRefundLimitCurrency\" IS NOT NULL)");
+                t.HasCheckConstraint(
+                    "CK_Business_ConversationInactivityCloseDays_Range",
+                    $"\"ConversationInactivityCloseDays\" BETWEEN {ConversationAutoCloseLimits.MinDays} AND {ConversationAutoCloseLimits.MaxDays}");
             });
         });
 

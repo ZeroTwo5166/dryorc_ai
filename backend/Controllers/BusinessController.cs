@@ -25,6 +25,14 @@ public record SetScheduledReportsEnabledRequest(bool Enabled);
 
 public record SetScheduledReportsEnabledResponse(bool ScheduledReportsEnabled);
 
+public record SetConversationAutoCloseEnabledRequest(bool Enabled);
+
+public record SetConversationAutoCloseEnabledResponse(bool ConversationAutoCloseEnabled);
+
+public record SetConversationInactivityCloseDaysRequest(int Days);
+
+public record SetConversationInactivityCloseDaysResponse(int ConversationInactivityCloseDays);
+
 /// <summary>
 /// Step 49b — Business-level settings. First real caller of AuditEntityTypes.Business.
 /// Reads: AnyStaff (matches MeResponse, which already exposes CancelOrderToolEnabled
@@ -231,6 +239,114 @@ public class BusinessController(
         return Ok(new SetScheduledReportsEnabledResponse(business.ScheduledReportsEnabled));
     }
 
+    /// <summary>
+    /// Step 25 Candidate 2, Phase 1 (implementation plan §1.1/§1.2/§1.5) —
+    /// kill switch for the stale/inactive Conversation auto-close feature.
+    /// Modeled directly on SetAiBusinessAnalystEnabled/SetScheduledReportsEnabled
+    /// above, mechanically: OwnerOnly, idempotent (no write/audit on a
+    /// same-value request), audits every real transition. No precondition to
+    /// check here — no external-integration dependency comparable to Shopify.
+    /// Setting this true does not require ConversationInactivityCloseDays to
+    /// be separately validated here — the field is non-nullable and
+    /// CHECK-bounded (CK_Business_ConversationInactivityCloseDays_Range), so
+    /// it structurally always holds a valid value regardless of this flag
+    /// (plan §1.3).
+    /// </summary>
+    [HttpPut("conversation-auto-close")]
+    [Authorize(Policy = NivoraPolicies.OwnerOnly)]
+    public async Task<IActionResult> SetConversationAutoCloseEnabled([FromBody] SetConversationAutoCloseEnabledRequest request)
+    {
+        var businessId = tenantAccessor.BusinessId
+            ?? throw new InvalidOperationException("Authenticated but no tenant resolved — unreachable behind [Authorize].");
+
+        var business = await db.Businesses.FirstOrDefaultAsync(b => b.Id == businessId);
+        if (business is null)
+        {
+            return Unauthorized();
+        }
+
+        // Idempotent no-op — matching SetScheduledReportsEnabled's own
+        // convention of only auditing real transitions.
+        if (business.ConversationAutoCloseEnabled == request.Enabled)
+        {
+            return Ok(new SetConversationAutoCloseEnabledResponse(business.ConversationAutoCloseEnabled));
+        }
+
+        var oldValue = SerializeConversationAutoCloseEnabledAuditValue(business);
+        business.ConversationAutoCloseEnabled = request.Enabled;
+        business.UpdatedAt = DateTimeOffset.UtcNow;
+
+        await auditLogService.LogAsync(
+            businessId,
+            AuditEntityTypes.Business,
+            businessId.ToString(),
+            request.Enabled ? AuditEventTypes.BusinessConversationAutoCloseEnabled : AuditEventTypes.BusinessConversationAutoCloseDisabled,
+            ActorType.NivoraBusinessStaff,
+            changedByUserId: CurrentUserId,
+            oldValue: oldValue,
+            newValue: SerializeConversationAutoCloseEnabledAuditValue(business));
+
+        await db.SaveChangesAsync();
+
+        return Ok(new SetConversationAutoCloseEnabledResponse(business.ConversationAutoCloseEnabled));
+    }
+
+    /// <summary>
+    /// Step 25 Candidate 2, Phase 1 (implementation plan §1.3/§1.5) — sets
+    /// the inactivity threshold (days). Range-validated against
+    /// ConversationAutoCloseLimits.MinDays/MaxDays BEFORE any DB write is
+    /// attempted (400, not a DbUpdateException from the CHECK constraint) —
+    /// the CHECK constraint (CK_Business_ConversationInactivityCloseDays_Range)
+    /// remains a backstop, never the primary rejection mechanism. Idempotent
+    /// (no write/audit on a same-value request) and OwnerOnly, matching every
+    /// other setter in this file. Changing this value never touches
+    /// ConversationAutoCloseEnabled.
+    /// </summary>
+    [HttpPut("conversation-inactivity-close-days")]
+    [Authorize(Policy = NivoraPolicies.OwnerOnly)]
+    public async Task<IActionResult> SetConversationInactivityCloseDays([FromBody] SetConversationInactivityCloseDaysRequest request)
+    {
+        if (request.Days < ConversationAutoCloseLimits.MinDays || request.Days > ConversationAutoCloseLimits.MaxDays)
+        {
+            return BadRequest($"Days must be between {ConversationAutoCloseLimits.MinDays} and {ConversationAutoCloseLimits.MaxDays}.");
+        }
+
+        var businessId = tenantAccessor.BusinessId
+            ?? throw new InvalidOperationException("Authenticated but no tenant resolved — unreachable behind [Authorize].");
+
+        var business = await db.Businesses.FirstOrDefaultAsync(b => b.Id == businessId);
+        if (business is null)
+        {
+            return Unauthorized();
+        }
+
+        // Idempotent no-op — checked only after range validation above, since
+        // an out-of-range request is always rejected regardless of the
+        // current stored value (plan §1.5).
+        if (business.ConversationInactivityCloseDays == request.Days)
+        {
+            return Ok(new SetConversationInactivityCloseDaysResponse(business.ConversationInactivityCloseDays));
+        }
+
+        var oldValue = SerializeConversationInactivityCloseDaysAuditValue(business);
+        business.ConversationInactivityCloseDays = request.Days;
+        business.UpdatedAt = DateTimeOffset.UtcNow;
+
+        await auditLogService.LogAsync(
+            businessId,
+            AuditEntityTypes.Business,
+            businessId.ToString(),
+            AuditEventTypes.BusinessConversationInactivityCloseDaysChanged,
+            ActorType.NivoraBusinessStaff,
+            changedByUserId: CurrentUserId,
+            oldValue: oldValue,
+            newValue: SerializeConversationInactivityCloseDaysAuditValue(business));
+
+        await db.SaveChangesAsync();
+
+        return Ok(new SetConversationInactivityCloseDaysResponse(business.ConversationInactivityCloseDays));
+    }
+
     /// <summary>Deliberately hand-picked, safe fields only — never the full
     /// Business entity, never PII, matching
     /// IntegrationsController.SerializeAuditValue's own convention.</summary>
@@ -246,4 +362,14 @@ public class BusinessController(
     /// ScheduledReportsEnabled field.</summary>
     private static string SerializeScheduledReportsAuditValue(Business business) =>
         JsonSerializer.Serialize(new { business.ScheduledReportsEnabled });
+
+    /// <summary>Same convention as SerializeAuditValue above, scoped to the
+    /// ConversationAutoCloseEnabled field.</summary>
+    private static string SerializeConversationAutoCloseEnabledAuditValue(Business business) =>
+        JsonSerializer.Serialize(new { business.ConversationAutoCloseEnabled });
+
+    /// <summary>Same convention as SerializeAuditValue above, scoped to the
+    /// ConversationInactivityCloseDays field.</summary>
+    private static string SerializeConversationInactivityCloseDaysAuditValue(Business business) =>
+        JsonSerializer.Serialize(new { business.ConversationInactivityCloseDays });
 }

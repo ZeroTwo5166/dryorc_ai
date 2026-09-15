@@ -171,6 +171,33 @@ public class BusinessApiTests : IAsyncLifetime
         return business.CancelOrderToolEnabled;
     }
 
+    private async Task<bool> GetPersistedConversationAutoCloseEnabledAsync(Guid businessId)
+    {
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var business = await db.Businesses.SingleAsync(b => b.Id == businessId);
+        return business.ConversationAutoCloseEnabled;
+    }
+
+    private async Task<int> GetPersistedConversationInactivityCloseDaysAsync(Guid businessId)
+    {
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var business = await db.Businesses.SingleAsync(b => b.Id == businessId);
+        return business.ConversationInactivityCloseDays;
+    }
+
+    private async Task<int> AuditCountAsync(Guid businessId) =>
+        await GetScopedDbAsync(async db => await db.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.BusinessId == businessId && a.EntityType == AuditEntityTypes.Business));
+
+    private async Task<T> GetScopedDbAsync<T>(Func<AppDbContext, Task<T>> query)
+    {
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        return await query(db);
+    }
+
     // ── Read: AnyStaff, via Me() ──────────────────────────────────────
 
     [Fact]
@@ -483,5 +510,381 @@ public class BusinessApiTests : IAsyncLifetime
         var auditCount = await db.AuditLogs.IgnoreQueryFilters()
             .CountAsync(a => a.BusinessId == businessId && a.EntityType == AuditEntityTypes.Business);
         Assert.Equal(0, auditCount); // matches Step 48's own un-audited ShopifyIntegrationUnavailable refusal
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // Step 25 Candidate 2, Phase 1 — ConversationAutoCloseEnabled /
+    // ConversationInactivityCloseDays (implementation plan §1)
+    // ═════════════════════════════════════════════════════════════════
+
+    // ── ConversationAutoCloseEnabled: authorization ────────────────────
+
+    [Fact]
+    public async Task SetConversationAutoCloseEnabled_AgentForbidden()
+    {
+        var (businessId, _, ownerClient, _) = await SetUpBusinessWithOwnerAsync("ConvAutoClose Agent Business");
+        using (ownerClient) { }
+
+        var agentEmail = $"agent-{Guid.NewGuid():N}@example.com";
+        await SeedStaffIntoBusinessAsync(businessId, agentEmail, RoleNames.Agent);
+        using var agentClient = NewClient();
+        var (_, _, agentCookie) = await LoginAsync(agentClient, agentEmail);
+
+        var response = await agentClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-auto-close", agentCookie!),
+            new SetConversationAutoCloseEnabledRequest(true)));
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.False(await GetPersistedConversationAutoCloseEnabledAsync(businessId));
+    }
+
+    [Fact]
+    public async Task SetConversationAutoCloseEnabled_AdminForbidden()
+    {
+        var (businessId, _, ownerClient, _) = await SetUpBusinessWithOwnerAsync("ConvAutoClose Admin Business");
+        using (ownerClient) { }
+
+        var adminEmail = $"admin-{Guid.NewGuid():N}@example.com";
+        await SeedStaffIntoBusinessAsync(businessId, adminEmail, RoleNames.Admin);
+        using var adminClient = NewClient();
+        var (_, _, adminCookie) = await LoginAsync(adminClient, adminEmail);
+
+        var response = await adminClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-auto-close", adminCookie!),
+            new SetConversationAutoCloseEnabledRequest(true)));
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode); // OwnerOnly, deliberately not OwnerOrAdmin
+        Assert.False(await GetPersistedConversationAutoCloseEnabledAsync(businessId));
+    }
+
+    [Fact]
+    public async Task SetConversationAutoCloseEnabled_Owner_Allowed()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("ConvAutoClose Owner Business");
+        using var _ = ownerClient;
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-auto-close", ownerCookie),
+            new SetConversationAutoCloseEnabledRequest(true)));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<SetConversationAutoCloseEnabledResponse>();
+        Assert.True(body!.ConversationAutoCloseEnabled);
+        Assert.True(await GetPersistedConversationAutoCloseEnabledAsync(businessId));
+    }
+
+    // ── ConversationAutoCloseEnabled: audit transition/no-op ───────────
+
+    [Fact]
+    public async Task SetConversationAutoCloseEnabled_FalseToTrue_WritesAuditLogRow()
+    {
+        var (businessId, ownerId, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("ConvAutoClose F2T Business");
+        using var _ = ownerClient;
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-auto-close", ownerCookie),
+            new SetConversationAutoCloseEnabledRequest(true)));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var auditLogs = await GetScopedDbAsync(async db => await db.AuditLogs.IgnoreQueryFilters()
+            .Where(a => a.BusinessId == businessId && a.EntityType == AuditEntityTypes.Business).ToListAsync());
+        var entry = Assert.Single(auditLogs);
+        Assert.Equal(AuditEventTypes.BusinessConversationAutoCloseEnabled, entry.EventType);
+        Assert.Equal(ActorType.NivoraBusinessStaff, entry.Actor);
+        Assert.Equal(ownerId, entry.ChangedByUserId);
+        using var oldValueDoc = JsonDocument.Parse(entry.OldValue!);
+        Assert.False(oldValueDoc.RootElement.GetProperty("ConversationAutoCloseEnabled").GetBoolean());
+        using var newValueDoc = JsonDocument.Parse(entry.NewValue!);
+        Assert.True(newValueDoc.RootElement.GetProperty("ConversationAutoCloseEnabled").GetBoolean());
+    }
+
+    [Fact]
+    public async Task SetConversationAutoCloseEnabled_TrueToFalse_WritesAuditLogRow()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("ConvAutoClose T2F Business");
+        using var _ = ownerClient;
+
+        await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-auto-close", ownerCookie),
+            new SetConversationAutoCloseEnabledRequest(true)));
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-auto-close", ownerCookie),
+            new SetConversationAutoCloseEnabledRequest(false)));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var auditLogs = await GetScopedDbAsync(async db => await db.AuditLogs.IgnoreQueryFilters()
+            .Where(a => a.BusinessId == businessId && a.EntityType == AuditEntityTypes.Business)
+            .OrderBy(a => a.CreatedAt).ToListAsync());
+        Assert.Equal(2, auditLogs.Count); // one for true, one for false
+        Assert.Equal(AuditEventTypes.BusinessConversationAutoCloseDisabled, auditLogs[1].EventType);
+    }
+
+    [Fact]
+    public async Task SetConversationAutoCloseEnabled_TrueToTrue_WritesNoAuditLogRow()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("ConvAutoClose T2T Business");
+        using var _ = ownerClient;
+
+        await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-auto-close", ownerCookie),
+            new SetConversationAutoCloseEnabledRequest(true)));
+        Assert.Equal(1, await AuditCountAsync(businessId));
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-auto-close", ownerCookie),
+            new SetConversationAutoCloseEnabledRequest(true)));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        Assert.Equal(1, await AuditCountAsync(businessId)); // no second row
+        Assert.True(await GetPersistedConversationAutoCloseEnabledAsync(businessId));
+    }
+
+    [Fact]
+    public async Task SetConversationAutoCloseEnabled_FalseToFalse_WritesNoAuditLogRow()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("ConvAutoClose F2F Business");
+        using var _ = ownerClient;
+        // Flag already defaults to false — disabling again is a pure no-op.
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-auto-close", ownerCookie),
+            new SetConversationAutoCloseEnabledRequest(false)));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        Assert.Equal(0, await AuditCountAsync(businessId));
+        Assert.False(await GetPersistedConversationAutoCloseEnabledAsync(businessId));
+    }
+
+    // ── ConversationAutoCloseEnabled: tenant isolation ─────────────────
+
+    [Fact]
+    public async Task SetConversationAutoCloseEnabled_NeverAffectsAnotherBusiness()
+    {
+        var (businessIdA, _, ownerClientA, ownerCookieA) = await SetUpBusinessWithOwnerAsync("ConvAutoClose Tenant A");
+        using var _a = ownerClientA;
+        var (businessIdB, _, ownerClientB, _) = await SetUpBusinessWithOwnerAsync("ConvAutoClose Tenant B");
+        using var _b = ownerClientB;
+
+        var responseA = await ownerClientA.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-auto-close", ownerCookieA),
+            new SetConversationAutoCloseEnabledRequest(true)));
+        Assert.Equal(HttpStatusCode.OK, responseA.StatusCode);
+
+        Assert.True(await GetPersistedConversationAutoCloseEnabledAsync(businessIdA));
+        Assert.False(await GetPersistedConversationAutoCloseEnabledAsync(businessIdB)); // untouched
+    }
+
+    // ── ConversationInactivityCloseDays: default ───────────────────────
+
+    [Fact]
+    public async Task NewBusiness_ConversationInactivityCloseDays_DefaultsToFourteen()
+    {
+        var (businessId, _, ownerClient, _) = await SetUpBusinessWithOwnerAsync("ConvInactivity Default Business");
+        using (ownerClient) { }
+
+        Assert.Equal(14, await GetPersistedConversationInactivityCloseDaysAsync(businessId));
+    }
+
+    // ── ConversationInactivityCloseDays: authorization ─────────────────
+
+    [Fact]
+    public async Task SetConversationInactivityCloseDays_AgentForbidden()
+    {
+        var (businessId, _, ownerClient, _) = await SetUpBusinessWithOwnerAsync("ConvInactivity Agent Business");
+        using (ownerClient) { }
+
+        var agentEmail = $"agent-{Guid.NewGuid():N}@example.com";
+        await SeedStaffIntoBusinessAsync(businessId, agentEmail, RoleNames.Agent);
+        using var agentClient = NewClient();
+        var (_, _, agentCookie) = await LoginAsync(agentClient, agentEmail);
+
+        var response = await agentClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-inactivity-close-days", agentCookie!),
+            new SetConversationInactivityCloseDaysRequest(30)));
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Equal(14, await GetPersistedConversationInactivityCloseDaysAsync(businessId));
+    }
+
+    [Fact]
+    public async Task SetConversationInactivityCloseDays_AdminForbidden()
+    {
+        var (businessId, _, ownerClient, _) = await SetUpBusinessWithOwnerAsync("ConvInactivity Admin Business");
+        using (ownerClient) { }
+
+        var adminEmail = $"admin-{Guid.NewGuid():N}@example.com";
+        await SeedStaffIntoBusinessAsync(businessId, adminEmail, RoleNames.Admin);
+        using var adminClient = NewClient();
+        var (_, _, adminCookie) = await LoginAsync(adminClient, adminEmail);
+
+        var response = await adminClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-inactivity-close-days", adminCookie!),
+            new SetConversationInactivityCloseDaysRequest(30)));
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Equal(14, await GetPersistedConversationInactivityCloseDaysAsync(businessId));
+    }
+
+    [Fact]
+    public async Task SetConversationInactivityCloseDays_Owner_Allowed()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("ConvInactivity Owner Business");
+        using var _ = ownerClient;
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-inactivity-close-days", ownerCookie),
+            new SetConversationInactivityCloseDaysRequest(30)));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<SetConversationInactivityCloseDaysResponse>();
+        Assert.Equal(30, body!.ConversationInactivityCloseDays);
+        Assert.Equal(30, await GetPersistedConversationInactivityCloseDaysAsync(businessId));
+    }
+
+    // ── ConversationInactivityCloseDays: range validation ──────────────
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(366)]
+    [InlineData(1000)]
+    public async Task SetConversationInactivityCloseDays_OutOfRange_Returns400_NoWrite_NoAudit(int invalidDays)
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync($"ConvInactivity OOR {invalidDays} Business");
+        using var _ = ownerClient;
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-inactivity-close-days", ownerCookie),
+            new SetConversationInactivityCloseDaysRequest(invalidDays)));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(14, await GetPersistedConversationInactivityCloseDaysAsync(businessId)); // untouched
+        Assert.Equal(0, await AuditCountAsync(businessId));
+    }
+
+    [Theory]
+    [InlineData(1)]   // MinDays boundary
+    [InlineData(365)] // MaxDays boundary
+    public async Task SetConversationInactivityCloseDays_AtBoundary_Succeeds(int boundaryDays)
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync($"ConvInactivity Boundary {boundaryDays} Business");
+        using var _ = ownerClient;
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-inactivity-close-days", ownerCookie),
+            new SetConversationInactivityCloseDaysRequest(boundaryDays)));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(boundaryDays, await GetPersistedConversationInactivityCloseDaysAsync(businessId));
+    }
+
+    // ── ConversationInactivityCloseDays: audit transition/no-op ────────
+
+    [Fact]
+    public async Task SetConversationInactivityCloseDays_ChangingValue_WritesAuditLogRow()
+    {
+        var (businessId, ownerId, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("ConvInactivity Audit Business");
+        using var _ = ownerClient;
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-inactivity-close-days", ownerCookie),
+            new SetConversationInactivityCloseDaysRequest(45)));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var auditLogs = await GetScopedDbAsync(async db => await db.AuditLogs.IgnoreQueryFilters()
+            .Where(a => a.BusinessId == businessId && a.EntityType == AuditEntityTypes.Business).ToListAsync());
+        var entry = Assert.Single(auditLogs);
+        Assert.Equal(AuditEventTypes.BusinessConversationInactivityCloseDaysChanged, entry.EventType);
+        Assert.Equal(ActorType.NivoraBusinessStaff, entry.Actor);
+        Assert.Equal(ownerId, entry.ChangedByUserId);
+        using var oldValueDoc = JsonDocument.Parse(entry.OldValue!);
+        Assert.Equal(14, oldValueDoc.RootElement.GetProperty("ConversationInactivityCloseDays").GetInt32());
+        using var newValueDoc = JsonDocument.Parse(entry.NewValue!);
+        Assert.Equal(45, newValueDoc.RootElement.GetProperty("ConversationInactivityCloseDays").GetInt32());
+    }
+
+    [Fact]
+    public async Task SetConversationInactivityCloseDays_SettingCurrentValueAgain_WritesNoAuditLogRow()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("ConvInactivity Idempotent Business");
+        using var _ = ownerClient;
+
+        await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-inactivity-close-days", ownerCookie),
+            new SetConversationInactivityCloseDaysRequest(45)));
+        Assert.Equal(1, await AuditCountAsync(businessId));
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-inactivity-close-days", ownerCookie),
+            new SetConversationInactivityCloseDaysRequest(45)));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        Assert.Equal(1, await AuditCountAsync(businessId)); // no second row
+        Assert.Equal(45, await GetPersistedConversationInactivityCloseDaysAsync(businessId));
+    }
+
+    [Fact]
+    public async Task SetConversationInactivityCloseDays_DefaultValueSetAgain_WritesNoAuditLogRow()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("ConvInactivity Default NoOp Business");
+        using var _ = ownerClient;
+        // Already 14 (the default) — setting it to 14 again is a pure no-op.
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-inactivity-close-days", ownerCookie),
+            new SetConversationInactivityCloseDaysRequest(14)));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        Assert.Equal(0, await AuditCountAsync(businessId));
+    }
+
+    // ── ConversationInactivityCloseDays: tenant isolation ──────────────
+
+    [Fact]
+    public async Task SetConversationInactivityCloseDays_NeverAffectsAnotherBusiness()
+    {
+        var (businessIdA, _, ownerClientA, ownerCookieA) = await SetUpBusinessWithOwnerAsync("ConvInactivity Tenant A");
+        using var _a = ownerClientA;
+        var (businessIdB, _, ownerClientB, _) = await SetUpBusinessWithOwnerAsync("ConvInactivity Tenant B");
+        using var _b = ownerClientB;
+
+        var responseA = await ownerClientA.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-inactivity-close-days", ownerCookieA),
+            new SetConversationInactivityCloseDaysRequest(90)));
+        Assert.Equal(HttpStatusCode.OK, responseA.StatusCode);
+
+        Assert.Equal(90, await GetPersistedConversationInactivityCloseDaysAsync(businessIdA));
+        Assert.Equal(14, await GetPersistedConversationInactivityCloseDaysAsync(businessIdB)); // untouched, still default
+    }
+
+    // ── Cross-field independence (design §5 / plan §1.5) ───────────────
+
+    [Fact]
+    public async Task SetConversationInactivityCloseDays_DoesNotEnableAutoClose()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("ConvInactivity No CrossEnable Business");
+        using var _ = ownerClient;
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-inactivity-close-days", ownerCookie),
+            new SetConversationInactivityCloseDaysRequest(200)));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        Assert.False(await GetPersistedConversationAutoCloseEnabledAsync(businessId)); // still default false
+    }
+
+    [Fact]
+    public async Task SetConversationAutoCloseEnabled_DoesNotChangeInactivityCloseDays()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("ConvAutoClose No CrossChange Business");
+        using var _ = ownerClient;
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Put, "/api/business/conversation-auto-close", ownerCookie),
+            new SetConversationAutoCloseEnabledRequest(true)));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        Assert.Equal(14, await GetPersistedConversationInactivityCloseDaysAsync(businessId)); // still default
     }
 }
