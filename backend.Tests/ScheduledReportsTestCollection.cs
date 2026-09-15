@@ -15,11 +15,22 @@ namespace backend.Tests;
 /// gap, but one that cannot occur in production and must not be
 /// "fixed" there merely to accommodate this test pattern).
 ///
-/// Confirmed empirically this phase: ScheduledReportSchedulerServiceTests is
-/// 100% clean in isolation (3/3 runs) and fails only when it runs
-/// concurrently with ScheduledReportExecutionServiceTests and/or
+/// Confirmed empirically this phase in two rounds: (1)
+/// ScheduledReportSchedulerServiceTests is 100% clean in isolation (3/3
+/// runs) and fails only when it runs concurrently with
+/// ScheduledReportExecutionServiceTests and/or
 /// ScheduledReportBackgroundServiceTests's own real hosted-service E2E test
-/// — both of which also seed ScheduledReportsEnabled=true businesses.
+/// — both of which also seed ScheduledReportsEnabled=true businesses; (2)
+/// even with those three collected together, a full-suite run still showed
+/// the identical failure signature once — traced to ScheduledReportsApiTests
+/// (Phase 1's real toggle-endpoint tests), the only other file in the whole
+/// suite that sets Business.ScheduledReportsEnabled=true (confirmed by
+/// grep) and was not yet in this collection. Its own NivoraApiFactory-hosted
+/// scheduler is already frozen to a permanently-not-due instant (that
+/// factory's other Phase 7 test-isolation fix), so it can never be the
+/// AGGRESSOR — but nothing protected it from being the VICTIM of Phase 5's
+/// own always-due direct PollAsync calls discovering its business in the
+/// same cross-tenant batch.
 ///
 /// Fix: put every test file that seeds a ScheduledReportsEnabled=true
 /// Business, or drives a real (direct or hosted) scheduler tick, in this one
@@ -27,7 +38,8 @@ namespace backend.Tests;
 /// each other, but every other test class in the suite (including every
 /// other *ApiTests.cs file) is completely unaffected and keeps running with
 /// full xUnit parallelism exactly as before. A narrow, test-only scoping
-/// fix, not a suite-wide parallelism change.
+/// fix, not a suite-wide parallelism change. If a future test file ever
+/// needs to set this flag too, it must join this same collection.
 /// </summary>
 [CollectionDefinition("ScheduledReports")]
 public class ScheduledReportsTestCollection;

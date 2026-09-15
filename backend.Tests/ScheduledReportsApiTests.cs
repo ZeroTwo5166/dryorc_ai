@@ -27,6 +27,7 @@ namespace backend.Tests;
 /// and this toggle — no scheduler, execution, or background-service
 /// assertions belong in this file; those are Phases 4-7's own scope.
 /// </summary>
+[Collection("ScheduledReports")]
 public class ScheduledReportsApiTests : IAsyncLifetime
 {
     private readonly NivoraApiFactory _factory = new();
