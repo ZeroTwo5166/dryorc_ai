@@ -40,6 +40,14 @@ namespace backend.Tests;
 /// full xUnit parallelism exactly as before. A narrow, test-only scoping
 /// fix, not a suite-wide parallelism change. If a future test file ever
 /// needs to set this flag too, it must join this same collection.
+///
+/// Membership as of Step 24's Final E2E verification pass:
+/// ScheduledReportSchedulerServiceTests, ScheduledReportExecutionServiceTests,
+/// ScheduledReportBackgroundServiceTests, ScheduledReportsApiTests, and
+/// ScheduledReportsFinalE2ETests (the last one added directly at authoring
+/// time, not discovered as a later fix — its own real registration +
+/// enablement HTTP calls and its own due-scheduler-overridden verification
+/// host are exactly the shape this collection exists to protect).
 /// </summary>
 [CollectionDefinition("ScheduledReports")]
 public class ScheduledReportsTestCollection;
