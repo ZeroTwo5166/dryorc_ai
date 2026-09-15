@@ -412,6 +412,27 @@ builder.Services.AddScoped<IApprovedActionExecutor, OrderCancelApprovedActionExe
 // ToolName matching (design §3.3, already implemented ahead of this phase).
 builder.Services.AddScoped<IApprovedActionExecutor, RefundApprovedActionExecutor>();
 
+// Step 24 Phase 7 — Scheduled AI Reports go-live
+// (docs/handoffs/step-24-scheduled-ai-reports-design.md). TimeProvider.System
+// is the real system clock, registered so ScheduledReportSchedulerService/
+// ScheduledReportExecutionService can each take TimeProvider as an ordinary
+// constructor dependency. This singleton registration itself is never
+// touched by tests (NivoraApiFactory instead overrides the two scoped
+// service registrations directly, each with its own hand-constructed
+// TimeProvider — see that factory's own doc comment for why the shared
+// TimeProvider singleton itself must stay untouched: ASP.NET Core Identity's
+// cookie authentication also resolves it for session-expiry timestamps).
+// Business.ScheduledReportsEnabled defaults to false and
+// every existing business stays disabled at ship (locked Decision 3) — this
+// block changes production behavior for zero real businesses until an
+// Owner explicitly opts in via Phase 1's SetScheduledReportsEnabled
+// endpoint, the same "ship dark, opt-in later" pattern already used for
+// AiBusinessAnalystEnabled/CancelOrderToolEnabled/RefundToolEnabled above.
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddScoped<IScheduledReportSchedulerService, ScheduledReportSchedulerService>();
+builder.Services.AddScoped<IScheduledReportExecutionService, ScheduledReportExecutionService>();
+builder.Services.AddHostedService<ScheduledReportBackgroundService>();
+
 // ─────────────────────────────────────────────────────────────
 // Identity — cookie-based auth for staff/dashboard users.
 //

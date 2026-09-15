@@ -28,6 +28,7 @@ namespace backend.Tests;
 /// "scoped service testable without the timer wrapper" convention. Phase 5's
 /// own claim logic is not exercised or modified anywhere in this file.
 /// </summary>
+[Collection("ScheduledReports")]
 public class ScheduledReportExecutionServiceTests : IAsyncLifetime
 {
     private readonly List<Guid> _businessIdsToClean = [];

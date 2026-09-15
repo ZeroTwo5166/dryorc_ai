@@ -27,6 +27,7 @@ namespace backend.Tests;
 /// does not exist yet - assertions stop at "the winner is determined to
 /// have won, and the loser can prove it lost."
 /// </summary>
+[Collection("ScheduledReports")]
 public class ScheduledReportSchedulerServiceTests : IAsyncLifetime
 {
     private readonly List<Guid> _businessIdsToClean = [];
