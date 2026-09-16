@@ -196,6 +196,37 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         return user;
     }
 
+    /// <summary>
+    /// GDPR Phase 2 — minimal valid Approval fixture for
+    /// ConversationPurgeService's Decision 4 cleanup tests below. Not
+    /// cleaned up explicitly in DisposeAsync: Approval.ConversationId is
+    /// Cascade (AppDbContext.cs), so the existing
+    /// "DELETE FROM Conversations" cleanup step already removes any
+    /// surviving row before Customers/Businesses are deleted.
+    /// </summary>
+    private async Task<Approval> CreateApprovalAsync(
+        AppDbContext db, Guid businessId, Guid conversationId, Guid customerId, ApprovalStatus status)
+    {
+        var approval = new Approval
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            ConversationId = conversationId,
+            CustomerId = customerId,
+            ToolName = "cancelOrder",
+            ResourceId = $"order-{Guid.NewGuid():N}",
+            CanonicalArguments = "{}",
+            ActionHash = Guid.NewGuid().ToString("N"),
+            DisplaySummary = "Test approval",
+            Status = status,
+            CreatedAt = DateTimeOffset.UtcNow,
+            ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(10),
+        };
+        db.Approvals.Add(approval);
+        await db.SaveChangesAsync();
+        return approval;
+    }
+
     // ── 1. Purge atomicity ──────────────────────────────────────────
 
     [Fact]
@@ -707,6 +738,162 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         Assert.False(await db.VerificationCodes.IgnoreQueryFilters().AnyAsync(v => v.Id == oldExpiredId));
         Assert.True(await db.VerificationCodes.IgnoreQueryFilters().AnyAsync(v => v.Id == recentlyExpiredId));
         Assert.True(await db.VerificationCodes.IgnoreQueryFilters().AnyAsync(v => v.Id == validId));
+    }
+
+    // ── 10. GDPR Phase 2 — transaction ownership (Option B) ──────────
+
+    /// <summary>
+    /// Direct, literal proof of the exact bug class the design's §1.3
+    /// documents: EF Core's DatabaseFacade.BeginTransactionAsync() throws
+    /// InvalidOperationException when called on a DbContext that already
+    /// has an active transaction. Before Option B, calling
+    /// PurgeConversationAsync from inside an ambient transaction on the
+    /// same context hit exactly this failure.
+    /// </summary>
+    [Fact]
+    public async Task PurgeConversation_CalledInsideAmbientTransaction_DoesNotThrow()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var purgeService = scope.ServiceProvider.GetRequiredService<IConversationPurgeService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, null, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
+
+        await using var ambientTransaction = await db.Database.BeginTransactionAsync();
+
+        var exception = await Record.ExceptionAsync(() => purgeService.PurgeConversationAsync(conversation.Id));
+        Assert.Null(exception);
+
+        await ambientTransaction.CommitAsync();
+    }
+
+    /// <summary>
+    /// Proves the joined path has NO transaction boundary of its own — an
+    /// ambient rollback (the CALLER's, not the service's) undoes everything
+    /// this method did, including the Approval cleanup, exactly as §1's
+    /// Option B requires.
+    /// </summary>
+    [Fact]
+    public async Task PurgeConversation_JoinsAmbientTransaction_RollsBackWithCaller()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var purgeService = scope.ServiceProvider.GetRequiredService<IConversationPurgeService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        var message = await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
+        var approval = await CreateApprovalAsync(db, business.Id, conversation.Id, customer.Id, ApprovalStatus.Pending);
+
+        await using (var ambientTransaction = await db.Database.BeginTransactionAsync())
+        {
+            await purgeService.PurgeConversationAsync(conversation.Id);
+            await ambientTransaction.RollbackAsync();
+        }
+
+        // Verified via a SEPARATE scope/AppDbContext, not the one that ran
+        // the purge: `db` above still has the mutated Conversation entity
+        // tracked in memory from PurgeConversationAsync's own SaveChangesAsync
+        // call — EF Core's change tracker does not know the ambient
+        // transaction was subsequently rolled back and does not revert
+        // tracked property values on its own, so re-querying the same
+        // entity on the same context would return the stale in-memory
+        // values (IsAnonymized == true) rather than the true, rolled-back
+        // database state. A fresh context has nothing tracked and reads
+        // the real row.
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var messageAfter = await verifyDb.Messages.IgnoreQueryFilters().FirstOrDefaultAsync(m => m.Id == message.Id);
+        Assert.NotNull(messageAfter);
+
+        var conversationAfter = await verifyDb.Conversations.IgnoreQueryFilters().FirstOrDefaultAsync(c => c.Id == conversation.Id);
+        Assert.NotNull(conversationAfter);
+        Assert.False(conversationAfter!.IsAnonymized);
+        Assert.NotNull(conversationAfter.VisitorSessionId);
+
+        Assert.True(await verifyDb.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == approval.Id));
+    }
+
+    /// <summary>
+    /// Proves the joined path commits together with the caller's own
+    /// transaction — the purge's Message/Notification/Approval deletes and
+    /// the Conversation mutation all land together with whatever else the
+    /// caller did in the same ambient transaction. Also exercises Decision
+    /// 4's Approval cleanup in the JOINED path specifically (Test D below
+    /// covers the standalone/owns path) — Consumed survives, non-Consumed
+    /// is deleted.
+    /// </summary>
+    [Fact]
+    public async Task PurgeConversation_JoinsAmbientTransaction_CommitsWithCaller()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var purgeService = scope.ServiceProvider.GetRequiredService<IConversationPurgeService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        var message = await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
+        var pendingApproval = await CreateApprovalAsync(db, business.Id, conversation.Id, customer.Id, ApprovalStatus.Pending);
+        var consumedApproval = await CreateApprovalAsync(db, business.Id, conversation.Id, customer.Id, ApprovalStatus.Consumed);
+
+        await using (var ambientTransaction = await db.Database.BeginTransactionAsync())
+        {
+            await purgeService.PurgeConversationAsync(conversation.Id);
+            await ambientTransaction.CommitAsync();
+        }
+
+        Assert.False(await db.Messages.IgnoreQueryFilters().AnyAsync(m => m.Id == message.Id));
+
+        var conversationAfter = await db.Conversations.IgnoreQueryFilters().FirstOrDefaultAsync(c => c.Id == conversation.Id);
+        Assert.NotNull(conversationAfter);
+        Assert.True(conversationAfter!.IsAnonymized);
+        Assert.Null(conversationAfter.VisitorSessionId);
+
+        Assert.False(await db.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == pendingApproval.Id));
+        Assert.True(await db.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == consumedApproval.Id));
+    }
+
+    // ── 11. GDPR Phase 2 — Approval cleanup (Decision 4), owns branch ─
+
+    /// <summary>
+    /// Standalone call (no ambient transaction) — proves the "owns" branch
+    /// also gets the new Approval cleanup, not only the "joins" branch
+    /// exercised by Test C above. Against the real dev DB, directly proving
+    /// Decision 4's "confirmed zero FK/cascade/transaction risk" claim
+    /// against actual Postgres behavior.
+    /// </summary>
+    [Fact]
+    public async Task PurgeConversation_ApprovalCleanup_ConsumedSurvives_NonConsumedDeleted()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var purgeService = scope.ServiceProvider.GetRequiredService<IConversationPurgeService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
+
+        var pending = await CreateApprovalAsync(db, business.Id, conversation.Id, customer.Id, ApprovalStatus.Pending);
+        var denied = await CreateApprovalAsync(db, business.Id, conversation.Id, customer.Id, ApprovalStatus.Denied);
+        var approvedNeverConsumed = await CreateApprovalAsync(db, business.Id, conversation.Id, customer.Id, ApprovalStatus.Approved);
+        var consumed = await CreateApprovalAsync(db, business.Id, conversation.Id, customer.Id, ApprovalStatus.Consumed);
+
+        await purgeService.PurgeConversationAsync(conversation.Id);
+
+        Assert.False(await db.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == pending.Id));
+        Assert.False(await db.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == denied.Id));
+        Assert.False(await db.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == approvedNeverConsumed.Id));
+        Assert.True(await db.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == consumed.Id));
     }
 
     // ── Test helpers ─────────────────────────────────────────────────

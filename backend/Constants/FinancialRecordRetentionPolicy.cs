@@ -11,6 +11,16 @@ namespace backend.Constants;
 /// are not, and no code should claim that), but because their retention is
 /// governed by a separate legal clock, not the conversation-retention one.
 ///
+/// GDPR lifecycle design (docs/handoffs/gdpr-lifecycle-design.md, Decision
+/// 4) extends this same rationale to cover Approval rows with
+/// Status == Consumed specifically — the accountability half (who/when
+/// approved) of an already-retained OrderCancellation/Refund record. Every
+/// other Approval status has no such record depending on it and is
+/// erasure/purge-eligible on the same basis as Message; this exemption is
+/// intentional and narrower than the other three tables above, not an
+/// inferred extension — ConversationPurgeService's own Approval cleanup
+/// implements exactly this split.
+///
 /// A single centralized constant, not three independent per-entity
 /// columns/fields — all three tables share the same legal category
 /// (financial/transaction records) and there's no product reason for them

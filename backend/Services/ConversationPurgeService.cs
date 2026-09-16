@@ -1,4 +1,5 @@
 using backend.Data;
+using backend.Enums;
 using Microsoft.EntityFrameworkCore;
 
 namespace backend.Services;
@@ -29,10 +30,14 @@ public interface IConversationPurgeService
 /// level FK cascade — no separate deletion here, see AppDbContext's
 /// MessageKnowledgeSource config).
 ///
-/// Ticket is deliberately untouched: as of this pass, no code anywhere
-/// creates or updates a Ticket (Tickets aren't built yet — see
-/// TicketService's absence), so there is nothing populated to purge. This
-/// needs revisiting once Ticket creation actually exists.
+/// Ticket is deliberately untouched: Tickets now exist, but this service
+/// still has no Ticket awareness by design, not by omission — the
+/// active-Ticket retention exemption (GDPR lifecycle design, Decision 3)
+/// lives entirely in RetentionEnforcementService instead. Decision 3
+/// explicitly rejected giving this shared service a bypass/reason
+/// parameter to special-case the exemption here; keeping it out means
+/// ConversationPurgeService never has to know a Ticket table exists, for
+/// either caller.
 ///
 /// Notification rows referencing this conversation are explicitly deleted
 /// below (ExecuteDeleteAsync, same shape as Messages) — their FK to
@@ -41,6 +46,19 @@ public interface IConversationPurgeService
 /// never fire, so the app-level delete is the real, load-bearing mechanism.
 /// NotificationRecipient rows go with them via the Notification ->
 /// NotificationRecipient Cascade FK — never deleted directly here.
+///
+/// Approval rows are deleted the same way, conditionally: GDPR lifecycle
+/// design Decision 4 keeps Consumed rows (durable operational evidence,
+/// extending FinancialRecordRetentionPolicy's Art. 17(3)(b) rationale) and
+/// erases every other status on the same basis as Message.
+///
+/// Transaction ownership (GDPR lifecycle design §1, Option B): this method
+/// joins an already-open ambient transaction on `db` when the caller has
+/// one (db.Database.CurrentTransaction is non-null) — skipping its own
+/// Begin/Commit/Rollback/Dispose and leaving the caller to close it — or
+/// owns a transaction exactly as before when called standalone. This is
+/// derived purely from ambient DB state, never from who is calling or why,
+/// preserving this service's reason-agnosticism.
 /// </summary>
 public class ConversationPurgeService(AppDbContext db, IPurgeFailurePoint failurePoint) : IConversationPurgeService
 {
@@ -60,7 +78,14 @@ public class ConversationPurgeService(AppDbContext db, IPurgeFailurePoint failur
 
         var businessId = conversation.BusinessId;
 
-        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+        // Option B: join the caller's ambient transaction if one is
+        // already open on this same AppDbContext; otherwise own one,
+        // exactly as before. Never inspects who the caller is or why.
+        var ownsTransaction = db.Database.CurrentTransaction is null;
+        var transaction = ownsTransaction
+            ? await db.Database.BeginTransactionAsync(cancellationToken)
+            : db.Database.CurrentTransaction!;
+
         try
         {
             failurePoint.MaybeFail("before-message-delete");
@@ -85,6 +110,16 @@ public class ConversationPurgeService(AppDbContext db, IPurgeFailurePoint failur
                 .Where(n => n.BusinessId == businessId && n.ConversationId == conversationId)
                 .ExecuteDeleteAsync(cancellationToken);
 
+            // Decision 4 — Consumed rows are durable operational evidence
+            // and survive; every other status is erasure/purge-eligible on
+            // the same basis as Message. Same conversation-scoped shape as
+            // the two deletes above, placed before the final Conversation
+            // mutation.
+            await db.Approvals
+                .IgnoreQueryFilters()
+                .Where(a => a.BusinessId == businessId && a.ConversationId == conversationId && a.Status != ApprovalStatus.Consumed)
+                .ExecuteDeleteAsync(cancellationToken);
+
             failurePoint.MaybeFail("after-message-delete");
 
             conversation.VisitorSessionId = null;
@@ -95,12 +130,34 @@ public class ConversationPurgeService(AppDbContext db, IPurgeFailurePoint failur
             failurePoint.MaybeFail("before-commit");
 
             await db.SaveChangesAsync(cancellationToken);
-            await transaction.CommitAsync(cancellationToken);
+
+            if (ownsTransaction)
+            {
+                await transaction.CommitAsync(cancellationToken);
+            }
+            // else: ambient transaction — the caller owns the commit; this
+            // method's mutation is already flushed above and waits inside
+            // the caller's own transaction for their own commit.
         }
         catch
         {
-            await transaction.RollbackAsync(cancellationToken);
+            if (ownsTransaction)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+            }
+            // else: ambient transaction — never rolled back here; the
+            // exception propagates for the caller's own catch/RollbackAsync
+            // to undo everything together.
             throw;
+        }
+        finally
+        {
+            if (ownsTransaction)
+            {
+                await transaction.DisposeAsync();
+            }
+            // else: the caller owns this transaction's lifetime — never
+            // dispose one this method doesn't own.
         }
     }
 }
