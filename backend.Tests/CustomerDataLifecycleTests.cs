@@ -445,7 +445,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         });
         await db.SaveChangesAsync();
 
-        await erasureService.EraseCustomerAsync(customer.Id);
+        await erasureService.EraseCustomerAsync(customer.Id, staffUser.Id);
 
         // Customer: anonymized in place.
         var customerAfter = await db.Customers.IgnoreQueryFilters().FirstOrDefaultAsync(c => c.Id == customer.Id);
@@ -481,7 +481,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         await using var scope = _provider.CreateAsyncScope();
         var erasureService = scope.ServiceProvider.GetRequiredService<ICustomerErasureService>();
 
-        var exception = await Record.ExceptionAsync(() => erasureService.EraseCustomerAsync(Guid.NewGuid()));
+        var exception = await Record.ExceptionAsync(() => erasureService.EraseCustomerAsync(Guid.NewGuid(), Guid.NewGuid()));
         Assert.Null(exception);
     }
 
@@ -616,6 +616,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         var businessA = await CreateBusinessAsync(db);
         var widgetA = await CreateWidgetAsync(db, businessA.Id);
         var customerA = await CreateCustomerAsync(db, businessA.Id);
+        var staffUserA = await CreateStaffUserAsync(db, businessA.Id);
         var conversationA = await CreateConversationAsync(db, businessA.Id, widgetA.Id, customerA.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
         var messageA = await CreateMessageAsync(db, businessA.Id, conversationA.Id, DateTimeOffset.UtcNow);
 
@@ -625,7 +626,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         var conversationB = await CreateConversationAsync(db, businessB.Id, widgetB.Id, customerB.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
         var messageB = await CreateMessageAsync(db, businessB.Id, conversationB.Id, DateTimeOffset.UtcNow);
 
-        await erasureService.EraseCustomerAsync(customerA.Id);
+        await erasureService.EraseCustomerAsync(customerA.Id, staffUserA.Id);
 
         // ---- Service level: Business A actually got erased ----
         var customerAAfter = await db.Customers.IgnoreQueryFilters().FirstAsync(c => c.Id == customerA.Id);
@@ -686,7 +687,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         });
         await db.SaveChangesAsync();
 
-        await erasureService.EraseCustomerAsync(customer.Id);
+        await erasureService.EraseCustomerAsync(customer.Id, staffUser.Id);
 
         Assert.False(await db.CustomerExtendedLoggingHistories.IgnoreQueryFilters().AnyAsync(h => h.Id == historyId));
     }
@@ -703,6 +704,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         var business = await CreateBusinessAsync(db);
         var widget = await CreateWidgetAsync(db, business.Id);
         var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
         var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
 
         var codeId = Guid.NewGuid();
@@ -718,7 +720,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         });
         await db.SaveChangesAsync();
 
-        await erasureService.EraseCustomerAsync(customer.Id);
+        await erasureService.EraseCustomerAsync(customer.Id, staffUser.Id);
 
         Assert.False(await db.VerificationCodes.IgnoreQueryFilters().AnyAsync(v => v.Id == codeId));
     }
@@ -1259,6 +1261,625 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         Assert.Equal(1, auditCount);
     }
 
+    // ── 13. GDPR Phase 4 — CustomerErasureService Mechanism 2 ─────────
+
+    /// <summary>
+    /// Requirement 1 (happy path) — the purge and its ConversationErasurePurged
+    /// audit row are visible together after a successful erasure.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_SingleConversation_PurgeAndAuditCommitTogether()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var erasureService = scope.ServiceProvider.GetRequiredService<ICustomerErasureService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
+
+        await erasureService.EraseCustomerAsync(customer.Id, staffUser.Id);
+
+        var conversationAfter = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        Assert.True(conversationAfter.IsAnonymized);
+        Assert.False(await db.Messages.IgnoreQueryFilters().AnyAsync(m => m.ConversationId == conversation.Id));
+
+        var auditCount = await db.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.EntityId == conversation.Id.ToString() && a.EventType == AuditEventTypes.ConversationErasurePurged);
+        Assert.Equal(1, auditCount);
+    }
+
+    /// <summary>
+    /// Requirement 1 (rollback) — an injected failure inside the joined
+    /// purge means neither the purge nor its audit row remains committed.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_FailureDuringConversationPurge_RollsBackPurgeAndAudit()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditLogService = scope.ServiceProvider.GetRequiredService<IAuditLogService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
+
+        var failingPurgeService = new ConversationPurgeService(db, new FailAtCheckpoint("before-commit"));
+        var failingErasureService = new CustomerErasureService(db, failingPurgeService, auditLogService);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => failingErasureService.EraseCustomerAsync(customer.Id, staffUser.Id));
+
+        // Verified via a SEPARATE scope — PurgeConversationAsync's own
+        // in-memory property assignments happen before the injected
+        // failure fires, and EF Core's change tracker does not revert
+        // tracked property values when a transaction is subsequently
+        // rolled back (same reasoning as this file's Phase 2/3 rollback
+        // tests).
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        Assert.True(await verifyDb.Messages.IgnoreQueryFilters().AnyAsync(m => m.ConversationId == conversation.Id));
+        var conversationAfter = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        Assert.False(conversationAfter.IsAnonymized);
+
+        var auditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.EntityId == conversation.Id.ToString() && a.EventType == AuditEventTypes.ConversationErasurePurged);
+        Assert.Equal(0, auditCount);
+
+        // Phase 1 (identity-row deletes) already committed in its own,
+        // separate, earlier transaction before Phase 2 ever ran — a Phase
+        // 2 failure must not (and does not) roll that back too.
+        var customerAfter = await verifyDb.Customers.IgnoreQueryFilters().SingleAsync(c => c.Id == customer.Id);
+        Assert.False(customerAfter.IsAnonymized); // Phase 3 never reached
+    }
+
+    /// <summary>
+    /// Requirement 1 (rollback, the other direction) — the purge succeeds
+    /// first, then the audit write itself fails. The outer per-conversation
+    /// transaction must roll back the ALREADY-SUCCEEDED purge too — proving
+    /// the locked property holds even when the failure originates in the
+    /// audit write, not the purge.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_FailureDuringAuditWriteAfterSuccessfulPurge_RollsBackBoth()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var realAuditLogService = scope.ServiceProvider.GetRequiredService<IAuditLogService>();
+        var realPurgeService = scope.ServiceProvider.GetRequiredService<IConversationPurgeService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
+
+        var throwingAuditService = new ThrowingOnEventType(realAuditLogService, AuditEventTypes.ConversationErasurePurged);
+        var failingErasureService = new CustomerErasureService(db, realPurgeService, throwingAuditService);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => failingErasureService.EraseCustomerAsync(customer.Id, staffUser.Id));
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        // The purge itself would have succeeded in isolation, but must be
+        // rolled back together with the audit write it shares a
+        // transaction with.
+        Assert.True(await verifyDb.Messages.IgnoreQueryFilters().AnyAsync(m => m.ConversationId == conversation.Id));
+        var conversationAfter = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        Assert.False(conversationAfter.IsAnonymized);
+        var auditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.EntityId == conversation.Id.ToString() && a.EventType == AuditEventTypes.ConversationErasurePurged);
+        Assert.Equal(0, auditCount);
+    }
+
+    /// <summary>
+    /// Requirement 2 — the core multi-conversation partial-failure proof.
+    /// Five conversations; conversation 3 (defined below by the actual
+    /// discovery-query result, not assumed insertion order — see comment)
+    /// fails during its purge. Proves, via a separate verification scope:
+    /// conversations 1-2 fully purged and audited; conversation 3 rolled
+    /// back with no partial state and no orphaned audit row; conversations
+    /// 4-5 never attempted at all.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_FailureDuringOneOfFiveConversations_PriorCommitted_FailedRolledBack_LaterUntouched()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditLogService = scope.ServiceProvider.GetRequiredService<IAuditLogService>();
+        var realPurgeService = scope.ServiceProvider.GetRequiredService<IConversationPurgeService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+
+        for (var i = 0; i < 5; i++)
+        {
+            var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+            await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
+        }
+
+        // EraseCustomerAsync's own Phase 2 discovery query has no ORDER BY
+        // (confirmed by direct inspection — CustomerErasureService.cs),
+        // so "conversation 3" is not a safe assumption based on insertion
+        // order. This probe issues the IDENTICAL query, against the same
+        // unchanged data, immediately before EraseCustomerAsync runs its
+        // own internal copy of it — no writes happen to this customer's
+        // Conversations in between, so both queries return the same
+        // physical scan order in practice. This mirrors this project's own
+        // established discipline about not assuming unspecified Postgres
+        // ordering (see NotificationApiTests' own real-ordering test) by
+        // reading the actual order rather than asserting one.
+        var processingOrder = await db.Conversations
+            .IgnoreQueryFilters()
+            .Where(c => c.BusinessId == business.Id && c.CustomerId == customer.Id)
+            .Select(c => c.Id)
+            .ToListAsync();
+        Assert.Equal(5, processingOrder.Count);
+
+        var priorIds = processingOrder.Take(2).ToList();
+        var failingId = processingOrder[2];
+        var laterIds = processingOrder.Skip(3).ToList();
+
+        var failingPurgeService = new FailForSpecificConversation(realPurgeService, failingId);
+        var failingErasureService = new CustomerErasureService(db, failingPurgeService, auditLogService);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => failingErasureService.EraseCustomerAsync(customer.Id, staffUser.Id));
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        // Conversations 1-2: purged, audited exactly once each.
+        foreach (var id in priorIds)
+        {
+            var conv = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == id);
+            Assert.True(conv.IsAnonymized);
+            Assert.Null(conv.VisitorSessionId);
+            Assert.False(await verifyDb.Messages.IgnoreQueryFilters().AnyAsync(m => m.ConversationId == id));
+            var auditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+                .CountAsync(a => a.EntityId == id.ToString() && a.EventType == AuditEventTypes.ConversationErasurePurged);
+            Assert.Equal(1, auditCount);
+        }
+
+        // Conversation 3: transaction rolled back — no partial destructive
+        // state, no orphaned audit row.
+        var failingConv = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == failingId);
+        Assert.False(failingConv.IsAnonymized);
+        Assert.NotNull(failingConv.VisitorSessionId);
+        Assert.True(await verifyDb.Messages.IgnoreQueryFilters().AnyAsync(m => m.ConversationId == failingId));
+        var failingAuditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.EntityId == failingId.ToString() && a.EventType == AuditEventTypes.ConversationErasurePurged);
+        Assert.Equal(0, failingAuditCount);
+
+        // Conversations 4-5: never attempted — the outer Phase 2 loop has
+        // no try/catch of its own, so the exception from conversation 3
+        // propagates all the way out of EraseCustomerAsync before the
+        // loop ever reaches these.
+        foreach (var id in laterIds)
+        {
+            var conv = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == id);
+            Assert.False(conv.IsAnonymized);
+            Assert.NotNull(conv.VisitorSessionId);
+            Assert.True(await verifyDb.Messages.IgnoreQueryFilters().AnyAsync(m => m.ConversationId == id));
+            var auditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+                .CountAsync(a => a.EntityId == id.ToString() && a.EventType == AuditEventTypes.ConversationErasurePurged);
+            Assert.Equal(0, auditCount);
+        }
+
+        // Phase 3 never reached.
+        var customerAfter = await verifyDb.Customers.IgnoreQueryFilters().SingleAsync(c => c.Id == customer.Id);
+        Assert.False(customerAfter.IsAnonymized);
+    }
+
+    /// <summary>
+    /// Retry safety (§3.3) — a subsequent, unfailing call converges: the
+    /// conversation already purged in the earlier failed attempt is not
+    /// re-audited (claim returns 0 for it), the remaining conversations are
+    /// purged and audited, and the operation completes.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_RetryAfterPartialFailure_ConvergesSafely_NoDuplicateAudit()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditLogService = scope.ServiceProvider.GetRequiredService<IAuditLogService>();
+        var realPurgeService = scope.ServiceProvider.GetRequiredService<IConversationPurgeService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+
+        for (var i = 0; i < 3; i++)
+        {
+            var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+            await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
+        }
+
+        var processingOrder = await db.Conversations
+            .IgnoreQueryFilters()
+            .Where(c => c.BusinessId == business.Id && c.CustomerId == customer.Id)
+            .Select(c => c.Id)
+            .ToListAsync();
+        Assert.Equal(3, processingOrder.Count);
+        var succeededFirstId = processingOrder[0];
+        var failingId = processingOrder[1];
+
+        var failingPurgeService = new FailForSpecificConversation(realPurgeService, failingId);
+        var failingErasureService = new CustomerErasureService(db, failingPurgeService, auditLogService);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => failingErasureService.EraseCustomerAsync(customer.Id, staffUser.Id));
+
+        // Retry — real services, no injected failure this time.
+        var retryErasureService = scope.ServiceProvider.GetRequiredService<ICustomerErasureService>();
+        await retryErasureService.EraseCustomerAsync(customer.Id, staffUser.Id);
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        foreach (var id in processingOrder)
+        {
+            var conv = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == id);
+            Assert.True(conv.IsAnonymized);
+            var auditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+                .CountAsync(a => a.EntityId == id.ToString() && a.EventType == AuditEventTypes.ConversationErasurePurged);
+            Assert.Equal(1, auditCount); // exactly one — never re-audited, including succeededFirstId
+        }
+
+        var customerAfter = await verifyDb.Customers.IgnoreQueryFilters().SingleAsync(c => c.Id == customer.Id);
+        Assert.True(customerAfter.IsAnonymized);
+        var completionAuditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.EntityId == customer.Id.ToString() && a.EventType == AuditEventTypes.CustomerErased);
+        Assert.Equal(1, completionAuditCount);
+
+        _ = succeededFirstId; // named for clarity in the loop above; no separate assertion needed
+    }
+
+    /// <summary>
+    /// Requirement 3 (happy path) — the terminal Customer mutation and its
+    /// CustomerErased completion audit row share the same CorrelationId as
+    /// the per-conversation rows and commit together.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_TerminalMutationAndCompletionAudit_CommitTogether()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var erasureService = scope.ServiceProvider.GetRequiredService<ICustomerErasureService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
+
+        await erasureService.EraseCustomerAsync(customer.Id, staffUser.Id);
+
+        var customerAfter = await db.Customers.IgnoreQueryFilters().SingleAsync(c => c.Id == customer.Id);
+        Assert.True(customerAfter.IsAnonymized);
+        Assert.NotNull(customerAfter.AnonymizedAt);
+
+        var completionAudit = await db.AuditLogs.IgnoreQueryFilters()
+            .SingleAsync(a => a.EntityId == customer.Id.ToString() && a.EventType == AuditEventTypes.CustomerErased);
+        Assert.Equal(AuditEntityTypes.Customer, completionAudit.EntityType);
+        Assert.Equal(ActorType.NivoraBusinessStaff, completionAudit.Actor);
+        Assert.Equal(staffUser.Id, completionAudit.ChangedByUserId);
+        Assert.NotNull(completionAudit.CorrelationId);
+
+        var conversationAudit = await db.AuditLogs.IgnoreQueryFilters()
+            .SingleAsync(a => a.EntityId == conversation.Id.ToString() && a.EventType == AuditEventTypes.ConversationErasurePurged);
+        Assert.Equal(completionAudit.CorrelationId, conversationAudit.CorrelationId);
+    }
+
+    /// <summary>
+    /// Requirement 3 (rollback) — a failure between the Customer mutation
+    /// and the completion audit's commit must roll back the Customer
+    /// mutation too, leaving IsAnonymized false. Already-committed
+    /// per-conversation purges from Phase 2 remain committed regardless —
+    /// Phase 3's own transaction is independent of Phase 2's.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_FailureBeforeCompletionAuditCommit_RollsBackCustomerMutation()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var realAuditLogService = scope.ServiceProvider.GetRequiredService<IAuditLogService>();
+        var realPurgeService = scope.ServiceProvider.GetRequiredService<IConversationPurgeService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
+
+        // Only the terminal CustomerErased write fails — the per-conversation
+        // ConversationErasurePurged write in Phase 2 must succeed normally.
+        var throwingAuditService = new ThrowingOnEventType(realAuditLogService, AuditEventTypes.CustomerErased);
+        var failingErasureService = new CustomerErasureService(db, realPurgeService, throwingAuditService);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => failingErasureService.EraseCustomerAsync(customer.Id, staffUser.Id));
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        // Phase 2 already committed — the conversation purge is real and
+        // permanent, unaffected by Phase 3's own, later, independent
+        // transaction failing.
+        var conversationAfter = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        Assert.True(conversationAfter.IsAnonymized);
+        var conversationAuditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.EntityId == conversation.Id.ToString() && a.EventType == AuditEventTypes.ConversationErasurePurged);
+        Assert.Equal(1, conversationAuditCount);
+
+        // Phase 3 rolled back — Customer never anonymized, no completion audit.
+        var customerAfter = await verifyDb.Customers.IgnoreQueryFilters().SingleAsync(c => c.Id == customer.Id);
+        Assert.False(customerAfter.IsAnonymized);
+        Assert.Null(customerAfter.AnonymizedAt);
+        Assert.NotNull(customerAfter.Email); // never nulled — the mutation rolled back
+        var completionAuditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.EntityId == customer.Id.ToString() && a.EventType == AuditEventTypes.CustomerErased);
+        Assert.Equal(0, completionAuditCount);
+    }
+
+    /// <summary>
+    /// Requirement 4 — Decision 4 exactly: Consumed survives, every other
+    /// status (including Denied with a populated DeniedReason) is deleted,
+    /// and an unrelated customer's Approval in the same business is
+    /// completely unaffected.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_ApprovalCleanup_ConsumedSurvives_NonConsumedDeleted_UnrelatedCustomerUntouched()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var erasureService = scope.ServiceProvider.GetRequiredService<ICustomerErasureService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
+
+        var pending = await CreateApprovalAsync(db, business.Id, conversation.Id, customer.Id, ApprovalStatus.Pending);
+        var approved = await CreateApprovalAsync(db, business.Id, conversation.Id, customer.Id, ApprovalStatus.Approved);
+        var consumed = await CreateApprovalAsync(db, business.Id, conversation.Id, customer.Id, ApprovalStatus.Consumed);
+
+        var deniedWithReason = await CreateApprovalAsync(db, business.Id, conversation.Id, customer.Id, ApprovalStatus.Denied);
+        deniedWithReason.DeniedReason = "Customer no longer eligible for this refund.";
+        await db.SaveChangesAsync();
+
+        // Unrelated customer, same business — must be completely untouched.
+        var unrelatedCustomer = await CreateCustomerAsync(db, business.Id);
+        var unrelatedConversation = await CreateConversationAsync(db, business.Id, widget.Id, unrelatedCustomer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        var unrelatedApproval = await CreateApprovalAsync(db, business.Id, unrelatedConversation.Id, unrelatedCustomer.Id, ApprovalStatus.Pending);
+
+        await erasureService.EraseCustomerAsync(customer.Id, staffUser.Id);
+
+        Assert.False(await db.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == pending.Id));
+        Assert.False(await db.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == approved.Id));
+        Assert.False(await db.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == deniedWithReason.Id));
+        Assert.True(await db.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == consumed.Id));
+
+        Assert.True(await db.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == unrelatedApproval.Id));
+    }
+
+    /// <summary>
+    /// Requirement 5 — ExternalIdentity rows are explicitly deleted by
+    /// Phase 1 (not merely a side effect of some cascade — the Customer
+    /// row itself is never deleted, only anonymized in place, so the
+    /// Cascade FK on ExternalIdentity.CustomerId never fires; this
+    /// ExecuteDeleteAsync is the only mechanism that removes them). An
+    /// unrelated customer's identity survives untouched.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_ExternalIdentityCleanup_ExplicitDeletion_UnrelatedIdentityPreserved()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var erasureService = scope.ServiceProvider.GetRequiredService<ICustomerErasureService>();
+
+        var business = await CreateBusinessAsync(db);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+
+        var identity = new ExternalIdentity
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = business.Id,
+            CustomerId = customer.Id,
+            Channel = "Website",
+            VerificationMethod = "SignedToken",
+            ExternalUserId = "to-be-erased",
+            LinkedAt = DateTimeOffset.UtcNow,
+        };
+        db.ExternalIdentities.Add(identity);
+
+        var unrelatedCustomer = await CreateCustomerAsync(db, business.Id);
+        var unrelatedIdentity = new ExternalIdentity
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = business.Id,
+            CustomerId = unrelatedCustomer.Id,
+            Channel = "Website",
+            VerificationMethod = "SignedToken",
+            ExternalUserId = "unrelated",
+            LinkedAt = DateTimeOffset.UtcNow,
+        };
+        db.ExternalIdentities.Add(unrelatedIdentity);
+        await db.SaveChangesAsync();
+
+        await erasureService.EraseCustomerAsync(customer.Id, staffUser.Id);
+
+        Assert.False(await db.ExternalIdentities.IgnoreQueryFilters().AnyAsync(i => i.Id == identity.Id));
+        Assert.True(await db.ExternalIdentities.IgnoreQueryFilters().AnyAsync(i => i.Id == unrelatedIdentity.Id));
+
+        // Customer row itself survives (anonymized in place) — confirming
+        // the ExternalIdentity delete above is truly explicit, not an
+        // artifact of a Cascade-on-Customer-delete that never happened.
+        var customerAfter = await db.Customers.IgnoreQueryFilters().SingleAsync(c => c.Id == customer.Id);
+        Assert.True(customerAfter.IsAnonymized);
+    }
+
+    /// <summary>
+    /// §7 item 1's confirmed, non-hypothetical edge case: Customer A's
+    /// Approval survives via Phase 1's customer-scoped delete even though
+    /// its Conversation was re-linked to Customer B before A's erasure ran,
+    /// so Phase 2's conversation-scoped discovery never finds it. Uses the
+    /// SAME mechanism VerificationCodeService.VerifyCodeAsync actually
+    /// uses (an unconditional ExecuteUpdateAsync setting
+    /// Conversation.CustomerId, no prior-value guard) — not a hand-rolled
+    /// substitute. VerificationCodeService itself is not modified.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_OrphanedApprovalFromReVerifiedConversation_StillErased()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var erasureService = scope.ServiceProvider.GetRequiredService<ICustomerErasureService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customerA = await CreateCustomerAsync(db, business.Id);
+        var customerB = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+
+        var conv1 = await CreateConversationAsync(db, business.Id, widget.Id, customerA.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        var messageOnConv1 = await CreateMessageAsync(db, business.Id, conv1.Id, DateTimeOffset.UtcNow);
+        var orphanedApproval = await CreateApprovalAsync(db, business.Id, conv1.Id, customerA.Id, ApprovalStatus.Pending);
+
+        // Mirrors VerificationCodeService.VerifyCodeAsync's exact
+        // mechanism (VerificationCodeService.cs) — unconditional
+        // Conversation.CustomerId overwrite, no guard on the prior value.
+        await db.Conversations
+            .IgnoreQueryFilters()
+            .Where(c => c.Id == conv1.Id && c.BusinessId == business.Id)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(c => c.CustomerId, customerB.Id)
+                .SetProperty(c => c.Level2VerifiedUntil, DateTimeOffset.UtcNow.AddMinutes(10)));
+
+        await erasureService.EraseCustomerAsync(customerA.Id, staffUser.Id);
+
+        // Verified via a SEPARATE scope: `conv1` was already tracked on
+        // `db` from CreateConversationAsync's own load, and the raw
+        // ExecuteUpdateAsync re-link above is a bulk operation that
+        // bypasses the change tracker entirely — re-querying conv1.Id on
+        // the SAME `db` would return that stale tracked instance (still
+        // showing CustomerId == A in memory) rather than the true,
+        // re-linked database row. A fresh context has nothing tracked and
+        // reads the real row.
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        // The orphaned Approval (still CustomerId == A) is deleted —
+        // caught by Phase 1's customer-scoped delete.
+        Assert.False(await verifyDb.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == orphanedApproval.Id));
+
+        // Conv1 itself, now owned by Customer B, was never purged as part
+        // of Customer A's erasure — its Messages remain intact.
+        var conv1After = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conv1.Id);
+        Assert.False(conv1After.IsAnonymized);
+        Assert.Equal(customerB.Id, conv1After.CustomerId);
+        Assert.True(await verifyDb.Messages.IgnoreQueryFilters().AnyAsync(m => m.Id == messageOnConv1.Id));
+
+        // Customer B's own data is completely unaffected by Customer A's erasure.
+        var customerBAfter = await verifyDb.Customers.IgnoreQueryFilters().SingleAsync(c => c.Id == customerB.Id);
+        Assert.False(customerBAfter.IsAnonymized);
+
+        // Customer A did complete its own erasure.
+        var customerAAfter = await verifyDb.Customers.IgnoreQueryFilters().SingleAsync(c => c.Id == customerA.Id);
+        Assert.True(customerAAfter.IsAnonymized);
+    }
+
+    /// <summary>
+    /// changedByUserId and CorrelationId reach every audit row a single
+    /// erasure produces, across multiple conversations.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_ChangedByUserIdAndCorrelationId_ReachEveryAuditRow()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var erasureService = scope.ServiceProvider.GetRequiredService<ICustomerErasureService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+
+        var conversation1 = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        await CreateMessageAsync(db, business.Id, conversation1.Id, DateTimeOffset.UtcNow);
+        var conversation2 = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        await CreateMessageAsync(db, business.Id, conversation2.Id, DateTimeOffset.UtcNow);
+
+        await erasureService.EraseCustomerAsync(customer.Id, staffUser.Id);
+
+        var allAuditRows = await db.AuditLogs.IgnoreQueryFilters()
+            .Where(a => a.BusinessId == business.Id
+                && ((a.EventType == AuditEventTypes.ConversationErasurePurged && (a.EntityId == conversation1.Id.ToString() || a.EntityId == conversation2.Id.ToString()))
+                    || (a.EventType == AuditEventTypes.CustomerErased && a.EntityId == customer.Id.ToString())))
+            .ToListAsync();
+
+        Assert.Equal(3, allAuditRows.Count); // 2 per-conversation + 1 completion
+        Assert.All(allAuditRows, a => Assert.Equal(staffUser.Id, a.ChangedByUserId));
+        Assert.All(allAuditRows, a => Assert.Equal(ActorType.NivoraBusinessStaff, a.Actor));
+
+        var correlationIds = allAuditRows.Select(a => a.CorrelationId).Distinct().ToList();
+        var singleCorrelationId = Assert.Single(correlationIds);
+        Assert.NotNull(singleCorrelationId);
+    }
+
+    /// <summary>
+    /// Idempotency — a second call against an already-anonymized customer
+    /// is a true no-op: zero additional deletes, zero additional purges,
+    /// zero additional audit rows.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_AlreadyAnonymized_TrueNoOp()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var erasureService = scope.ServiceProvider.GetRequiredService<ICustomerErasureService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
+
+        await erasureService.EraseCustomerAsync(customer.Id, staffUser.Id);
+
+        var auditCountAfterFirst = await db.AuditLogs.IgnoreQueryFilters().CountAsync(a => a.BusinessId == business.Id);
+
+        await erasureService.EraseCustomerAsync(customer.Id, staffUser.Id);
+
+        var auditCountAfterSecond = await db.AuditLogs.IgnoreQueryFilters().CountAsync(a => a.BusinessId == business.Id);
+        Assert.Equal(auditCountAfterFirst, auditCountAfterSecond);
+
+        var customerAfter = await db.Customers.IgnoreQueryFilters().SingleAsync(c => c.Id == customer.Id);
+        Assert.True(customerAfter.IsAnonymized);
+        Assert.Null(customerAfter.Email);
+        Assert.Null(customerAfter.Name);
+        Assert.Null(customerAfter.ExternalId);
+    }
+
     // ── Test helpers ─────────────────────────────────────────────────
 
     private class FixedTenantAccessor(Guid? businessId) : ICurrentTenantAccessor
@@ -1274,6 +1895,50 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
             {
                 throw new InvalidOperationException($"Injected test failure at '{checkpointName}'.");
             }
+        }
+    }
+
+    /// <summary>
+    /// GDPR Phase 4 — deterministic per-conversation fault injection for
+    /// the multi-conversation partial-failure proof. Fails for exactly one,
+    /// explicitly-chosen conversationId and delegates to a real
+    /// IConversationPurgeService for every other one. Deliberately not
+    /// checkpoint/call-count-based (unlike FailAtCheckpoint above): the
+    /// discovery query CustomerErasureService.EraseCustomerAsync uses has
+    /// no ORDER BY, so "the Nth call" is not a safe way to target a specific
+    /// conversation — targeting by conversationId directly is.
+    /// </summary>
+    private class FailForSpecificConversation(IConversationPurgeService inner, Guid failingConversationId) : IConversationPurgeService
+    {
+        public async Task PurgeConversationAsync(Guid conversationId, CancellationToken cancellationToken = default)
+        {
+            if (conversationId == failingConversationId)
+            {
+                throw new InvalidOperationException($"Injected test failure for conversation {failingConversationId}.");
+            }
+            await inner.PurgeConversationAsync(conversationId, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// GDPR Phase 4 — fault injection for Phase 3's terminal Customer
+    /// mutation + completion-audit atomicity proof. Fails only for the
+    /// named EventType (CustomerErased), letting every other audit write
+    /// (in particular Phase 2's ConversationErasurePurged rows) succeed
+    /// normally via the real IAuditLogService.
+    /// </summary>
+    private class ThrowingOnEventType(IAuditLogService inner, string throwingEventType) : IAuditLogService
+    {
+        public Task LogAsync(
+            Guid businessId, string entityType, string entityId, string eventType, ActorType actor,
+            Guid? changedByUserId = null, string? oldValue = null, string? newValue = null,
+            Guid? conversationId = null, Guid? correlationId = null, CancellationToken cancellationToken = default)
+        {
+            if (eventType == throwingEventType)
+            {
+                throw new InvalidOperationException($"Injected test failure for event type '{throwingEventType}'.");
+            }
+            return inner.LogAsync(businessId, entityType, entityId, eventType, actor, changedByUserId, oldValue, newValue, conversationId, correlationId, cancellationToken);
         }
     }
 }

@@ -70,7 +70,8 @@ public class CustomersController(
     AppDbContext db,
     ICurrentTenantAccessor tenantAccessor,
     IAuthorizationService authorizationService,
-    IAuditLogService auditLogService) : ControllerBase
+    IAuditLogService auditLogService,
+    ICustomerErasureService erasureService) : ControllerBase
 {
     private const int RecentConversationsTake = 20;
 
@@ -426,6 +427,47 @@ public class CustomersController(
         }
 
         await db.SaveChangesAsync();
+
+        return NoContent();
+    }
+
+    // ── GDPR lifecycle design §6 — customer-erasure invocation ──────────
+
+    /// <summary>
+    /// Decision 2: GDPR erasure is initiated by merchant staff (Owner/Admin
+    /// only), acting as execution of the controller's instruction — not
+    /// Nivora independently adjudicating the end customer's Article 17
+    /// request. Thin adapter, mirroring ApprovalsController.Execute's own
+    /// "load + authorize, then delegate entirely" shape — no business logic
+    /// here; every phase/transaction decomposition lives inside
+    /// CustomerErasureService.EraseCustomerAsync (Mechanism 2).
+    ///
+    /// §7 item 6 (LOCKED, Option A): no additional backend confirmation
+    /// mechanism — bare authenticated POST, consistent with every other
+    /// mutation on this controller. Protection against accidental execution
+    /// is a frontend/UX responsibility, out of this backend's scope.
+    ///
+    /// Idempotent — a second call on an already-anonymized customer is a
+    /// legitimate 204 no-op (EraseCustomerAsync's own top-of-method guard),
+    /// never a 409; GDPR erasure makes no external API call, so it needs no
+    /// IdempotencyKey mechanism (that exists specifically to guard external
+    /// Shopify write actions).
+    ///
+    /// No controller-level try/catch — an exception from EraseCustomerAsync
+    /// propagates uncaught to ASP.NET Core's default exception middleware
+    /// (500), matching this controller's established convention.
+    /// </summary>
+    [HttpPost("{customerId:guid}/erase")]
+    [Authorize(Policy = NivoraPolicies.OwnerOrAdmin)]
+    public async Task<IActionResult> Erase(Guid customerId, CancellationToken cancellationToken)
+    {
+        var customer = await db.Customers.FirstOrDefaultAsync(c => c.Id == customerId, cancellationToken);
+        if (customer is null) return NotFound();
+
+        var authResult = await authorizationService.AuthorizeAsync(User, customer, NivoraPolicies.SameTenant);
+        if (!authResult.Succeeded) return NotFound();
+
+        await erasureService.EraseCustomerAsync(customerId, CurrentUserId, cancellationToken);
 
         return NoContent();
     }

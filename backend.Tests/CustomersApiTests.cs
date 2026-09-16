@@ -919,4 +919,163 @@ public class CustomersApiTests : IAsyncLifetime
         Assert.True(historyExists);
         Assert.True(auditExists);
     }
+
+    // ── GDPR erasure endpoint (design §6) ────────────────────────────────
+
+    [Fact]
+    public async Task Erase_Unauthenticated_ReturnsUnauthorized()
+    {
+        using var client = NewClient();
+        var response = await client.PostAsync($"/api/customers/{Guid.NewGuid()}/erase", null);
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Erase_AgentForbidden_CustomerNotAnonymized()
+    {
+        var (businessId, _, ownerClient, _) = await SetUpBusinessWithOwnerAsync("Erase Agent Forbidden Business");
+        using var _ = ownerClient;
+
+        Guid customerId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerId = await SeedCustomerAsync(db, businessId);
+        }
+
+        var agentEmail = $"agent-{Guid.NewGuid():N}@example.com";
+        await SeedStaffIntoBusinessAsync(businessId, agentEmail, RoleNames.Agent);
+        using var agentClient = NewClient();
+        var (_, _, agentCookie) = await LoginAsync(agentClient, agentEmail);
+
+        var response = await agentClient.SendAsync(Authed(HttpMethod.Post, $"/api/customers/{customerId}/erase", agentCookie!));
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode); // OwnerOrAdmin, Agent excluded
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var customer = await verifyDb.Customers.IgnoreQueryFilters().SingleAsync(c => c.Id == customerId);
+        Assert.False(customer.IsAnonymized);
+    }
+
+    /// <summary>
+    /// The full HTTP-level proof: Owner/Admin succeeds, the customer and
+    /// their conversation are actually erased, and the resulting audit rows
+    /// carry the authenticated caller's own id as ChangedByUserId — never
+    /// invented or inferred by the service, captured only at the
+    /// controller's own CurrentUserId boundary.
+    /// </summary>
+    [Fact]
+    public async Task Erase_OwnerOrAdmin_Succeeds_AnonymizesCustomer_AuditChangedByUserIdCorrect()
+    {
+        var (businessId, ownerId, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Erase Success Business");
+        using var _ = ownerClient;
+
+        Guid customerId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerId = await SeedCustomerAsync(db, businessId);
+            var widgetId = await SeedWidgetAsync(db, businessId);
+            await SeedConversationAsync(db, businessId, widgetId, customerId, DateTimeOffset.UtcNow);
+        }
+
+        var response = await ownerClient.SendAsync(Authed(HttpMethod.Post, $"/api/customers/{customerId}/erase", ownerCookie));
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var customer = await verifyDb.Customers.IgnoreQueryFilters().SingleAsync(c => c.Id == customerId);
+        Assert.True(customer.IsAnonymized);
+        Assert.Null(customer.Email);
+        Assert.Null(customer.Name);
+
+        // ConversationPurgeService never touches Conversation.CustomerId —
+        // it survives purge unchanged, so this still matches this
+        // customer's own conversation.
+        var conversation = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.CustomerId == customerId);
+        Assert.True(conversation.IsAnonymized);
+        Assert.Null(conversation.VisitorSessionId);
+
+        var completionAudit = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .SingleAsync(a => a.EntityId == customerId.ToString() && a.EventType == AuditEventTypes.CustomerErased);
+        Assert.Equal(ownerId, completionAudit.ChangedByUserId);
+        Assert.Equal(ActorType.NivoraBusinessStaff, completionAudit.Actor);
+
+        var conversationAudit = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .Where(a => a.EventType == AuditEventTypes.ConversationErasurePurged && a.BusinessId == businessId)
+            .ToListAsync();
+        var singleConversationAudit = Assert.Single(conversationAudit);
+        Assert.Equal(ownerId, singleConversationAudit.ChangedByUserId);
+        Assert.Equal(completionAudit.CorrelationId, singleConversationAudit.CorrelationId);
+    }
+
+    [Fact]
+    public async Task Erase_CrossTenantCustomer_ReturnsNotFound_NoStateChanged()
+    {
+        var (businessIdA, _, ownerClientA, _) = await SetUpBusinessWithOwnerAsync("Erase Tenant A");
+        using var _a = ownerClientA;
+        Guid customerIdA;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerIdA = await SeedCustomerAsync(db, businessIdA);
+        }
+
+        var (_, _, ownerClientB, ownerCookieB) = await SetUpBusinessWithOwnerAsync("Erase Tenant B");
+        using var _b = ownerClientB;
+
+        var response = await ownerClientB.SendAsync(Authed(HttpMethod.Post, $"/api/customers/{customerIdA}/erase", ownerCookieB));
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode); // never 403 — cross-tenant existence not leaked
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var customerA = await verifyDb.Customers.IgnoreQueryFilters().SingleAsync(c => c.Id == customerIdA);
+        Assert.False(customerA.IsAnonymized);
+    }
+
+    [Fact]
+    public async Task Erase_UnknownCustomerId_ReturnsNotFound()
+    {
+        var (_, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Erase Unknown Customer Business");
+        using var _ = ownerClient;
+
+        var response = await ownerClient.SendAsync(Authed(HttpMethod.Post, $"/api/customers/{Guid.NewGuid()}/erase", ownerCookie));
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    /// <summary>
+    /// Idempotency through the real HTTP path — no 409, no confirmation
+    /// token, exactly matching design §6's own locked idempotency
+    /// behavior: a second call on an already-anonymized customer is a
+    /// legitimate 204 no-op.
+    /// </summary>
+    [Fact]
+    public async Task Erase_CalledTwice_BothReturnNoContent_NoExtraAuditRows()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Erase Idempotent Business");
+        using var _ = ownerClient;
+
+        Guid customerId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerId = await SeedCustomerAsync(db, businessId);
+        }
+
+        var first = await ownerClient.SendAsync(Authed(HttpMethod.Post, $"/api/customers/{customerId}/erase", ownerCookie));
+        Assert.Equal(HttpStatusCode.NoContent, first.StatusCode);
+
+        await using var midScope = _factory.Services.CreateAsyncScope();
+        var midDb = midScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditCountAfterFirst = await midDb.AuditLogs.IgnoreQueryFilters().CountAsync(a => a.BusinessId == businessId);
+
+        var second = await ownerClient.SendAsync(Authed(HttpMethod.Post, $"/api/customers/{customerId}/erase", ownerCookie));
+        Assert.Equal(HttpStatusCode.NoContent, second.StatusCode); // legitimate no-op, never 409
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditCountAfterSecond = await verifyDb.AuditLogs.IgnoreQueryFilters().CountAsync(a => a.BusinessId == businessId);
+        Assert.Equal(auditCountAfterFirst, auditCountAfterSecond);
+    }
 }
