@@ -1,3 +1,4 @@
+using backend.Constants;
 using backend.Data;
 using backend.Enums;
 using backend.Interfaces;
@@ -54,6 +55,9 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
             .AddScoped<IRetentionEnforcementService, RetentionEnforcementService>()
             .AddScoped<IVerificationCodeCleanupService, VerificationCodeCleanupService>()
             .AddScoped<IPurgeFailurePoint, NoOpPurgeFailurePoint>()
+            // GDPR Phase 3 — RetentionEnforcementService now depends on
+            // IAuditLogService (ConversationRetentionPurged audit write).
+            .AddScoped<IAuditLogService, AuditLogService>()
             .BuildServiceProvider();
 
         return Task.CompletedTask;
@@ -67,6 +71,19 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
             var ids = _businessIdsToClean.ToArray();
 
+            // GDPR Phase 3 — AuditLog.BusinessId is Restrict, not Cascade
+            // (AppDbContext.cs), so any row the new retention-audit tests
+            // write must be deleted before "Businesses" below or that
+            // delete fails with a FK violation. Same precedent
+            // DataLifecycleBackgroundServiceTests.cs's own DisposeAsync
+            // already established.
+            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AuditLogs\" WHERE \"BusinessId\" = ANY({ids})");
+            // Ticket.BusinessId/CustomerId are both Restrict, and
+            // Ticket.ConversationId is SetNull (not Cascade) — the
+            // "Conversations" delete below would NOT remove a surviving
+            // Ticket row, so it must be deleted explicitly, before both
+            // "Customers" and "Businesses".
+            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Tickets\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"MessageKnowledgeSources\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Messages\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"VerificationCodes\" WHERE \"BusinessId\" = ANY({ids})");
@@ -225,6 +242,34 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         db.Approvals.Add(approval);
         await db.SaveChangesAsync();
         return approval;
+    }
+
+    /// <summary>
+    /// GDPR Phase 3 — minimal valid Ticket fixture for
+    /// RetentionEnforcementService's Decision 3 active-Ticket-exemption
+    /// tests below. Same shape as
+    /// ConversationInactivityCloseServiceTests.CreateTicketAsync (this
+    /// project's own established precedent for seeding a Ticket).
+    /// </summary>
+    private static async Task<Ticket> CreateTicketAsync(
+        AppDbContext db, Guid businessId, Guid customerId, Guid conversationId, TicketStatus status)
+    {
+        var ticket = new Ticket
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            CustomerId = customerId,
+            ConversationId = conversationId,
+            Status = status,
+            Priority = TicketPriority.Medium,
+            PriorityReason = TicketPriorityReasons.ManualEscalation,
+            Channel = "Website",
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        db.Tickets.Add(ticket);
+        await db.SaveChangesAsync();
+        return ticket;
     }
 
     // ── 1. Purge atomicity ──────────────────────────────────────────
@@ -894,6 +939,324 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         Assert.False(await db.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == denied.Id));
         Assert.False(await db.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == approvedNeverConsumed.Id));
         Assert.True(await db.Approvals.IgnoreQueryFilters().AnyAsync(a => a.Id == consumed.Id));
+    }
+
+    // ── 12. GDPR Phase 3 — RetentionEnforcementService atomic claim ──
+
+    /// <summary>
+    /// Decision 3 — an active Ticket created AFTER discovery but BEFORE
+    /// this conversation's claim runs must still exempt it (the discovery
+    /// query's own Ticket filter alone is insufficient — see the class doc
+    /// comment). Repeated for all three of Decision 3's named active
+    /// statuses, proving the exemption is not narrowed to a subset of
+    /// "Status != Resolved".
+    /// </summary>
+    [Theory]
+    [InlineData(TicketStatus.Open)]
+    [InlineData(TicketStatus.InProgress)]
+    [InlineData(TicketStatus.Reopened)]
+    public async Task RetentionEnforcement_TicketCreatedBetweenDiscoveryAndClaim_NotPurged(TicketStatus activeStatus)
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var retentionService = (RetentionEnforcementService)scope.ServiceProvider.GetRequiredService<IRetentionEnforcementService>();
+
+        const int retentionDays = 30;
+        var business = await CreateBusinessAsync(db, retentionDays);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var now = DateTimeOffset.UtcNow;
+        var wellPastRetention = now.AddDays(-(retentionDays + 5));
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, wellPastRetention, wellPastRetention);
+        await CreateMessageAsync(db, business.Id, conversation.Id, wellPastRetention);
+
+        // Simulates the discovery→claim gap via a second, independent scope
+        // (and therefore AppDbContext) — no Ticket existed at discovery
+        // time; one is created here, committed, before the claim below runs.
+        await using (var otherScope = _provider.CreateAsyncScope())
+        {
+            var otherDb = otherScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            await CreateTicketAsync(otherDb, business.Id, customer.Id, conversation.Id, activeStatus);
+        }
+
+        var claimed = await retentionService.TryPurgeConversationAsync(business.Id, conversation.Id, CancellationToken.None);
+
+        Assert.False(claimed);
+        Assert.True(await db.Messages.IgnoreQueryFilters().AnyAsync(m => m.ConversationId == conversation.Id));
+        var conversationAfter = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        Assert.False(conversationAfter.IsAnonymized);
+        Assert.Equal(0, await db.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.EntityId == conversation.Id.ToString() && a.EventType == AuditEventTypes.ConversationRetentionPurged));
+    }
+
+    /// <summary>
+    /// The other half of Decision 3's own text: a Resolved Ticket must NOT
+    /// exempt an otherwise-eligible conversation — proves the exemption
+    /// isn't accidentally over-broad.
+    /// </summary>
+    [Fact]
+    public async Task RetentionEnforcement_ResolvedTicket_DoesNotBlockPurge()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var retentionService = (RetentionEnforcementService)scope.ServiceProvider.GetRequiredService<IRetentionEnforcementService>();
+
+        const int retentionDays = 30;
+        var business = await CreateBusinessAsync(db, retentionDays);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var now = DateTimeOffset.UtcNow;
+        var wellPastRetention = now.AddDays(-(retentionDays + 5));
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, wellPastRetention, wellPastRetention);
+        await CreateMessageAsync(db, business.Id, conversation.Id, wellPastRetention);
+        await CreateTicketAsync(db, business.Id, customer.Id, conversation.Id, TicketStatus.Resolved);
+
+        var claimed = await retentionService.TryPurgeConversationAsync(business.Id, conversation.Id, CancellationToken.None);
+
+        Assert.True(claimed);
+        var conversationAfter = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        Assert.True(conversationAfter.IsAnonymized);
+    }
+
+    /// <summary>
+    /// Proves §2.3's "fresh re-read of Business.RetentionDays, never the
+    /// discovery-time snapshot" requirement is actually load-bearing — a
+    /// business widening its retention window between discovery and claim
+    /// must be honored, not silently missed.
+    /// </summary>
+    [Fact]
+    public async Task RetentionEnforcement_RetentionDaysChangedBetweenDiscoveryAndClaim_NotPurged()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var retentionService = (RetentionEnforcementService)scope.ServiceProvider.GetRequiredService<IRetentionEnforcementService>();
+
+        const int retentionDays = 30;
+        var business = await CreateBusinessAsync(db, retentionDays);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var now = DateTimeOffset.UtcNow;
+        // Just past the original 30-day cutoff, but NOT past a widened
+        // 180-day one.
+        var justPastOriginalCutoff = now.AddDays(-31);
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, null, justPastOriginalCutoff, justPastOriginalCutoff);
+        await CreateMessageAsync(db, business.Id, conversation.Id, justPastOriginalCutoff);
+
+        await using (var otherScope = _provider.CreateAsyncScope())
+        {
+            var otherDb = otherScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var businessRow = await otherDb.Businesses.IgnoreQueryFilters().SingleAsync(b => b.Id == business.Id);
+            businessRow.RetentionDays = 180;
+            businessRow.UpdatedAt = now;
+            await otherDb.SaveChangesAsync();
+        }
+
+        var claimed = await retentionService.TryPurgeConversationAsync(business.Id, conversation.Id, CancellationToken.None);
+
+        Assert.False(claimed);
+        var conversationAfter = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        Assert.False(conversationAfter.IsAnonymized);
+    }
+
+    /// <summary>
+    /// A Message arriving (or, as here, a zero-message conversation's
+    /// LastMessageAt being populated) between discovery and claim must
+    /// re-exclude the conversation, not rely on the discovery-time
+    /// snapshot of staleness.
+    /// </summary>
+    [Fact]
+    public async Task RetentionEnforcement_MessageArrivesBetweenDiscoveryAndClaim_NotPurged()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var retentionService = (RetentionEnforcementService)scope.ServiceProvider.GetRequiredService<IRetentionEnforcementService>();
+
+        const int retentionDays = 30;
+        var business = await CreateBusinessAsync(db, retentionDays);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var now = DateTimeOffset.UtcNow;
+        var wellPastRetention = now.AddDays(-(retentionDays + 5));
+        // Zero-message, CreatedAt-fallback case — mirrors the discovery
+        // query's own predicate shape.
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, null, wellPastRetention, null);
+
+        await using (var otherScope = _provider.CreateAsyncScope())
+        {
+            var otherDb = otherScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var conversationRow = await otherDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+            conversationRow.LastMessageAt = now;
+            conversationRow.UpdatedAt = now;
+            await otherDb.SaveChangesAsync();
+        }
+
+        var claimed = await retentionService.TryPurgeConversationAsync(business.Id, conversation.Id, CancellationToken.None);
+
+        Assert.False(claimed);
+        var conversationAfter = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        Assert.False(conversationAfter.IsAnonymized);
+    }
+
+    /// <summary>
+    /// The claim, the purge, and the audit write all share one transaction
+    /// (Decision 5) — an injected failure after the claim has already
+    /// succeeded must roll back all three together: nothing partial
+    /// survives. Uses the "before-commit" checkpoint (fires after every
+    /// delete and the Conversation mutation's in-memory assignment, right
+    /// before SaveChangesAsync) — the strongest available proof that a
+    /// fully-prepared-but-uncommitted transaction rolls back completely.
+    /// </summary>
+    [Fact]
+    public async Task RetentionEnforcement_FailureInjectedAfterClaimBeforeCommit_RollsBackPurgeAndAudit()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditLogService = scope.ServiceProvider.GetRequiredService<IAuditLogService>();
+
+        const int retentionDays = 30;
+        var business = await CreateBusinessAsync(db, retentionDays);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var now = DateTimeOffset.UtcNow;
+        var wellPastRetention = now.AddDays(-(retentionDays + 5));
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, null, wellPastRetention, wellPastRetention);
+        await CreateMessageAsync(db, business.Id, conversation.Id, wellPastRetention);
+
+        var failingPurgeService = new ConversationPurgeService(db, new FailAtCheckpoint("before-commit"));
+        var failingRetentionService = new RetentionEnforcementService(db, failingPurgeService, auditLogService);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => failingRetentionService.TryPurgeConversationAsync(business.Id, conversation.Id, CancellationToken.None));
+
+        // Verified via a SEPARATE scope, not `db`: PurgeConversationAsync's
+        // own in-memory property assignments (IsAnonymized = true, etc.)
+        // happen before the injected failure point fires, and EF Core's
+        // change tracker does not revert tracked property values when a
+        // transaction is subsequently rolled back — re-querying the same
+        // entity on `db` would return that stale in-memory state rather
+        // than the true, rolled-back database row (identical reasoning to
+        // this file's Phase 2 PurgeConversation_JoinsAmbientTransaction_RollsBackWithCaller
+        // test). A fresh context has nothing tracked and reads the real row.
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        Assert.True(await verifyDb.Messages.IgnoreQueryFilters().AnyAsync(m => m.ConversationId == conversation.Id));
+
+        var conversationAfter = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        Assert.False(conversationAfter.IsAnonymized);
+
+        var auditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.EntityId == conversation.Id.ToString() && a.EventType == AuditEventTypes.ConversationRetentionPurged);
+        Assert.Equal(0, auditCount);
+    }
+
+    /// <summary>
+    /// A retry against an already-purged conversation is ordinary
+    /// idempotency, not an error — claimed == 0, no duplicate audit row.
+    /// </summary>
+    [Fact]
+    public async Task RetentionEnforcement_AlreadyPurgedByPriorRun_ClaimedZero_NoDuplicateAudit()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var retentionService = (RetentionEnforcementService)scope.ServiceProvider.GetRequiredService<IRetentionEnforcementService>();
+
+        const int retentionDays = 30;
+        var business = await CreateBusinessAsync(db, retentionDays);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var now = DateTimeOffset.UtcNow;
+        var wellPastRetention = now.AddDays(-(retentionDays + 5));
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, null, wellPastRetention, wellPastRetention);
+        await CreateMessageAsync(db, business.Id, conversation.Id, wellPastRetention);
+
+        var firstAttempt = await retentionService.TryPurgeConversationAsync(business.Id, conversation.Id, CancellationToken.None);
+        Assert.True(firstAttempt);
+
+        var secondAttempt = await retentionService.TryPurgeConversationAsync(business.Id, conversation.Id, CancellationToken.None);
+        Assert.False(secondAttempt);
+
+        var auditCount = await db.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.EntityId == conversation.Id.ToString() && a.EventType == AuditEventTypes.ConversationRetentionPurged);
+        Assert.Equal(1, auditCount);
+    }
+
+    /// <summary>
+    /// Audit content proof — exercised through the full public
+    /// EnforceRetentionAsync() path (discovery + claim together), not just
+    /// the internal claim helper.
+    /// </summary>
+    [Fact]
+    public async Task RetentionEnforcement_WritesCorrectAuditRow()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var retentionService = scope.ServiceProvider.GetRequiredService<IRetentionEnforcementService>();
+
+        const int retentionDays = 30;
+        var business = await CreateBusinessAsync(db, retentionDays);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var now = DateTimeOffset.UtcNow;
+        var wellPastRetention = now.AddDays(-(retentionDays + 5));
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, null, wellPastRetention, wellPastRetention);
+        await CreateMessageAsync(db, business.Id, conversation.Id, wellPastRetention);
+
+        await retentionService.EnforceRetentionAsync();
+
+        var auditRow = await db.AuditLogs.IgnoreQueryFilters()
+            .SingleAsync(a => a.EntityId == conversation.Id.ToString() && a.EventType == AuditEventTypes.ConversationRetentionPurged);
+
+        Assert.Equal(AuditEntityTypes.Conversation, auditRow.EntityType);
+        Assert.Equal(ActorType.NivoraSystem, auditRow.Actor);
+        Assert.Null(auditRow.ChangedByUserId);
+        Assert.Null(auditRow.CorrelationId);
+        Assert.Equal(business.Id, auditRow.BusinessId);
+    }
+
+    /// <summary>
+    /// Requirement B — concurrent claims against the SAME conversation must
+    /// be mutually exclusive. Two independent scopes (independent
+    /// AppDbContexts/transactions) race for the same conversation via
+    /// Task.WhenAll — real concurrent execution against the real dev DB,
+    /// not two sequential calls. Postgres's own row-level locking inside
+    /// the atomic claim's ExecuteUpdateAsync is what actually serializes
+    /// the two attempts: whichever reaches the lock first wins; the other
+    /// blocks until the first's transaction ends, then re-evaluates its own
+    /// WHERE clause against the now-committed (already-anonymized) row and
+    /// correctly finds zero matching rows.
+    /// </summary>
+    [Fact]
+    public async Task RetentionEnforcement_ConcurrentClaims_OnlyOneSucceeds_PurgesExactlyOnce()
+    {
+        await using var seedScope = _provider.CreateAsyncScope();
+        var seedDb = seedScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        const int retentionDays = 30;
+        var business = await CreateBusinessAsync(seedDb, retentionDays);
+        var widget = await CreateWidgetAsync(seedDb, business.Id);
+        var now = DateTimeOffset.UtcNow;
+        var wellPastRetention = now.AddDays(-(retentionDays + 5));
+        var conversation = await CreateConversationAsync(seedDb, business.Id, widget.Id, null, wellPastRetention, wellPastRetention);
+        await CreateMessageAsync(seedDb, business.Id, conversation.Id, wellPastRetention);
+
+        await using var scopeA = _provider.CreateAsyncScope();
+        await using var scopeB = _provider.CreateAsyncScope();
+        var serviceA = (RetentionEnforcementService)scopeA.ServiceProvider.GetRequiredService<IRetentionEnforcementService>();
+        var serviceB = (RetentionEnforcementService)scopeB.ServiceProvider.GetRequiredService<IRetentionEnforcementService>();
+
+        var taskA = serviceA.TryPurgeConversationAsync(business.Id, conversation.Id, CancellationToken.None);
+        var taskB = serviceB.TryPurgeConversationAsync(business.Id, conversation.Id, CancellationToken.None);
+        var results = await Task.WhenAll(taskA, taskB);
+
+        Assert.Single(results, r => r);
+        Assert.Single(results, r => !r);
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var conversationAfter = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        Assert.True(conversationAfter.IsAnonymized);
+        Assert.False(await verifyDb.Messages.IgnoreQueryFilters().AnyAsync(m => m.ConversationId == conversation.Id));
+
+        var auditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.EntityId == conversation.Id.ToString() && a.EventType == AuditEventTypes.ConversationRetentionPurged);
+        Assert.Equal(1, auditCount);
     }
 
     // ── Test helpers ─────────────────────────────────────────────────
