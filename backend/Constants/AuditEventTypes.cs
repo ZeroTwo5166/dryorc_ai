@@ -44,6 +44,15 @@ public static class AuditEventTypes
     public const string CustomerDeleted = "CustomerDeleted";
     public const string CustomerDataExported = "CustomerDataExported";
 
+    /// <summary>
+    /// GDPR lifecycle design (docs/handoffs/gdpr-lifecycle-design.md §4) —
+    /// written by CustomerErasureService on a successful erasure. A new
+    /// constant, not a reuse of CustomerDeleted above: the Customer row is
+    /// anonymized in place, never deleted, so CustomerDeleted would
+    /// misdescribe the operation in the audit trail.
+    /// </summary>
+    public const string CustomerErased = "CustomerErased";
+
     // Commerce write actions
     public const string RefundIssued = "RefundIssued";
     public const string OrderCancelled = "OrderCancelled";
@@ -108,6 +117,29 @@ public static class AuditEventTypes
     /// is achievable, not merely best-effort).
     /// </summary>
     public const string ConversationAutoClosed = "ConversationAutoClosed";
+
+    /// <summary>
+    /// GDPR lifecycle design (docs/handoffs/gdpr-lifecycle-design.md §2.5/§4)
+    /// — written by RetentionEnforcementService on every successful
+    /// age-based purge, ActorType.NivoraSystem, no ChangedByUserId, in the
+    /// same per-conversation transaction as the claim and the purge.
+    /// Deliberately distinct from ConversationErasurePurged below — see
+    /// that constant's own doc comment for why a shared event type is
+    /// wrong.
+    /// </summary>
+    public const string ConversationRetentionPurged = "ConversationRetentionPurged";
+
+    /// <summary>
+    /// GDPR lifecycle design (docs/handoffs/gdpr-lifecycle-design.md §3.4/§4)
+    /// — written by CustomerErasureService for each conversation purged as
+    /// part of a customer erasure, ActorType.NivoraBusinessStaff, in the
+    /// same per-conversation transaction as the claim and the purge.
+    /// Deliberately a separate constant from ConversationRetentionPurged
+    /// above, not a shared one — using one event type for both would
+    /// silently re-introduce the "can't tell why a conversation was
+    /// purged" gap the design's discovery pass flagged.
+    /// </summary>
+    public const string ConversationErasurePurged = "ConversationErasurePurged";
 
     /// <summary>
     /// Step 22 Phase 3 — written by ConversationTagCorrectionService on every
