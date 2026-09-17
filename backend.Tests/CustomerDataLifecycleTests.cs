@@ -1880,6 +1880,53 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         Assert.Null(customerAfter.ExternalId);
     }
 
+    // ── 14. Identity-binding/erasure-integrity Phase 2 — foundational ──
+
+    /// <summary>
+    /// Phase 2 verification criterion (implementation plan): a plain
+    /// round-trip for the new Customer.PendingErasureAt column — set,
+    /// save, then reload through a fresh scope/DbContext (not the same
+    /// tracked instance that wrote it) and confirm the persisted value
+    /// matches. No CustomerErasureService/advisory-lock behavior exists
+    /// yet to protect (that's Phase 3+) — this is plumbing correctness
+    /// only.
+    /// </summary>
+    [Fact]
+    public async Task Customer_PendingErasureAt_RoundTripsThroughFreshScope()
+    {
+        Guid businessId;
+        Guid customerId;
+        DateTimeOffset pendingErasureAt;
+
+        await using (var writeScope = _provider.CreateAsyncScope())
+        {
+            var writeDb = writeScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var business = await CreateBusinessAsync(writeDb);
+            var customer = await CreateCustomerAsync(writeDb, business.Id);
+            businessId = business.Id;
+            customerId = customer.Id;
+
+            // Postgres timestamptz stores microsecond precision, not .NET's
+            // 100ns ticks — truncate before the round-trip comparison, same
+            // convention as ConversationsApiTests/NotificationApiTests/
+            // WidgetConversationServiceTests' own TruncateToMicroseconds.
+            pendingErasureAt = TruncateToMicroseconds(DateTimeOffset.UtcNow);
+            customer.PendingErasureAt = pendingErasureAt;
+            await writeDb.SaveChangesAsync();
+        }
+
+        await using var readScope = _provider.CreateAsyncScope();
+        var readDb = readScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var reloaded = await readDb.Customers.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(c => c.Id == customerId);
+
+        Assert.Equal(pendingErasureAt, reloaded.PendingErasureAt);
+        Assert.Equal(businessId, reloaded.BusinessId);
+    }
+
+    private static DateTimeOffset TruncateToMicroseconds(DateTimeOffset value) =>
+        new(value.Ticks - (value.Ticks % 10), value.Offset);
+
     // ── Test helpers ─────────────────────────────────────────────────
 
     private class FixedTenantAccessor(Guid? businessId) : ICurrentTenantAccessor

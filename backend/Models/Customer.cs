@@ -29,6 +29,21 @@ public class Customer : ITenantOwned
     public DateTimeOffset? AnonymizedAt { get; set; }
 
     /// <summary>
+    /// Set once CustomerErasureService begins erasing this customer, cleared
+    /// again once erasure reaches its normal terminal state. Persists the
+    /// "erasure in progress" fact across the service's own multiple,
+    /// separately-committing transactions — the ForCustomerErasure advisory
+    /// lock (AdvisoryLockKeyGenerator) is transaction-scoped and leaves no
+    /// trace once released, so this column is what a later-arriving
+    /// identity-mutating write actually checks. May remain non-null
+    /// indefinitely if an erasure is abandoned after being set; no
+    /// automatic staleness/expiry/reconciliation is implied by this field
+    /// alone (docs/handoffs/identity-binding-erasure-integrity-design.md
+    /// §3.7).
+    /// </summary>
+    public DateTimeOffset? PendingErasureAt { get; set; }
+
+    /// <summary>
     /// Current state only — true if this customer is presently flagged for
     /// closer review (e.g. suspected fraud). Takes effect only when
     /// Business.ExtendedAuditLoggingEnabled is also true. Full history of

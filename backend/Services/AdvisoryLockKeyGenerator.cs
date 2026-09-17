@@ -117,6 +117,20 @@ public static class AdvisoryLockKeyGenerator
     public static long ForConversationTagState(Guid businessId, Guid conversationId) =>
         PackToLong($"{businessId:D}:tag-state:{conversationId:D}");
 
+    /// <summary>
+    /// Identity-binding/erasure-integrity design (Decision 2/Decision 3;
+    /// docs/handoffs/identity-binding-erasure-integrity-design.md §7) —
+    /// scopes a lock to one Customer's erasure-in-flight check, shared by
+    /// CustomerErasureService's own Phase 0 (which sets
+    /// Customer.PendingErasureAt) and every identity-mutating write site
+    /// that must check it before proceeding. One shared key serves both
+    /// Decision 2 (Conversation erasure-escape) and Decision 3
+    /// (ExternalIdentity erasure-escape), since both reduce to the same
+    /// underlying "is this CustomerId currently mid-erasure?" question.
+    /// </summary>
+    public static long ForCustomerErasure(Guid businessId, Guid customerId) =>
+        PackToLong($"{businessId:D}:customer-erasure:{customerId:D}");
+
     private static long PackToLong(string canonical)
     {
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));
