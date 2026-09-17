@@ -1125,6 +1125,198 @@ public class VerificationCodeServiceTests : IAsyncLifetime
         Assert.Equal(customers[0].Id, codeCustomerIds[0]);
     }
 
+    // ── Decision 1: existing-binding conflict (identity-binding/erasure-
+    // integrity design; implementation plan Phase 1) ──────────────────
+
+    /// <summary>
+    /// Design doc Decision 1 / implementation plan Phase 1's core acceptance
+    /// criterion: once a Conversation is bound to Customer A, a different
+    /// Customer B's otherwise-valid verification must be rejected rather
+    /// than silently rebinding it. Also proves the rejected rebind never
+    /// burns B's own code — the whole transaction (including B's own
+    /// code-consumption write) rolls back, so B's code stays unused.
+    /// </summary>
+    [Fact]
+    public async Task VerifyCodeAsync_DifferentCustomerAttemptsRebind_RejectedAndBindingUnchanged()
+    {
+        var (businessId, conversation) = await SeedConversationAsync();
+        await using var scope = _provider.CreateAsyncScope();
+        var service = scope.ServiceProvider.GetRequiredService<IVerificationCodeService>();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var emailA = $"rebind-a-{Guid.NewGuid():N}@example.com";
+        var emailB = $"rebind-b-{Guid.NewGuid():N}@example.com";
+
+        await service.RequestCodeAsync(businessId, conversation.Id, conversation.Channel, emailA, CancellationToken.None);
+        var codeA = ExtractCode(_emailSender, emailA);
+        await service.RequestCodeAsync(businessId, conversation.Id, conversation.Channel, emailB, CancellationToken.None);
+        var codeB = ExtractCode(_emailSender, emailB);
+
+        var customerA = await db.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.BusinessId == businessId && c.Email == emailA);
+        var customerB = await db.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.BusinessId == businessId && c.Email == emailB);
+
+        var resultA = await service.VerifyCodeAsync(businessId, conversation.Id, conversation.Channel, emailA, codeA, CancellationToken.None);
+        Assert.True(resultA.Success);
+
+        // AsNoTracking throughout — db is shared with the service under
+        // test (same scope), so a tracked re-query of the same Conversation
+        // Id would return the change tracker's stale cached instance
+        // instead of a fresh read, silently masking whether the value
+        // actually changed underneath via the service's own ExecuteUpdateAsync
+        // calls (which bypass the tracker entirely).
+        var afterA = await db.Conversations.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == conversation.Id);
+        Assert.Equal(customerA.Id, afterA.CustomerId);
+
+        var resultB = await service.VerifyCodeAsync(businessId, conversation.Id, conversation.Channel, emailB, codeB, CancellationToken.None);
+
+        Assert.False(resultB.Success);
+        Assert.Equal(VerificationFailureReason.AlreadyBoundToDifferentCustomer, resultB.Reason);
+
+        var afterB = await db.Conversations.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == conversation.Id);
+        Assert.Equal(customerA.Id, afterB.CustomerId);
+
+        var codeRowB = await db.VerificationCodes.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(v => v.BusinessId == businessId && v.ConversationId == conversation.Id && v.CustomerId == customerB.Id);
+        Assert.False(codeRowB.Used);
+        Assert.Equal(0, codeRowB.AttemptCount);
+    }
+
+    /// <summary>
+    /// Decision 1 explicitly permits re-verification by the already-bound
+    /// customer — the conditional UPDATE's WHERE clause matches
+    /// CustomerId == customerId, not just CustomerId == null.
+    /// </summary>
+    [Fact]
+    public async Task VerifyCodeAsync_SameCustomerReVerifies_SucceedsAndRefreshesLevel2VerifiedUntil()
+    {
+        var (businessId, conversation) = await SeedConversationAsync();
+        await using var scope = _provider.CreateAsyncScope();
+        var service = scope.ServiceProvider.GetRequiredService<IVerificationCodeService>();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var email = $"reverify-{Guid.NewGuid():N}@example.com";
+
+        await service.RequestCodeAsync(businessId, conversation.Id, conversation.Channel, email, CancellationToken.None);
+        var firstCode = ExtractCode(_emailSender, email);
+        var firstResult = await service.VerifyCodeAsync(businessId, conversation.Id, conversation.Channel, email, firstCode, CancellationToken.None);
+        Assert.True(firstResult.Success);
+
+        var customer = await db.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.BusinessId == businessId && c.Email == email);
+        // AsNoTracking — db is shared with the service under test (same
+        // scope); a tracked re-query of the same Conversation Id below
+        // would otherwise return the change tracker's stale cached
+        // instance rather than a fresh read of what the second
+        // VerifyCodeAsync call actually persisted via ExecuteUpdateAsync
+        // (which bypasses the tracker entirely).
+        var afterFirst = await db.Conversations.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == conversation.Id);
+        Assert.Equal(customer.Id, afterFirst.CustomerId);
+        var firstLevel2VerifiedUntil = afterFirst.Level2VerifiedUntil;
+        Assert.NotNull(firstLevel2VerifiedUntil);
+
+        // Backdate past the resend cooldown so the second RequestCodeAsync
+        // below isn't blocked by that unrelated throttle — same technique
+        // RequestCodeAsync_SixResendsWithinHour_SixthReturnsResendLimitExceeded
+        // already uses.
+        await db.VerificationCodes.IgnoreQueryFilters()
+            .Where(v => v.BusinessId == businessId && v.ConversationId == conversation.Id)
+            .ExecuteUpdateAsync(s => s.SetProperty(v => v.CreatedAt, DateTimeOffset.UtcNow.AddMinutes(-2)));
+
+        await service.RequestCodeAsync(businessId, conversation.Id, conversation.Channel, email, CancellationToken.None);
+        var secondCode = ExtractCode(_emailSender, email);
+
+        var secondResult = await service.VerifyCodeAsync(businessId, conversation.Id, conversation.Channel, email, secondCode, CancellationToken.None);
+
+        Assert.True(secondResult.Success);
+        var afterSecond = await db.Conversations.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == conversation.Id);
+        Assert.Equal(customer.Id, afterSecond.CustomerId);
+        Assert.True(afterSecond.Level2VerifiedUntil > firstLevel2VerifiedUntil);
+    }
+
+    /// <summary>
+    /// Implementation plan Phase 1's own specified additional case: two
+    /// genuinely concurrent VerifyCodeAsync calls for two different
+    /// customers against the same initially-unbound Conversation. No
+    /// interceptor/checkpoint gate is needed here (unlike later phases) —
+    /// per the plan's own reasoning, this race is already fully closed by
+    /// ordinary Postgres row-level UPDATE locking on the Conversation row,
+    /// the same way VerifyCodeAsync_ConcurrentAttemptsWithSameCorrectCode_
+    /// ExactlyOneSucceeds above proves the equivalent for the code-
+    /// consumption CAS.
+    /// </summary>
+    [Fact]
+    public async Task VerifyCodeAsync_ConcurrentDifferentCustomerAttempts_ExactlyOneBindsOtherRejected()
+    {
+        var (businessId, conversation) = await SeedConversationAsync();
+        await using var setupScope = _provider.CreateAsyncScope();
+        var setupService = setupScope.ServiceProvider.GetRequiredService<IVerificationCodeService>();
+        var setupDb = setupScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var emailA = $"concurrent-rebind-a-{Guid.NewGuid():N}@example.com";
+        var emailB = $"concurrent-rebind-b-{Guid.NewGuid():N}@example.com";
+
+        await setupService.RequestCodeAsync(businessId, conversation.Id, conversation.Channel, emailA, CancellationToken.None);
+        var codeA = ExtractCode(_emailSender, emailA);
+        await setupService.RequestCodeAsync(businessId, conversation.Id, conversation.Channel, emailB, CancellationToken.None);
+        var codeB = ExtractCode(_emailSender, emailB);
+
+        var customerA = await setupDb.Customers.IgnoreQueryFilters().SingleAsync(c => c.BusinessId == businessId && c.Email == emailA);
+        var customerB = await setupDb.Customers.IgnoreQueryFilters().SingleAsync(c => c.BusinessId == businessId && c.Email == emailB);
+
+        async Task<VerificationResult> VerifyAsync(string email, string code)
+        {
+            await using var scope = _provider.CreateAsyncScope();
+            var service = scope.ServiceProvider.GetRequiredService<IVerificationCodeService>();
+            return await service.VerifyCodeAsync(businessId, conversation.Id, conversation.Channel, email, code, CancellationToken.None);
+        }
+
+        var results = await Task.WhenAll(VerifyAsync(emailA, codeA), VerifyAsync(emailB, codeB));
+
+        Assert.Single(results, r => r.Success);
+        Assert.Single(results, r => !r.Success && r.Reason == VerificationFailureReason.AlreadyBoundToDifferentCustomer);
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var finalConversation = await verifyDb.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+
+        Assert.True(finalConversation.CustomerId == customerA.Id || finalConversation.CustomerId == customerB.Id);
+    }
+
+    /// <summary>
+    /// Owner decision (Phase 1 NotFound-classification sign-off): when the
+    /// conditional CAS in VerifyCodeAsync affects zero rows because the
+    /// Conversation itself became anonymized between the code request and
+    /// this verify attempt, the re-read/reattribution branch must classify
+    /// it as VerificationFailureReason.NotFound — not a distinct
+    /// "anonymized" reason — consistent with
+    /// WidgetController.ResolveOwnConversationAsync already treating
+    /// !c.IsAnonymized as "absent" at the controller boundary.
+    /// </summary>
+    [Fact]
+    public async Task VerifyCodeAsync_ConversationAnonymizedBeforeVerify_ReturnsNotFound()
+    {
+        var (businessId, conversation) = await SeedConversationAsync();
+        await using var scope = _provider.CreateAsyncScope();
+        var service = scope.ServiceProvider.GetRequiredService<IVerificationCodeService>();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var email = $"anonymized-{Guid.NewGuid():N}@example.com";
+
+        await service.RequestCodeAsync(businessId, conversation.Id, conversation.Channel, email, CancellationToken.None);
+        var code = ExtractCode(_emailSender, email);
+
+        // Simulates the Conversation being anonymized (e.g. by
+        // ConversationPurgeService) after the code was issued but before
+        // this verify attempt — the exact race the CAS predicate's
+        // !IsAnonymized clause is meant to close.
+        await db.Conversations
+            .IgnoreQueryFilters()
+            .Where(c => c.Id == conversation.Id)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(c => c.IsAnonymized, true)
+                .SetProperty(c => c.AnonymizedAt, DateTimeOffset.UtcNow));
+
+        var result = await service.VerifyCodeAsync(businessId, conversation.Id, conversation.Channel, email, code, CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal(VerificationFailureReason.NotFound, result.Reason);
+    }
+
     private class FixedTenantAccessor(Guid? businessId) : ICurrentTenantAccessor
     {
         public Guid? BusinessId => businessId;

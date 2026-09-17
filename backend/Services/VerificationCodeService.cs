@@ -241,12 +241,48 @@ public class VerificationCodeService(
             }
 
             var level2Until = now.AddMinutes(options.Value.Level2VerifiedDurationMinutes);
-            await db.Conversations
+
+            // Decision 1 (identity-binding/erasure-integrity design;
+            // implementation plan Phase 1) — conditional UPDATE (row-level CAS),
+            // not the prior unconditional one: a Conversation already bound to a
+            // different customer must reject this rebind rather than silently
+            // being overwritten. Re-verification by the already-bound customer
+            // (CustomerId == customerId) remains permitted, as does a first bind
+            // (CustomerId == null). !IsAnonymized matches
+            // WidgetController.ResolveOwnConversationAsync's existing
+            // convention, not a new invariant.
+            var conversationAffected = await db.Conversations
                 .IgnoreQueryFilters()
-                .Where(c => c.Id == conversationId && c.BusinessId == businessId)
+                .Where(c => c.Id == conversationId && c.BusinessId == businessId && !c.IsAnonymized
+                    && (c.CustomerId == null || c.CustomerId == customerId))
                 .ExecuteUpdateAsync(s => s
                     .SetProperty(c => c.CustomerId, customerId)
                     .SetProperty(c => c.Level2VerifiedUntil, level2Until), cancellationToken);
+
+            if (conversationAffected == 0)
+            {
+                // Lost the CAS — roll back the whole transaction, including the
+                // code-consumption Used=true write above, so a rejected rebind
+                // attempt never burns the submitter's own otherwise-valid code.
+                // Re-read (AsNoTracking, IgnoreQueryFilters) to attribute the
+                // real cause rather than guessing — same discipline as the
+                // reattribution switch above.
+                await transaction.RollbackAsync(cancellationToken);
+
+                var currentConversation = await db.Conversations
+                    .IgnoreQueryFilters()
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(c => c.Id == conversationId && c.BusinessId == businessId, cancellationToken);
+
+                var conversationReason = currentConversation switch
+                {
+                    null => VerificationFailureReason.NotFound,
+                    { IsAnonymized: true } => VerificationFailureReason.NotFound,
+                    _ => VerificationFailureReason.AlreadyBoundToDifferentCustomer,
+                };
+
+                return await FailAsync(businessId, conversationId, conversationReason, cancellationToken);
+            }
 
             await transaction.CommitAsync(cancellationToken);
             return new VerificationResult(true, VerificationFailureReason.None);

@@ -36,6 +36,16 @@ public enum VerificationFailureReason
     Superseded,
     AttemptsExhausted,
     CodeMismatch,
+
+    /// <summary>
+    /// Identity-binding/erasure-integrity design, Decision 1 (implementation
+    /// plan Phase 1). The target Conversation's CustomerId is already
+    /// non-null and bound to a different customer than the one that just
+    /// verified — the conditional UPDATE in VerifyCodeAsync rejects the
+    /// rebind rather than silently overwriting it. Re-verification by the
+    /// already-bound customer is unaffected by this reason.
+    /// </summary>
+    AlreadyBoundToDifferentCustomer,
 }
 
 public record VerificationResult(bool Success, VerificationFailureReason Reason);
