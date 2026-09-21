@@ -7,6 +7,7 @@ using backend.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Npgsql;
 using Xunit;
 
 namespace backend.Tests;
@@ -31,6 +32,7 @@ namespace backend.Tests;
 public class CustomerDataLifecycleTests : IAsyncLifetime
 {
     private ServiceProvider _provider = null!;
+    private string _adoConnectionString = null!;
     private readonly List<Guid> _businessIdsToClean = [];
     private readonly List<Guid> _userIdsToClean = [];
 
@@ -41,6 +43,14 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
             .Build();
         var connectionUri = configuration.GetConnectionString("DefaultConnection")
             ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
+
+        // Identity-binding/erasure-integrity Phase 3's lock-acquisition test
+        // needs a raw, independent connection (not routed through the app's
+        // own DI-managed AppDbContext) to act as a deterministic
+        // advisory-lock barrier — same technique
+        // VerificationCodeServiceTests.cs already established for its own
+        // ForVerificationCode concurrency races.
+        _adoConnectionString = PostgresConnectionString.FromUri(connectionUri);
 
         // None of the services under test rely on ICurrentTenantAccessor at
         // all (they resolve BusinessId explicitly — see
@@ -55,6 +65,10 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
             .AddScoped<IRetentionEnforcementService, RetentionEnforcementService>()
             .AddScoped<IVerificationCodeCleanupService, VerificationCodeCleanupService>()
             .AddScoped<IPurgeFailurePoint, NoOpPurgeFailurePoint>()
+            // Identity-binding/erasure-integrity Phase 3 — CustomerErasureService
+            // now depends on ICustomerErasureCheckpoint (Phase 0's pause/fail
+            // test seam, no-op in production).
+            .AddScoped<ICustomerErasureCheckpoint, NoOpCustomerErasureCheckpoint>()
             // GDPR Phase 3 — RetentionEnforcementService now depends on
             // IAuditLogService (ConversationRetentionPurged audit write).
             .AddScoped<IAuditLogService, AuditLogService>()
@@ -1311,7 +1325,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
 
         var failingPurgeService = new ConversationPurgeService(db, new FailAtCheckpoint("before-commit"));
-        var failingErasureService = new CustomerErasureService(db, failingPurgeService, auditLogService);
+        var failingErasureService = new CustomerErasureService(db, failingPurgeService, auditLogService, new NoOpCustomerErasureCheckpoint());
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => failingErasureService.EraseCustomerAsync(customer.Id, staffUser.Id));
@@ -1363,7 +1377,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
 
         var throwingAuditService = new ThrowingOnEventType(realAuditLogService, AuditEventTypes.ConversationErasurePurged);
-        var failingErasureService = new CustomerErasureService(db, realPurgeService, throwingAuditService);
+        var failingErasureService = new CustomerErasureService(db, realPurgeService, throwingAuditService, new NoOpCustomerErasureCheckpoint());
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => failingErasureService.EraseCustomerAsync(customer.Id, staffUser.Id));
@@ -1433,7 +1447,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         var laterIds = processingOrder.Skip(3).ToList();
 
         var failingPurgeService = new FailForSpecificConversation(realPurgeService, failingId);
-        var failingErasureService = new CustomerErasureService(db, failingPurgeService, auditLogService);
+        var failingErasureService = new CustomerErasureService(db, failingPurgeService, auditLogService, new NoOpCustomerErasureCheckpoint());
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => failingErasureService.EraseCustomerAsync(customer.Id, staffUser.Id));
@@ -1518,7 +1532,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         var failingId = processingOrder[1];
 
         var failingPurgeService = new FailForSpecificConversation(realPurgeService, failingId);
-        var failingErasureService = new CustomerErasureService(db, failingPurgeService, auditLogService);
+        var failingErasureService = new CustomerErasureService(db, failingPurgeService, auditLogService, new NoOpCustomerErasureCheckpoint());
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => failingErasureService.EraseCustomerAsync(customer.Id, staffUser.Id));
@@ -1610,7 +1624,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         // Only the terminal CustomerErased write fails — the per-conversation
         // ConversationErasurePurged write in Phase 2 must succeed normally.
         var throwingAuditService = new ThrowingOnEventType(realAuditLogService, AuditEventTypes.CustomerErased);
-        var failingErasureService = new CustomerErasureService(db, realPurgeService, throwingAuditService);
+        var failingErasureService = new CustomerErasureService(db, realPurgeService, throwingAuditService, new NoOpCustomerErasureCheckpoint());
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => failingErasureService.EraseCustomerAsync(customer.Id, staffUser.Id));
@@ -1927,6 +1941,317 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
     private static DateTimeOffset TruncateToMicroseconds(DateTimeOffset value) =>
         new(value.Ticks - (value.Ticks % 10), value.Offset);
 
+    // ── 15. Identity-binding/erasure-integrity Phase 3 — CustomerErasureService Phase 0 ──
+
+    /// <summary>
+    /// Plan's own "Lock acquisition, no consumer yet" criterion: a
+    /// competing holder of ForCustomerErasure(businessId, customerId) —
+    /// here a raw barrier connection, same idiom
+    /// VerificationCodeServiceTests.cs already established for its own
+    /// ForVerificationCode races — provably blocks EraseCustomerAsync's
+    /// Phase 0 (proven via pg_locks waiter count, not a timer/sleep) until
+    /// the barrier releases, and PendingErasureAt genuinely has not been
+    /// set while blocked.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_PhaseZero_LockAcquisitionBlocksConcurrentErasure()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var erasureService = scope.ServiceProvider.GetRequiredService<ICustomerErasureService>();
+
+        var business = await CreateBusinessAsync(db);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+
+        var lockKey = AdvisoryLockKeyGenerator.ForCustomerErasure(business.Id, customer.Id);
+        var (barrierConnection, barrierTransaction) = await AcquireBarrierAsync(lockKey);
+        try
+        {
+            var eraseTask = erasureService.EraseCustomerAsync(customer.Id, staffUser.Id);
+
+            await WaitForAdvisoryLockWaitersAsync(barrierConnection, lockKey, expected: 1, raceName: "CustomerErasure Phase 0");
+            Assert.False(eraseTask.IsCompleted);
+
+            await using var duringScope = _provider.CreateAsyncScope();
+            var duringDb = duringScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var duringBlock = await duringDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customer.Id);
+            Assert.Null(duringBlock.PendingErasureAt);
+
+            await barrierTransaction.RollbackAsync();
+            await eraseTask;
+        }
+        finally
+        {
+            await barrierConnection.DisposeAsync();
+        }
+
+        await using var afterScope = _provider.CreateAsyncScope();
+        var afterDb = afterScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var after = await afterDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customer.Id);
+        Assert.True(after.IsAnonymized);
+        Assert.Null(after.PendingErasureAt);
+    }
+
+    /// <summary>
+    /// Plan's own "Idempotent set" criterion: Phase 0's
+    /// COALESCE(PendingErasureAt, now) must never overwrite an
+    /// already-set value — simulating a resumed/retried erasure attempt.
+    /// Paused at the Phase 0 checkpoint (before Phase 3's terminal clear
+    /// could run) so the still-set value can be observed directly, not
+    /// inferred from a full run.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_PhaseZero_AlreadySetPendingErasureAt_NotOverwritten()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var purgeService = scope.ServiceProvider.GetRequiredService<IConversationPurgeService>();
+        var auditLogService = scope.ServiceProvider.GetRequiredService<IAuditLogService>();
+
+        var business = await CreateBusinessAsync(db);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+
+        var originalPendingErasureAt = TruncateToMicroseconds(DateTimeOffset.UtcNow.AddMinutes(-30));
+        await db.Customers.IgnoreQueryFilters()
+            .Where(c => c.Id == customer.Id)
+            .ExecuteUpdateAsync(s => s.SetProperty(c => c.PendingErasureAt, originalPendingErasureAt));
+
+        var gate = new GatedCustomerErasureCheckpoint("after-phase-0-committed");
+        var erasureService = new CustomerErasureService(db, purgeService, auditLogService, gate);
+
+        var eraseTask = erasureService.EraseCustomerAsync(customer.Id, staffUser.Id);
+        await gate.Reached;
+
+        await using var duringScope = _provider.CreateAsyncScope();
+        var duringDb = duringScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var duringBlock = await duringDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customer.Id);
+        Assert.Equal(originalPendingErasureAt, duringBlock.PendingErasureAt);
+
+        gate.Release();
+        await eraseTask;
+    }
+
+    /// <summary>
+    /// Plan's own "Ordering relative to existing Phase 1" criterion:
+    /// PendingErasureAt is durably non-null (independent scope) at the
+    /// Phase 0 checkpoint, while the ExternalIdentity row Phase 1 would
+    /// delete is still present — proving a real window where Phase 0 has
+    /// committed but Phase 1 has not yet begun. Releasing the gate then
+    /// lets Phase 1 actually run and delete it.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_PhaseZero_CommitsBeforePhaseOneBegins()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var purgeService = scope.ServiceProvider.GetRequiredService<IConversationPurgeService>();
+        var auditLogService = scope.ServiceProvider.GetRequiredService<IAuditLogService>();
+
+        var business = await CreateBusinessAsync(db);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+
+        var identity = new ExternalIdentity
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = business.Id,
+            CustomerId = customer.Id,
+            Channel = "Website",
+            VerificationMethod = "SignedToken",
+            ExternalUserId = "phase-ordering-check",
+            LinkedAt = DateTimeOffset.UtcNow,
+        };
+        db.ExternalIdentities.Add(identity);
+        await db.SaveChangesAsync();
+
+        var gate = new GatedCustomerErasureCheckpoint("after-phase-0-committed");
+        var erasureService = new CustomerErasureService(db, purgeService, auditLogService, gate);
+
+        var eraseTask = erasureService.EraseCustomerAsync(customer.Id, staffUser.Id);
+        await gate.Reached;
+
+        await using var duringScope = _provider.CreateAsyncScope();
+        var duringDb = duringScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var duringCustomer = await duringDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customer.Id);
+        Assert.NotNull(duringCustomer.PendingErasureAt);
+        Assert.True(await duringDb.ExternalIdentities.IgnoreQueryFilters().AnyAsync(i => i.Id == identity.Id));
+
+        gate.Release();
+        await eraseTask;
+
+        await using var afterScope = _provider.CreateAsyncScope();
+        var afterDb = afterScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        Assert.False(await afterDb.ExternalIdentities.IgnoreQueryFilters().AnyAsync(i => i.Id == identity.Id));
+    }
+
+    /// <summary>
+    /// Plan's own "Abandoned after Phase 0" criterion (design §3.8's own
+    /// acceptance criterion: a failed/abandoned operation after Phase 0
+    /// may leave PendingErasureAt set — an accepted outcome, not a bug).
+    /// The checkpoint throws instead of pausing, mirroring
+    /// IPurgeFailurePoint's own FailAtCheckpoint idiom. No cleanup or
+    /// recovery logic is exercised or expected here.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_PhaseZero_CheckpointThrows_PendingErasureAtSurvivesAndPhaseOneNeverRuns()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var purgeService = scope.ServiceProvider.GetRequiredService<IConversationPurgeService>();
+        var auditLogService = scope.ServiceProvider.GetRequiredService<IAuditLogService>();
+
+        var business = await CreateBusinessAsync(db);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+
+        var identity = new ExternalIdentity
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = business.Id,
+            CustomerId = customer.Id,
+            Channel = "Website",
+            VerificationMethod = "SignedToken",
+            ExternalUserId = "abandoned-after-phase-zero",
+            LinkedAt = DateTimeOffset.UtcNow,
+        };
+        db.ExternalIdentities.Add(identity);
+        await db.SaveChangesAsync();
+
+        var auditCountBefore = await db.AuditLogs.IgnoreQueryFilters().CountAsync(a => a.BusinessId == business.Id);
+
+        var failingService = new CustomerErasureService(
+            db, purgeService, auditLogService, new ThrowAtCustomerErasureCheckpoint("after-phase-0-committed"));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => failingService.EraseCustomerAsync(customer.Id, staffUser.Id));
+
+        await using var afterScope = _provider.CreateAsyncScope();
+        var afterDb = afterScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var afterCustomer = await afterDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customer.Id);
+        Assert.NotNull(afterCustomer.PendingErasureAt);
+        Assert.False(afterCustomer.IsAnonymized);
+        Assert.Null(afterCustomer.AnonymizedAt);
+
+        // Phase 1 never began — the ExternalIdentity row it would delete survives.
+        Assert.True(await afterDb.ExternalIdentities.IgnoreQueryFilters().AnyAsync(i => i.Id == identity.Id));
+
+        // No Phase 0 audit row (C-1), and no terminal CustomerErased row
+        // either, since Phase 3 never ran.
+        var auditCountAfter = await afterDb.AuditLogs.IgnoreQueryFilters().CountAsync(a => a.BusinessId == business.Id);
+        Assert.Equal(auditCountBefore, auditCountAfter);
+    }
+
+    /// <summary>
+    /// Plan's own "Happy path (regression check)" criterion, run through
+    /// the real, unmodified CustomerErasureService (no custom checkpoint —
+    /// the production NoOpCustomerErasureCheckpoint from DI): Phase 0 sets
+    /// PendingErasureAt, the existing Phase 1/2/3 flow runs exactly as
+    /// before, and — per C-3 — PendingErasureAt is null again once Phase 3
+    /// commits, alongside the existing CustomerErased audit row.
+    /// </summary>
+    [Fact]
+    public async Task EraseCustomer_PhaseZero_HappyPath_PendingErasureAtSetThenClearedOnCompletion()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var erasureService = scope.ServiceProvider.GetRequiredService<ICustomerErasureService>();
+
+        var business = await CreateBusinessAsync(db);
+        var widget = await CreateWidgetAsync(db, business.Id);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var staffUser = await CreateStaffUserAsync(db, business.Id);
+        var conversation = await CreateConversationAsync(db, business.Id, widget.Id, customer.Id, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow);
+        await CreateMessageAsync(db, business.Id, conversation.Id, DateTimeOffset.UtcNow);
+
+        var identity = new ExternalIdentity
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = business.Id,
+            CustomerId = customer.Id,
+            Channel = "Website",
+            VerificationMethod = "SignedToken",
+            ExternalUserId = "phase-zero-happy-path",
+            LinkedAt = DateTimeOffset.UtcNow,
+        };
+        db.ExternalIdentities.Add(identity);
+        await db.SaveChangesAsync();
+
+        await erasureService.EraseCustomerAsync(customer.Id, staffUser.Id);
+
+        await using var afterScope = _provider.CreateAsyncScope();
+        var afterDb = afterScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var afterCustomer = await afterDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customer.Id);
+        Assert.True(afterCustomer.IsAnonymized);
+        Assert.Null(afterCustomer.PendingErasureAt);
+
+        Assert.False(await afterDb.ExternalIdentities.IgnoreQueryFilters().AnyAsync(i => i.Id == identity.Id));
+
+        var afterConversation = await afterDb.Conversations.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == conversation.Id);
+        Assert.True(afterConversation.IsAnonymized);
+
+        await afterDb.AuditLogs.IgnoreQueryFilters()
+            .SingleAsync(a => a.EntityId == customer.Id.ToString() && a.EventType == AuditEventTypes.CustomerErased);
+    }
+
+    private async Task<int> CountAdvisoryLockWaitersAsync(NpgsqlConnection barrierConnection, long lockKey)
+    {
+        var classId = unchecked((uint)(lockKey >> 32));
+        var objId = unchecked((uint)lockKey);
+        await using var cmd = new NpgsqlCommand(
+            "SELECT count(*) FROM pg_locks " +
+            "WHERE locktype = 'advisory' AND NOT granted AND objsubid = 1 " +
+            "AND classid::bigint = @classid AND objid::bigint = @objid",
+            barrierConnection);
+        cmd.Parameters.AddWithValue("classid", (long)classId);
+        cmd.Parameters.AddWithValue("objid", (long)objId);
+        return (int)(long)(await cmd.ExecuteScalarAsync())!;
+    }
+
+    /// <summary>
+    /// Deterministic wait-for-condition, not a fixed sleep — same
+    /// established convention as VerificationCodeServiceTests.cs's own
+    /// helper of this name.
+    /// </summary>
+    private async Task WaitForAdvisoryLockWaitersAsync(NpgsqlConnection barrierConnection, long lockKey, int expected, string raceName)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        int count;
+        do
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                Assert.Fail(
+                    $"Expected {expected} concurrent advisory-lock waiters for the {raceName} race within 10s, " +
+                    "but they did not appear. If the concurrency protection under test has been removed or is " +
+                    "no longer reached, this is the expected failure mode.");
+            }
+
+            count = await CountAdvisoryLockWaitersAsync(barrierConnection, lockKey);
+            if (count < expected)
+            {
+                await Task.Delay(25);
+            }
+        } while (count < expected);
+    }
+
+    /// <summary>Opens the barrier connection and pre-acquires the given erasure lock, holding it open until the caller disposes/rolls back the returned transaction.</summary>
+    private async Task<(NpgsqlConnection Connection, NpgsqlTransaction Transaction)> AcquireBarrierAsync(long lockKey)
+    {
+        var connection = new NpgsqlConnection(_adoConnectionString);
+        await connection.OpenAsync();
+        var transaction = await connection.BeginTransactionAsync();
+        await using (var lockCmd = new NpgsqlCommand($"SELECT pg_advisory_xact_lock({lockKey})", connection, transaction))
+        {
+            await lockCmd.ExecuteNonQueryAsync();
+        }
+        return (connection, transaction);
+    }
+
     // ── Test helpers ─────────────────────────────────────────────────
 
     private class FixedTenantAccessor(Guid? businessId) : ICurrentTenantAccessor
@@ -1942,6 +2267,47 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
             {
                 throw new InvalidOperationException($"Injected test failure at '{checkpointName}'.");
             }
+        }
+    }
+
+    /// <summary>Same throws-at-a-named-checkpoint idiom as FailAtCheckpoint above, for ICustomerErasureCheckpoint.</summary>
+    private class ThrowAtCustomerErasureCheckpoint(string checkpoint) : ICustomerErasureCheckpoint
+    {
+        public Task ReachedAsync(string checkpointName, CancellationToken cancellationToken)
+        {
+            if (checkpointName == checkpoint)
+            {
+                throw new InvalidOperationException($"Injected test failure at '{checkpointName}'.");
+            }
+
+            return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// Same TaskCompletionSource-gated pause idiom as BlockingEmailSender's
+    /// SendStarted/Release shape, scoped to one named checkpoint — every
+    /// other checkpoint name passes through immediately, un-paused.
+    /// </summary>
+    private class GatedCustomerErasureCheckpoint(string checkpoint) : ICustomerErasureCheckpoint
+    {
+        private readonly TaskCompletionSource _reached = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _releaseGate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Completes once the configured checkpoint has actually been reached.</summary>
+        public Task Reached => _reached.Task;
+
+        public void Release() => _releaseGate.TrySetResult();
+
+        public async Task ReachedAsync(string checkpointName, CancellationToken cancellationToken)
+        {
+            if (checkpointName != checkpoint)
+            {
+                return;
+            }
+
+            _reached.TrySetResult();
+            await _releaseGate.Task;
         }
     }
 

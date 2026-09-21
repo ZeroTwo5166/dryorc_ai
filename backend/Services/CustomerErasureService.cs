@@ -63,7 +63,9 @@ public interface ICustomerErasureService
 /// ignorant of caller identity/intent by design (Decision 5's settled
 /// boundary).
 /// </summary>
-public class CustomerErasureService(AppDbContext db, IConversationPurgeService purgeService, IAuditLogService auditLogService)
+public class CustomerErasureService(
+    AppDbContext db, IConversationPurgeService purgeService, IAuditLogService auditLogService,
+    ICustomerErasureCheckpoint checkpoint)
     : ICustomerErasureService
 {
     public async Task EraseCustomerAsync(Guid customerId, Guid changedByUserId, CancellationToken cancellationToken = default)
@@ -86,6 +88,41 @@ public class CustomerErasureService(AppDbContext db, IConversationPurgeService p
 
         var businessId = customer.BusinessId;
         var erasureCorrelationId = Guid.NewGuid();
+
+        // Phase 0 (identity-binding/erasure-integrity design;
+        // implementation plan Phase 3) — establishes the persisted
+        // "erasure in progress" fact before any destructive work begins.
+        // Own short transaction, separate from Phase 1: ForCustomerErasure
+        // is a transaction-scoped advisory lock (like every other lock in
+        // this codebase — released on commit/rollback), so it alone can't
+        // signal "erasure in progress" to a transaction that acquires it
+        // only after this one has already committed and released it. The
+        // persisted PendingErasureAt column is what survives that gap; the
+        // lock here only serializes this write against a concurrent
+        // identity-mutating write's own eligibility recheck under the same
+        // key. Idempotent (COALESCE) so re-running EraseCustomerAsync for
+        // an already-in-progress customer never clobbers the original
+        // timestamp. No audit row (C-1, design §9) — this step performs no
+        // destructive operation and the terminal CustomerErased row already
+        // covers this erasure run.
+        var now = DateTimeOffset.UtcNow;
+        var pendingErasureLockKey = AdvisoryLockKeyGenerator.ForCustomerErasure(businessId, customerId);
+        await using (var phase0Transaction = await db.Database.BeginTransactionAsync(cancellationToken))
+        {
+            await db.Database.ExecuteSqlInterpolatedAsync(
+                $"SELECT pg_advisory_xact_lock({pendingErasureLockKey})", cancellationToken);
+
+            await db.Customers
+                .IgnoreQueryFilters()
+                .Where(c => c.Id == customerId)
+                .ExecuteUpdateAsync(
+                    s => s.SetProperty(c => c.PendingErasureAt, c => c.PendingErasureAt ?? now),
+                    cancellationToken);
+
+            await phase0Transaction.CommitAsync(cancellationToken);
+        }
+
+        await checkpoint.ReachedAsync("after-phase-0-committed", cancellationToken);
 
         // Phase 1 — identity-row deletes + customer-scoped Approval
         // belt-and-braces delete, own small transaction. Not subject to
@@ -149,13 +186,37 @@ public class CustomerErasureService(AppDbContext db, IConversationPurgeService p
         {
             try
             {
-                var now = DateTimeOffset.UtcNow;
+                var completedAt = DateTimeOffset.UtcNow;
                 customer.Email = null;
                 customer.Name = null;
                 customer.ExternalId = null;
                 customer.IsAnonymized = true;
-                customer.AnonymizedAt = now;
-                customer.UpdatedAt = now;
+                customer.AnonymizedAt = completedAt;
+                customer.UpdatedAt = completedAt;
+
+                // C-3 (design §2/§9) — not required for correctness
+                // (IsAnonymized alone already makes every PendingErasureAt
+                // check moot once true), but clearing it here keeps a
+                // future "find stuck erasures" query
+                // (WHERE PendingErasureAt IS NOT NULL) from being
+                // permanently polluted by every successfully-completed
+                // erasure. Deliberately a direct ExecuteUpdateAsync, not a
+                // tracked-entity assignment: Phase 0 wrote this column via
+                // its own ExecuteUpdateAsync, bypassing this DbContext's
+                // change tracker entirely — the tracked `customer`
+                // instance's in-memory PendingErasureAt is still whatever
+                // it was when loaded at the top of this method (null, in
+                // the ordinary case), so `customer.PendingErasureAt = null`
+                // would be a no-op the tracker silently drops from the
+                // generated UPDATE. ExecuteUpdateAsync here joins this same
+                // ambient transaction (Database.CurrentTransaction), same
+                // as every other ExecuteUpdateAsync call already used
+                // throughout this file — no new transaction, no new lock
+                // acquisition.
+                await db.Customers
+                    .IgnoreQueryFilters()
+                    .Where(c => c.Id == customerId)
+                    .ExecuteUpdateAsync(s => s.SetProperty(c => c.PendingErasureAt, (DateTimeOffset?)null), cancellationToken);
 
                 await auditLogService.LogAsync(
                     businessId, AuditEntityTypes.Customer, customerId.ToString(),

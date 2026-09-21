@@ -119,6 +119,10 @@ builder.Services.AddScoped<ICurrentTenantAccessor, ClaimsCurrentTenantAccessor>(
 // substitute a fake to deterministically fail PurgeConversationAsync
 // partway through, proving its transaction rolls back.
 builder.Services.AddScoped<IPurgeFailurePoint, NoOpPurgeFailurePoint>();
+// ICustomerErasureCheckpoint is the same test-seam idiom as
+// IPurgeFailurePoint above, but for pausing CustomerErasureService's Phase 0
+// mid-flight rather than failing it — see ICustomerErasureCheckpoint.cs.
+builder.Services.AddScoped<ICustomerErasureCheckpoint, NoOpCustomerErasureCheckpoint>();
 builder.Services.AddScoped<IConversationPurgeService, ConversationPurgeService>();
 builder.Services.AddScoped<ICustomerErasureService, CustomerErasureService>();
 builder.Services.AddScoped<IRetentionEnforcementService, RetentionEnforcementService>();
