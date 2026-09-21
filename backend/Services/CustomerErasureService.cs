@@ -166,6 +166,8 @@ public class CustomerErasureService(
             await transaction.CommitAsync(cancellationToken);
         }
 
+        await checkpoint.ReachedAsync("after-phase-1-committed", cancellationToken);
+
         // Phase 2 — one small transaction per conversation. Each pairs
         // that conversation's purge with its own audit row.
         var conversationIds = await db.Conversations
