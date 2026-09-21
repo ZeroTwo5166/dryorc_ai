@@ -7,9 +7,12 @@ using backend.Controllers;
 using backend.Data;
 using backend.Enums;
 using backend.Models;
+using backend.Services;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Npgsql;
 using Xunit;
 
 namespace backend.Tests;
@@ -28,8 +31,21 @@ public class CustomersApiTests : IAsyncLifetime
 {
     private readonly NivoraApiFactory _factory = new();
     private readonly List<Guid> _businessIdsToClean = [];
+    private string _adoConnectionString = null!;
 
-    public Task InitializeAsync() => Task.CompletedTask;
+    public Task InitializeAsync()
+    {
+        // Identity-binding/erasure-integrity Phase 4's lock-freshness race
+        // test needs a raw, independent connection (not routed through the
+        // app's own DI-managed AppDbContext) to act as a deterministic
+        // advisory-lock barrier — same technique
+        // CustomerDataLifecycleTests.cs/VerificationCodeServiceTests.cs
+        // already established for their own advisory-lock races.
+        var connectionUri = new ConfigurationBuilder().AddUserSecrets<Program>().Build().GetConnectionString("DefaultConnection")
+            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
+        _adoConnectionString = PostgresConnectionString.FromUri(connectionUri);
+        return Task.CompletedTask;
+    }
 
     public async Task DisposeAsync()
     {
@@ -577,6 +593,245 @@ public class CustomersApiTests : IAsyncLifetime
         Assert.Equal(1, activeCount); // never zero, never two — exactly one active row survives the race
     }
 
+    // ── Identity-binding/erasure-integrity Phase 4 (Decision 3) ─────────
+    //
+    // docs/handoffs/identity-binding-erasure-integrity-design.md §4;
+    // implementation plan Phase 4. Distinct from
+    // LinkIdentity_AnonymizedCustomer_ReturnsConflict_NoRowsWritten above:
+    // that test covers the terminal IsAnonymized == true state; these cover
+    // the in-flight PendingErasureAt marker Phase 3's CustomerErasureService
+    // Phase 0 sets, including the fresh-recheck race against a genuinely
+    // concurrent erasure. Erasure itself is never mocked — only
+    // ICustomerErasureCheckpoint (an intentional test seam, no-op in
+    // production) is substituted, exactly as CustomerDataLifecycleTests.cs's
+    // own Phase 3 tests already do.
+
+    private const string PendingErasureConflictMessage =
+        "This customer's erasure is currently in progress and cannot be linked to a new identity.";
+
+    [Fact]
+    public async Task LinkIdentity_PendingErasureAtSet_RejectsWithoutMutatingAnything()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Link Identity Pending Erasure Business");
+        using var _ = ownerClient;
+
+        Guid customerId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerId = await SeedCustomerAsync(db, businessId);
+            await db.Customers.IgnoreQueryFilters()
+                .Where(c => c.Id == customerId)
+                .ExecuteUpdateAsync(s => s.SetProperty(c => c.PendingErasureAt, DateTimeOffset.UtcNow));
+        }
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/customers/{customerId}/identities", ownerCookie),
+            new LinkExternalIdentityRequest(ConversationChannels.Website, IdentityVerificationMethods.Otp, "should-never-link-pending-erasure", null)));
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Contains(PendingErasureConflictMessage, await response.Content.ReadAsStringAsync());
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var identityCount = await verifyDb.ExternalIdentities.IgnoreQueryFilters().CountAsync(i => i.CustomerId == customerId);
+        Assert.Equal(0, identityCount);
+
+        var auditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.BusinessId == businessId && a.EntityType == AuditEntityTypes.ExternalIdentity);
+        Assert.Equal(0, auditCount);
+
+        var customer = await verifyDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerId);
+        Assert.False(customer.IsAnonymized);
+        Assert.NotNull(customer.PendingErasureAt);
+    }
+
+    /// <summary>
+    /// The post-erasure zero-identity assertion is a regression check only: Phase 1's
+    /// unconditional delete-by-CustomerId sweep removes any row inserted at this
+    /// checkpoint whether or not Phase 4's fix exists, because the only checkpoint
+    /// ('after-phase-0-committed') fires before Phase 1. The escape window after Phase 1's
+    /// delete has no checkpoint and is not deterministically testable with the current
+    /// seam. The discriminating assertion here is the 409 response; lock and freshness
+    /// behavior are proven by the T3 test.
+    /// </summary>
+    [Fact]
+    public async Task LinkIdentity_AfterErasurePhaseZeroCommitted_RejectsWithoutCreatingIdentity()
+    {
+        var (businessId, ownerId, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Link Identity Erasure Race Business");
+        using var _ = ownerClient;
+
+        Guid customerId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerId = await SeedCustomerAsync(db, businessId);
+
+            var existingIdentity = new ExternalIdentity
+            {
+                Id = Guid.NewGuid(),
+                BusinessId = businessId,
+                CustomerId = customerId,
+                Channel = ConversationChannels.Website,
+                VerificationMethod = IdentityVerificationMethods.Otp,
+                ExternalUserId = "pre-existing-identity",
+                LinkedAt = DateTimeOffset.UtcNow,
+            };
+            db.ExternalIdentities.Add(existingIdentity);
+            await db.SaveChangesAsync();
+        }
+
+        await using var erasureScope = _factory.Services.CreateAsyncScope();
+        var erasureDb = erasureScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var purgeService = erasureScope.ServiceProvider.GetRequiredService<IConversationPurgeService>();
+        var auditLogService = erasureScope.ServiceProvider.GetRequiredService<IAuditLogService>();
+        var gate = new GatedCustomerErasureCheckpoint("after-phase-0-committed");
+        var erasureService = new CustomerErasureService(erasureDb, purgeService, auditLogService, gate);
+
+        var eraseTask = erasureService.EraseCustomerAsync(customerId, ownerId);
+        await gate.Reached;
+
+        await using (var duringScope = _factory.Services.CreateAsyncScope())
+        {
+            var duringDb = duringScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var during = await duringDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerId);
+            Assert.NotNull(during.PendingErasureAt);
+        }
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/customers/{customerId}/identities", ownerCookie),
+            new LinkExternalIdentityRequest(ConversationChannels.Email, IdentityVerificationMethods.SignedToken, "should-never-link-race", null)));
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Contains(PendingErasureConflictMessage, await response.Content.ReadAsStringAsync());
+
+        await using (var midScope = _factory.Services.CreateAsyncScope())
+        {
+            var midDb = midScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var raceIdentityCount = await midDb.ExternalIdentities.IgnoreQueryFilters()
+                .CountAsync(i => i.CustomerId == customerId && i.ExternalUserId == "should-never-link-race");
+            Assert.Equal(0, raceIdentityCount);
+        }
+
+        gate.Release();
+        await eraseTask;
+
+        await using var afterScope = _factory.Services.CreateAsyncScope();
+        var afterDb = afterScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var after = await afterDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerId);
+        Assert.True(after.IsAnonymized);
+        Assert.Null(after.PendingErasureAt);
+
+        var survivingIdentities = await afterDb.ExternalIdentities.IgnoreQueryFilters().CountAsync(i => i.CustomerId == customerId);
+        Assert.Equal(0, survivingIdentities);
+    }
+
+    /// <summary>
+    /// Proves the recheck is a fresh, AsNoTracking, post-lock query — not a
+    /// re-read of the `customer` entity LinkIdentity already loaded (and
+    /// still holds tracked) before acquiring the lock. A raw barrier
+    /// connection holds ForCustomerErasure open first; LinkIdentity's HTTP
+    /// request blocks acquiring the same lock (its own tracked customer
+    /// snapshot, from before the block, still shows PendingErasureAt ==
+    /// null at that point). Only once exactly one waiter is confirmed
+    /// (pg_locks, not a timer) does the barrier set PendingErasureAt and
+    /// commit, releasing the lock — LinkIdentity's fresh recheck, issued
+    /// strictly after it acquires the now-free lock, must observe the
+    /// just-committed value and reject. If the recheck instead read the
+    /// stale tracked instance, this would observe PendingErasureAt == null
+    /// and incorrectly succeed.
+    /// </summary>
+    [Fact]
+    public async Task LinkIdentity_BlockedOnLock_ObservesPendingErasureCommittedWhileWaiting()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Link Identity Lock Freshness Business");
+        using var _ = ownerClient;
+
+        Guid customerId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerId = await SeedCustomerAsync(db, businessId);
+        }
+
+        var lockKey = AdvisoryLockKeyGenerator.ForCustomerErasure(businessId, customerId);
+        var (barrierConnection, barrierTransaction) = await AcquireBarrierAsync(lockKey);
+        try
+        {
+            var linkTask = ownerClient.SendAsync(WithBody(
+                Authed(HttpMethod.Post, $"/api/customers/{customerId}/identities", ownerCookie),
+                new LinkExternalIdentityRequest(ConversationChannels.Website, IdentityVerificationMethods.Otp, "should-block-then-reject", null)));
+
+            await WaitForAdvisoryLockWaitersAsync(barrierConnection, lockKey, expected: 1, raceName: "LinkIdentity vs erasure marker freshness");
+            Assert.False(linkTask.IsCompleted);
+
+            await using (var duringCmd = new NpgsqlCommand(
+                "UPDATE \"Customers\" SET \"PendingErasureAt\" = now() WHERE \"Id\" = @id", barrierConnection, barrierTransaction))
+            {
+                duringCmd.Parameters.AddWithValue("id", customerId);
+                await duringCmd.ExecuteNonQueryAsync();
+            }
+            await barrierTransaction.CommitAsync();
+
+            var response = await linkTask;
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            Assert.Contains(PendingErasureConflictMessage, await response.Content.ReadAsStringAsync());
+        }
+        finally
+        {
+            await barrierConnection.DisposeAsync();
+        }
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var identityCount = await verifyDb.ExternalIdentities.IgnoreQueryFilters()
+            .CountAsync(i => i.CustomerId == customerId && i.ExternalUserId == "should-block-then-reject");
+        Assert.Equal(0, identityCount);
+
+        var auditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.BusinessId == businessId && a.EntityType == AuditEntityTypes.ExternalIdentity);
+        Assert.Equal(0, auditCount);
+    }
+
+    /// <summary>
+    /// Regression guard, not an escape proof: this ordering already worked
+    /// correctly before Phase 4 (Phase 1's own unconditional delete-by-
+    /// CustomerId sweep, unchanged by this design) — proves the new lock
+    /// does not introduce a false rejection or a dropped write when there
+    /// is no concurrency at all.
+    /// </summary>
+    [Fact]
+    public async Task LinkIdentity_CompletesBeforeErasureStarts_IdentityIsSweptByPhaseOne()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Link Identity Then Erase Business");
+        using var _ = ownerClient;
+
+        Guid customerId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerId = await SeedCustomerAsync(db, businessId);
+        }
+
+        var linkResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, $"/api/customers/{customerId}/identities", ownerCookie),
+            new LinkExternalIdentityRequest(ConversationChannels.Website, IdentityVerificationMethods.Otp, "linked-before-erasure", null)));
+        Assert.Equal(HttpStatusCode.Created, linkResponse.StatusCode);
+
+        var eraseResponse = await ownerClient.SendAsync(Authed(HttpMethod.Post, $"/api/customers/{customerId}/erase", ownerCookie));
+        Assert.Equal(HttpStatusCode.NoContent, eraseResponse.StatusCode);
+
+        await using var afterScope = _factory.Services.CreateAsyncScope();
+        var afterDb = afterScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var after = await afterDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerId);
+        Assert.True(after.IsAnonymized);
+        Assert.Null(after.PendingErasureAt);
+
+        var survivingIdentities = await afterDb.ExternalIdentities.IgnoreQueryFilters().CountAsync(i => i.CustomerId == customerId);
+        Assert.Equal(0, survivingIdentities);
+    }
+
     // ── Identity revocation ──────────────────────────────────────────────
 
     [Fact]
@@ -1077,5 +1332,90 @@ public class CustomersApiTests : IAsyncLifetime
         var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
         var auditCountAfterSecond = await verifyDb.AuditLogs.IgnoreQueryFilters().CountAsync(a => a.BusinessId == businessId);
         Assert.Equal(auditCountAfterFirst, auditCountAfterSecond);
+    }
+
+    // ── Identity-binding/erasure-integrity Phase 4 test helpers ──────────
+
+    /// <summary>
+    /// Same TaskCompletionSource-gated pause idiom as
+    /// CustomerDataLifecycleTests.cs's own GatedCustomerErasureCheckpoint
+    /// (private to that file, so duplicated here rather than shared —
+    /// matching this project's own established per-file convention for
+    /// small concurrency-test doubles, e.g. AcquireBarrierAsync/
+    /// WaitForAdvisoryLockWaitersAsync below are independently duplicated
+    /// in CustomerDataLifecycleTests.cs and VerificationCodeServiceTests.cs
+    /// too). Every checkpoint name other than the configured one passes
+    /// through immediately, un-paused.
+    /// </summary>
+    private class GatedCustomerErasureCheckpoint(string checkpoint) : ICustomerErasureCheckpoint
+    {
+        private readonly TaskCompletionSource _reached = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _releaseGate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Completes once the configured checkpoint has actually been reached.</summary>
+        public Task Reached => _reached.Task;
+
+        public void Release() => _releaseGate.TrySetResult();
+
+        public async Task ReachedAsync(string checkpointName, CancellationToken cancellationToken)
+        {
+            if (checkpointName != checkpoint)
+            {
+                return;
+            }
+
+            _reached.TrySetResult();
+            await _releaseGate.Task;
+        }
+    }
+
+    /// <summary>Opens a raw barrier connection and pre-acquires the given advisory lock, holding it open until the caller commits/rolls back and disposes the returned transaction — same idiom as CustomerDataLifecycleTests.cs's own AcquireBarrierAsync.</summary>
+    private async Task<(NpgsqlConnection Connection, NpgsqlTransaction Transaction)> AcquireBarrierAsync(long lockKey)
+    {
+        var connection = new NpgsqlConnection(_adoConnectionString);
+        await connection.OpenAsync();
+        var transaction = await connection.BeginTransactionAsync();
+        await using (var lockCmd = new NpgsqlCommand($"SELECT pg_advisory_xact_lock({lockKey})", connection, transaction))
+        {
+            await lockCmd.ExecuteNonQueryAsync();
+        }
+        return (connection, transaction);
+    }
+
+    /// <summary>Deterministic wait-for-condition, not a fixed sleep — same established convention as CustomerDataLifecycleTests.cs's/VerificationCodeServiceTests.cs's own helper of this name.</summary>
+    private async Task WaitForAdvisoryLockWaitersAsync(NpgsqlConnection barrierConnection, long lockKey, int expected, string raceName)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        int count;
+        do
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                Assert.Fail(
+                    $"Expected {expected} concurrent advisory-lock waiters for the {raceName} race within 10s, " +
+                    "but they did not appear. If the concurrency protection under test has been removed or is " +
+                    "no longer reached, this is the expected failure mode.");
+            }
+
+            count = await CountAdvisoryLockWaitersAsync(barrierConnection, lockKey);
+            if (count < expected)
+            {
+                await Task.Delay(25);
+            }
+        } while (count < expected);
+    }
+
+    private async Task<int> CountAdvisoryLockWaitersAsync(NpgsqlConnection barrierConnection, long lockKey)
+    {
+        var classId = unchecked((uint)(lockKey >> 32));
+        var objId = unchecked((uint)lockKey);
+        await using var cmd = new NpgsqlCommand(
+            "SELECT count(*) FROM pg_locks " +
+            "WHERE locktype = 'advisory' AND NOT granted AND objsubid = 1 " +
+            "AND classid::bigint = @classid AND objid::bigint = @objid",
+            barrierConnection);
+        cmd.Parameters.AddWithValue("classid", (long)classId);
+        cmd.Parameters.AddWithValue("objid", (long)objId);
+        return (int)(long)(await cmd.ExecuteScalarAsync())!;
     }
 }

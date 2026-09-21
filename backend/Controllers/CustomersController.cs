@@ -236,6 +236,45 @@ public class CustomersController(
             return BadRequest("ExternalUserId is required.");
         }
 
+        // Identity-binding/erasure-integrity design, Decision 3
+        // (docs/handoffs/identity-binding-erasure-integrity-design.md §4;
+        // implementation plan Phase 4). The customer.IsAnonymized pre-filter
+        // above is a cheap early-exit only: `customer` was loaded (and
+        // remains tracked) before this point, so it cannot observe a
+        // CustomerErasureService run that starts concurrently after that
+        // load. The authoritative check is this fresh, AsNoTracking,
+        // lock-protected recheck, immediately before the ExternalIdentity
+        // insert it protects — acquiring the lock alone is not enough,
+        // since pg_advisory_xact_lock is transaction-scoped and says
+        // nothing about data already read into memory before it was
+        // acquired; re-reading the tracked `customer` instance here would
+        // silently return its stale, pre-lock snapshot (EF Core does not
+        // overwrite an already-tracked entity's values from a later query).
+        await using var transaction = await db.Database.BeginTransactionAsync();
+
+        var lockKey = AdvisoryLockKeyGenerator.ForCustomerErasure(customer.BusinessId, customerId);
+        await db.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock({lockKey})");
+
+        var current = await db.Customers
+            .AsNoTracking()
+            .Where(c => c.Id == customerId)
+            .Select(c => new { c.IsAnonymized, c.PendingErasureAt })
+            .SingleOrDefaultAsync();
+
+        if (current is null)
+        {
+            // Unreachable in practice — customers are never hard-deleted —
+            // but fail closed rather than proceed on an assumption.
+            await transaction.RollbackAsync();
+            return NotFound();
+        }
+
+        if (current.IsAnonymized || current.PendingErasureAt is not null)
+        {
+            await transaction.RollbackAsync();
+            return Conflict("This customer's erasure is currently in progress and cannot be linked to a new identity.");
+        }
+
         var now = DateTimeOffset.UtcNow;
         var identity = new ExternalIdentity
         {
@@ -274,8 +313,14 @@ public class CustomersController(
         }
         catch (DbUpdateException ex) when (ex.InnerException is PostgresException { SqlState: "23505" })
         {
+            // The transaction is aborted after the failed statement —
+            // an explicit rollback before returning, same as every other
+            // non-success exit from this new transaction above.
+            await transaction.RollbackAsync();
             return Conflict("An active identity already exists for this Channel/ExternalUserId combination.");
         }
+
+        await transaction.CommitAsync();
 
         return CreatedAtAction(nameof(ListIdentities), new { customerId = customer.Id }, ToIdentityResponse(identity, now));
     }
