@@ -133,6 +133,36 @@ public class WidgetConversationService(AppDbContext db, INotificationService not
 
             if (conversation is null)
             {
+                // Identity-binding/erasure-integrity design, Decision 2
+                // (docs/handoffs/identity-binding-erasure-integrity-design.md
+                // §5b; implementation plan Phase 6). customerId here is a
+                // claim baked into the widget JWT at Init time, up to 24
+                // hours ago (WidgetTokenService.Lifetime) — it only proves
+                // the customer wasn't mid-erasure at token-issuance time,
+                // not now. Acquired inside the already-open ForVisitorSession
+                // transaction — no new transaction. Degrade to an anonymous
+                // conversation rather than fail the send, matching
+                // WidgetInitRequest's own "never fails the request, only
+                // means the result starts unresolved" precedent. Only the
+                // reuse branch above (conversation already found) and the
+                // customerId == null case skip this entirely — neither can
+                // escape any erasure, so neither needs the lock.
+                var effectiveCustomerId = customerId;
+                if (customerId is not null)
+                {
+                    var erasureLockKey = AdvisoryLockKeyGenerator.ForCustomerErasure(businessId, customerId.Value);
+                    await db.Database.ExecuteSqlInterpolatedAsync(
+                        $"SELECT pg_advisory_xact_lock({erasureLockKey})", cancellationToken);
+
+                    var eligible = await db.Customers
+                        .IgnoreQueryFilters()
+                        .AsNoTracking()
+                        .AnyAsync(c => c.BusinessId == businessId && c.Id == customerId.Value
+                            && !c.IsAnonymized && c.PendingErasureAt == null, cancellationToken);
+
+                    effectiveCustomerId = eligible ? customerId : null;
+                }
+
                 conversation = new Conversation
                 {
                     Id = Guid.NewGuid(),
@@ -141,7 +171,7 @@ public class WidgetConversationService(AppDbContext db, INotificationService not
                     VisitorSessionId = visitorSessionId,
                     Channel = ConversationChannels.Website,
                     HandledBy = HandledBy.Ai,
-                    CustomerId = customerId,
+                    CustomerId = effectiveCustomerId,
                     CreatedAt = now,
                     UpdatedAt = now,
                 };

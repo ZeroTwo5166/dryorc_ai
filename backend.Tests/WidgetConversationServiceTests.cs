@@ -76,6 +76,7 @@ public class WidgetConversationServiceTests : IAsyncLifetime
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Notifications\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Messages\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({ids})");
+            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Customers\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Widgets\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AspNetUsers\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = ANY({ids})");
@@ -117,6 +118,21 @@ public class WidgetConversationServiceTests : IAsyncLifetime
         _businessIdsToClean.Add(business.Id);
 
         return (business, widget);
+    }
+
+    private static async Task<Customer> CreateCustomerAsync(AppDbContext db, Guid businessId, DateTimeOffset? pendingErasureAt = null)
+    {
+        var customer = new Customer
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+            PendingErasureAt = pendingErasureAt,
+        };
+        db.Customers.Add(customer);
+        await db.SaveChangesAsync();
+        return customer;
     }
 
     private static async Task<ApplicationUser> CreateActiveStaffAsync(AppDbContext db, Guid businessId)
@@ -582,6 +598,241 @@ public class WidgetConversationServiceTests : IAsyncLifetime
                 && x.n.Type == NotificationTypes.CustomerReplied
                 && !x.r.IsRead);
         Assert.Equal(1, unreadRecipientCount);
+    }
+
+    // ── Identity-binding/erasure-integrity Phase 6 (Decision 2, Path 2b) ──
+    //
+    // docs/handoffs/identity-binding-erasure-integrity-design.md §5b;
+    // implementation-plan.md's Phase 6. Only the new-conversation creation
+    // branch is protected; the existing-open-conversation reuse branch is
+    // never touched. Failure semantics are degrade-to-anonymous, never
+    // reject the send.
+
+    [Fact]
+    public async Task PostMessageAsync_EligibleCustomer_CreatesConversationBoundToCustomer()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var conversationService = scope.ServiceProvider.GetRequiredService<IWidgetConversationService>();
+
+        var (business, widget) = await CreateBusinessAndWidgetAsync(db);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var visitorSessionId = Guid.NewGuid().ToString("N");
+
+        var message = await conversationService.PostMessageAsync(
+            business.Id, widget.Id, visitorSessionId, "Hello, identified customer", customer.Id);
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var conversation = await verifyDb.Conversations.IgnoreQueryFilters()
+            .SingleAsync(c => c.Id == message.ConversationId);
+        Assert.Equal(customer.Id, conversation.CustomerId);
+    }
+
+    /// <summary>
+    /// Proves the fresh eligibility check observes a marker that was
+    /// already committed before the call even started — no concurrency
+    /// needed for this case, since the marker is already durable. Against
+    /// the unfixed implementation, this fails because CustomerId is
+    /// currently assigned unconditionally with no eligibility check at all.
+    /// </summary>
+    [Fact]
+    public async Task PostMessageAsync_ErasurePendingMarkerAlreadySet_CreatesUnboundConversation()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var conversationService = scope.ServiceProvider.GetRequiredService<IWidgetConversationService>();
+
+        var (business, widget) = await CreateBusinessAndWidgetAsync(db);
+        var customer = await CreateCustomerAsync(db, business.Id, pendingErasureAt: DateTimeOffset.UtcNow);
+        var visitorSessionId = Guid.NewGuid().ToString("N");
+
+        var message = await conversationService.PostMessageAsync(
+            business.Id, widget.Id, visitorSessionId, "Hello while erasure pending", customer.Id);
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var conversation = await verifyDb.Conversations.IgnoreQueryFilters()
+            .SingleAsync(c => c.Id == message.ConversationId);
+        Assert.Null(conversation.CustomerId);
+
+        // No trace of the stale customerId anywhere on the created row.
+        Assert.NotEqual(customer.Id, conversation.CustomerId ?? Guid.Empty);
+    }
+
+    /// <summary>
+    /// Genuine PostgreSQL concurrency proof, same barrier idiom already
+    /// established in this file for ForConversationNotification (see
+    /// PostMessageAsync_GenuinelyConcurrentCustomerMessages_... above): a
+    /// raw, independent connection pre-acquires ForCustomerErasure and
+    /// holds it open. PostMessageAsync's own creation-branch call is
+    /// started (not awaited) — its Customer eligibility read must happen
+    /// only AFTER it acquires this same lock, so it necessarily blocks
+    /// here first. Only once exactly one waiter is confirmed via pg_locks
+    /// (not a timer) does the barrier commit PendingErasureAt and release
+    /// the lock. Against the unfixed implementation (no lock acquired at
+    /// all), the wait-for-1-waiter loop below times out — a distinct,
+    /// meaningful RED signature, not a silent pass.
+    /// </summary>
+    [Fact]
+    public async Task PostMessageAsync_BlockedOnCustomerErasureLock_ObservesPendingErasureCommittedWhileWaiting_CreatesUnboundConversation()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var (business, widget) = await CreateBusinessAndWidgetAsync(db);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var visitorSessionId = Guid.NewGuid().ToString("N");
+
+        var lockKey = AdvisoryLockKeyGenerator.ForCustomerErasure(business.Id, customer.Id);
+
+        await using var barrierConnection = new NpgsqlConnection(_adoConnectionString);
+        await barrierConnection.OpenAsync();
+        await using var barrierTransaction = await barrierConnection.BeginTransactionAsync();
+        await using (var lockCmd = new NpgsqlCommand($"SELECT pg_advisory_xact_lock({lockKey})", barrierConnection, barrierTransaction))
+        {
+            await lockCmd.ExecuteNonQueryAsync();
+        }
+
+        await using var callScope = _provider.CreateAsyncScope();
+        var callService = callScope.ServiceProvider.GetRequiredService<IWidgetConversationService>();
+        var callTask = callService.PostMessageAsync(business.Id, widget.Id, visitorSessionId, "Racing message", customer.Id);
+
+        var classId = unchecked((uint)(lockKey >> 32));
+        var objId = unchecked((uint)lockKey);
+
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        int waitingCount;
+        do
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                Assert.Fail(
+                    "Expected exactly one advisory-lock waiter for the customer-erasure lock within 10s, " +
+                    "but it did not appear. If the ForCustomerErasure lock acquisition in the new-conversation " +
+                    "creation branch has been removed or is no longer reached, this is the expected failure mode.");
+            }
+
+            await using var checkCmd = new NpgsqlCommand(
+                "SELECT count(*) FROM pg_locks " +
+                "WHERE locktype = 'advisory' AND NOT granted AND objsubid = 1 " +
+                "AND classid::bigint = @classid AND objid::bigint = @objid",
+                barrierConnection);
+            checkCmd.Parameters.AddWithValue("classid", (long)classId);
+            checkCmd.Parameters.AddWithValue("objid", (long)objId);
+            waitingCount = (int)(long)(await checkCmd.ExecuteScalarAsync())!;
+
+            if (waitingCount < 1)
+            {
+                await Task.Delay(25);
+            }
+        } while (waitingCount < 1);
+
+        Assert.Equal(1, waitingCount); // genuinely blocked — confirmed via pg_locks, not assumed
+        Assert.False(callTask.IsCompleted);
+
+        await using (var markCmd = new NpgsqlCommand(
+            "UPDATE \"Customers\" SET \"PendingErasureAt\" = now() WHERE \"Id\" = @id", barrierConnection, barrierTransaction))
+        {
+            markCmd.Parameters.AddWithValue("id", customer.Id);
+            await markCmd.ExecuteNonQueryAsync();
+        }
+        await barrierTransaction.CommitAsync();
+
+        var message = await callTask;
+
+        // Independent, fresh scope/DbContext — never the tracked scope above.
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var conversation = await verifyDb.Conversations.IgnoreQueryFilters()
+            .SingleAsync(c => c.Id == message.ConversationId);
+        Assert.Null(conversation.CustomerId);
+    }
+
+    /// <summary>
+    /// Tenant-isolation proof for the BusinessId predicate: calls the
+    /// service directly (its actual production call path — no controller,
+    /// no JWT fabrication needed) with a customerId that genuinely belongs
+    /// to a different Business than the one the call itself targets.
+    /// Against the unfixed implementation (no recheck at all), CustomerId
+    /// is bound directly to the cross-tenant id, which this test would
+    /// catch as a failure.
+    /// </summary>
+    [Fact]
+    public async Task PostMessageAsync_CustomerIdBelongsToDifferentBusiness_CreatesUnboundConversation()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var conversationService = scope.ServiceProvider.GetRequiredService<IWidgetConversationService>();
+
+        var (businessA, _) = await CreateBusinessAndWidgetAsync(db);
+        var customerA = await CreateCustomerAsync(db, businessA.Id);
+
+        var (businessB, widgetB) = await CreateBusinessAndWidgetAsync(db);
+        var visitorSessionId = Guid.NewGuid().ToString("N");
+
+        var message = await conversationService.PostMessageAsync(
+            businessB.Id, widgetB.Id, visitorSessionId, "Cross-tenant customerId", customerA.Id);
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var conversation = await verifyDb.Conversations.IgnoreQueryFilters()
+            .SingleAsync(c => c.Id == message.ConversationId);
+        Assert.Null(conversation.CustomerId);
+
+        // Customer A itself must remain completely untouched by this call.
+        var reloadedCustomerA = await verifyDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerA.Id);
+        Assert.Equal(businessA.Id, reloadedCustomerA.BusinessId);
+    }
+
+    /// <summary>
+    /// Regression proof that the Phase 6 lock/recheck is reachable only
+    /// through the conversation-is-null creation branch: a raw connection
+    /// pre-acquires ForCustomerErasure for this exact customer and holds it
+    /// open (never releasing it during the test). If the existing-open-
+    /// conversation reuse branch ever tried to acquire that same lock, this
+    /// second call would block indefinitely behind it — the bounded
+    /// Task.WhenAny below is the proof it never does, without introducing
+    /// any query-interception framework.
+    /// </summary>
+    [Fact]
+    public async Task PostMessageAsync_ExistingOpenConversation_DoesNotAcquireCustomerErasureLock_ReusesConversation()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var conversationService = scope.ServiceProvider.GetRequiredService<IWidgetConversationService>();
+
+        var (business, widget) = await CreateBusinessAndWidgetAsync(db);
+        var customer = await CreateCustomerAsync(db, business.Id);
+        var visitorSessionId = Guid.NewGuid().ToString("N");
+
+        var firstMessage = await conversationService.PostMessageAsync(
+            business.Id, widget.Id, visitorSessionId, "First message", customer.Id);
+
+        var lockKey = AdvisoryLockKeyGenerator.ForCustomerErasure(business.Id, customer.Id);
+        await using var barrierConnection = new NpgsqlConnection(_adoConnectionString);
+        await barrierConnection.OpenAsync();
+        await using var barrierTransaction = await barrierConnection.BeginTransactionAsync();
+        await using (var lockCmd = new NpgsqlCommand($"SELECT pg_advisory_xact_lock({lockKey})", barrierConnection, barrierTransaction))
+        {
+            await lockCmd.ExecuteNonQueryAsync();
+        }
+
+        var secondMessageTask = conversationService.PostMessageAsync(
+            business.Id, widget.Id, visitorSessionId, "Second message, existing conversation reused", customer.Id);
+        var completed = await Task.WhenAny(secondMessageTask, Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.Same(secondMessageTask, completed); // did not hang behind the still-held lock
+
+        var secondMessage = await secondMessageTask;
+        Assert.Equal(firstMessage.ConversationId, secondMessage.ConversationId); // reused, not a second conversation
+
+        await barrierTransaction.RollbackAsync();
+
+        await using var verifyScope = _provider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var conversation = await verifyDb.Conversations.IgnoreQueryFilters()
+            .SingleAsync(c => c.Id == firstMessage.ConversationId);
+        Assert.Equal(customer.Id, conversation.CustomerId); // unchanged — never rebound or cleared
     }
 
     private class FixedTenantAccessor(Guid? businessId) : ICurrentTenantAccessor
