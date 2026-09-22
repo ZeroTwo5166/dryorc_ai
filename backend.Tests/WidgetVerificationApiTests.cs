@@ -329,6 +329,46 @@ public class WidgetVerificationApiTests : IAsyncLifetime
         Assert.Equal("NotFound", body.Reason);
     }
 
+    /// <summary>
+    /// Test G — identity-binding/erasure-integrity design (Decision 2;
+    /// implementation plan Phase 7). Confirms
+    /// WidgetController.VerifyVerificationCode's existing, unmodified
+    /// result.Reason.ToString() forwarding surfaces the new
+    /// CustomerErasureInProgress reason exactly like every other reason —
+    /// no controller change is needed or made for this.
+    /// </summary>
+    [Fact]
+    public async Task VerifyVerificationCode_ErasureInProgress_ReturnsVerifiedFalseWithCustomerErasureInProgressReason()
+    {
+        var widget = await CreateBusinessAndWidgetAsync();
+        using var client = NewClient();
+        var (token, conversationId) = await InitAndStartConversationAsync(client, widget);
+        var email = $"verify-erasure-api-{Guid.NewGuid():N}@example.com";
+
+        await client.SendAsync(WithJsonBody(
+            Bearer(HttpMethod.Post, "/api/widget/verification/request", token),
+            new WidgetVerificationRequestRequest(conversationId, email)));
+        var code = ExtractCode(EmailSender, email);
+
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            await db.Customers.IgnoreQueryFilters()
+                .Where(c => c.BusinessId == widget.BusinessId && c.Email == email)
+                .ExecuteUpdateAsync(s => s.SetProperty(c => c.PendingErasureAt, DateTimeOffset.UtcNow));
+        }
+
+        var response = await client.SendAsync(WithJsonBody(
+            Bearer(HttpMethod.Post, "/api/widget/verification/verify", token),
+            new WidgetVerificationVerifyRequest(conversationId, email, code)));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<WidgetVerificationVerifyResponse>();
+        Assert.NotNull(body);
+        Assert.False(body!.Verified);
+        Assert.Equal("CustomerErasureInProgress", body.Reason);
+    }
+
     [Fact]
     public async Task VerifyVerificationCode_MalformedRequest_ReturnsBadRequest()
     {

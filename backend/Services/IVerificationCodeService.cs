@@ -46,6 +46,18 @@ public enum VerificationFailureReason
     /// already-bound customer is unaffected by this reason.
     /// </summary>
     AlreadyBoundToDifferentCustomer,
+
+    /// <summary>
+    /// Identity-binding/erasure-integrity design, Decision 2 (implementation
+    /// plan Phase 7). The customer this code just verified is currently
+    /// mid-erasure (Customer.PendingErasureAt is set, or IsAnonymized is
+    /// true) — the fresh, lock-protected recheck in VerifyCodeAsync fails
+    /// closed before the conditional CAS ever runs, whether this would have
+    /// been a first bind or a rebind by the already-bound customer. The
+    /// whole transaction (including this code's own consumption) rolls
+    /// back, so the code is never burned by a rejected attempt.
+    /// </summary>
+    CustomerErasureInProgress,
 }
 
 public record VerificationResult(bool Success, VerificationFailureReason Reason);

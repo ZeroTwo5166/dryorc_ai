@@ -242,6 +242,46 @@ public class VerificationCodeService(
 
             var level2Until = now.AddMinutes(options.Value.Level2VerifiedDurationMinutes);
 
+            // Decision 2 (identity-binding/erasure-integrity design;
+            // implementation plan Phase 7) — lock + fresh recheck,
+            // positioned immediately before Decision 1's conditional CAS
+            // below, inside this same transaction (no new transaction, no
+            // change to its ownership). This is additional to, not a
+            // replacement for, the CAS: it protects a different invariant
+            // (a first bind or rebind escaping this customer's in-flight
+            // erasure), which the CAS alone cannot detect since a
+            // null->customerId write has no pre-existing owner to conflict
+            // against. Projection-shaped (AnyAsync), not a full Customer
+            // entity load — ResolveCustomerAsync above already tracks a
+            // Customer entity for this exact customerId in this same
+            // DbContext, and a full-entity re-fetch without AsNoTracking
+            // would risk EF Core's identity-resolution returning that
+            // stale, pre-lock instance instead of a genuinely fresh read.
+            // BusinessId is included for consistency with every other
+            // erasure-check call site even though it is redundant here
+            // (customerId was already resolved via a BusinessId-scoped
+            // lookup above); IgnoreQueryFilters() matches this service's
+            // own file-level doc comment — it never relies on an ambient
+            // HTTP-scoped tenant context.
+            var erasureLockKey = AdvisoryLockKeyGenerator.ForCustomerErasure(businessId, customerId);
+            await db.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock({erasureLockKey})", cancellationToken);
+
+            var erasureEligible = await db.Customers
+                .IgnoreQueryFilters()
+                .AsNoTracking()
+                .AnyAsync(c => c.BusinessId == businessId && c.Id == customerId
+                    && !c.IsAnonymized && c.PendingErasureAt == null, cancellationToken);
+
+            if (!erasureEligible)
+            {
+                // Roll back the whole transaction, including the
+                // code-consumption Used=true write above — a rejected
+                // attempt must never burn the submitter's own otherwise-
+                // valid code. The existing CAS below is never reached.
+                await transaction.RollbackAsync(cancellationToken);
+                return await FailAsync(businessId, conversationId, VerificationFailureReason.CustomerErasureInProgress, cancellationToken);
+            }
+
             // Decision 1 (identity-binding/erasure-integrity design;
             // implementation plan Phase 1) — conditional UPDATE (row-level CAS),
             // not the prior unconditional one: a Conversation already bound to a

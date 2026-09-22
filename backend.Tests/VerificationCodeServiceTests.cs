@@ -1317,6 +1317,250 @@ public class VerificationCodeServiceTests : IAsyncLifetime
         Assert.Equal(VerificationFailureReason.NotFound, result.Reason);
     }
 
+    // ── Identity-binding/erasure-integrity Phase 7 (Decision 2, Path 3) ──
+    //
+    // docs/handoffs/identity-binding-erasure-integrity-design.md §6;
+    // implementation-plan.md's Phase 7. Erasure is never mocked — a raw
+    // advisory-lock barrier connection and direct PendingErasureAt writes
+    // substitute for a full CustomerErasureService run, same technique
+    // SignedIdentityTokenServiceTests.cs's own Phase 5 tests already
+    // established for the identical race shape.
+
+    /// <summary>
+    /// Test A — Decision-1 regression under Phase 7. The new erasure
+    /// lock+recheck is layered in front of the existing conditional CAS;
+    /// this proves it does not interfere with the ordinary
+    /// no-erasure-in-progress path — a first bind to an unbound
+    /// conversation, and re-verification by the already-bound customer,
+    /// must both still succeed via the real, unmodified CAS.
+    /// </summary>
+    [Fact]
+    public async Task VerifyCodeAsync_NoErasureInProgress_UnboundBindThenSameCustomerReVerify_BothSucceedViaExistingCas()
+    {
+        var (businessId, conversation) = await SeedConversationAsync();
+        await using var scope = _provider.CreateAsyncScope();
+        var service = scope.ServiceProvider.GetRequiredService<IVerificationCodeService>();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var email = $"phase7-regression-{Guid.NewGuid():N}@example.com";
+
+        await service.RequestCodeAsync(businessId, conversation.Id, conversation.Channel, email, CancellationToken.None);
+        var firstCode = ExtractCode(_emailSender, email);
+
+        var firstResult = await service.VerifyCodeAsync(businessId, conversation.Id, conversation.Channel, email, firstCode, CancellationToken.None);
+        Assert.True(firstResult.Success);
+        Assert.Equal(VerificationFailureReason.None, firstResult.Reason);
+
+        var customer = await db.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.BusinessId == businessId && c.Email == email);
+        Assert.Null(customer.PendingErasureAt);
+        Assert.False(customer.IsAnonymized);
+        var afterFirst = await db.Conversations.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == conversation.Id);
+        Assert.Equal(customer.Id, afterFirst.CustomerId);
+
+        // Backdate past the resend cooldown so the second RequestCodeAsync
+        // below isn't blocked by that unrelated throttle — same technique
+        // RequestCodeAsync_SixResendsWithinHour_SixthReturnsResendLimitExceeded
+        // already uses.
+        await db.VerificationCodes.IgnoreQueryFilters()
+            .Where(v => v.BusinessId == businessId && v.ConversationId == conversation.Id)
+            .ExecuteUpdateAsync(s => s.SetProperty(v => v.CreatedAt, DateTimeOffset.UtcNow.AddMinutes(-2)));
+
+        await service.RequestCodeAsync(businessId, conversation.Id, conversation.Channel, email, CancellationToken.None);
+        var secondCode = ExtractCode(_emailSender, email);
+
+        var secondResult = await service.VerifyCodeAsync(businessId, conversation.Id, conversation.Channel, email, secondCode, CancellationToken.None);
+
+        Assert.True(secondResult.Success);
+        Assert.Equal(VerificationFailureReason.None, secondResult.Reason);
+        var afterSecond = await db.Conversations.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == conversation.Id);
+        Assert.Equal(customer.Id, afterSecond.CustomerId);
+        Assert.True(afterSecond.Level2VerifiedUntil > afterFirst.Level2VerifiedUntil);
+    }
+
+    /// <summary>
+    /// Test B — Phase 7 must not replace, bypass, or duplicate the existing
+    /// Decision-1 CAS. Neither customer here is mid-erasure, so Phase 7's
+    /// own lock+recheck must pass silently for B — the rejection must still
+    /// come from the pre-existing conditional CAS
+    /// (AlreadyBoundToDifferentCustomer), never from the new Phase 7 check
+    /// (CustomerErasureInProgress), which would only appear if a (wrong)
+    /// implementation let the new mechanism alone decide this outcome.
+    /// </summary>
+    [Fact]
+    public async Task VerifyCodeAsync_DifferentCustomerAttemptsRebind_NoErasureInProgress_RejectedByExistingCasNotPhase7Check()
+    {
+        var (businessId, conversation) = await SeedConversationAsync();
+        await using var scope = _provider.CreateAsyncScope();
+        var service = scope.ServiceProvider.GetRequiredService<IVerificationCodeService>();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var emailA = $"phase7-rebind-a-{Guid.NewGuid():N}@example.com";
+        var emailB = $"phase7-rebind-b-{Guid.NewGuid():N}@example.com";
+
+        await service.RequestCodeAsync(businessId, conversation.Id, conversation.Channel, emailA, CancellationToken.None);
+        var codeA = ExtractCode(_emailSender, emailA);
+        await service.RequestCodeAsync(businessId, conversation.Id, conversation.Channel, emailB, CancellationToken.None);
+        var codeB = ExtractCode(_emailSender, emailB);
+
+        var customerA = await db.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.BusinessId == businessId && c.Email == emailA);
+        var customerB = await db.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.BusinessId == businessId && c.Email == emailB);
+
+        var resultA = await service.VerifyCodeAsync(businessId, conversation.Id, conversation.Channel, emailA, codeA, CancellationToken.None);
+        Assert.True(resultA.Success);
+
+        // Neither customer is mid-erasure — Phase 7's own lock+recheck must
+        // pass silently for B here.
+        Assert.Null(customerB.PendingErasureAt);
+        Assert.False(customerB.IsAnonymized);
+
+        var resultB = await service.VerifyCodeAsync(businessId, conversation.Id, conversation.Channel, emailB, codeB, CancellationToken.None);
+
+        Assert.False(resultB.Success);
+        Assert.Equal(VerificationFailureReason.AlreadyBoundToDifferentCustomer, resultB.Reason);
+
+        var afterB = await db.Conversations.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == conversation.Id);
+        Assert.Equal(customerA.Id, afterB.CustomerId);
+
+        var codeRowB = await db.VerificationCodes.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(v => v.BusinessId == businessId && v.ConversationId == conversation.Id && v.CustomerId == customerB.Id);
+        Assert.False(codeRowB.Used);
+        Assert.Equal(0, codeRowB.AttemptCount);
+    }
+
+    /// <summary>
+    /// Test C — first-bind erasure race, real advisory-lock barrier (design
+    /// §6 first-bind race; implementation plan Phase 7). A raw barrier
+    /// connection holds ForCustomerErasure(businessId, customerId) open
+    /// first; VerifyCodeAsync's own lock acquisition must block on it —
+    /// proven via pg_locks, not IsCompleted timing alone, same convention
+    /// as SignedIdentityTokenServiceTests.cs's own
+    /// ValidateAndResolveAsync_BlockedOnLock_ObservesPendingErasureCommittedWhileWaiting.
+    /// Only once exactly one waiter is confirmed does the barrier commit
+    /// PendingErasureAt and release the lock — VerifyCodeAsync's fresh
+    /// recheck, issued strictly after it acquires the now-free lock, must
+    /// observe the just-committed marker and reject before ever reaching
+    /// the existing CAS.
+    /// </summary>
+    [Fact]
+    public async Task VerifyCodeAsync_BlockedOnErasureLock_ObservesPendingErasureCommittedWhileWaiting()
+    {
+        var (businessId, conversation) = await SeedConversationAsync();
+        await using var setupScope = _provider.CreateAsyncScope();
+        var setupService = setupScope.ServiceProvider.GetRequiredService<IVerificationCodeService>();
+        var setupDb = setupScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var email = $"phase7-race-{Guid.NewGuid():N}@example.com";
+
+        await setupService.RequestCodeAsync(businessId, conversation.Id, conversation.Channel, email, CancellationToken.None);
+        var code = ExtractCode(_emailSender, email);
+        var customerId = (await setupDb.Customers.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(c => c.BusinessId == businessId && c.Email == email)).Id;
+
+        var lockKey = AdvisoryLockKeyGenerator.ForCustomerErasure(businessId, customerId);
+        var (barrierConnection, barrierTransaction) = await AcquireBarrierAsync(lockKey);
+        try
+        {
+            async Task<VerificationResult> CallAsync()
+            {
+                await using var callScope = _provider.CreateAsyncScope();
+                var callService = callScope.ServiceProvider.GetRequiredService<IVerificationCodeService>();
+                return await callService.VerifyCodeAsync(businessId, conversation.Id, conversation.Channel, email, code, CancellationToken.None);
+            }
+
+            var callTask = CallAsync();
+
+            await WaitForAdvisoryLockWaitersAsync(barrierConnection, lockKey, expected: 1, raceName: "VerifyCodeAsync vs erasure marker freshness");
+            Assert.False(callTask.IsCompleted);
+
+            await using (var duringCmd = new NpgsqlCommand(
+                "UPDATE \"Customers\" SET \"PendingErasureAt\" = now() WHERE \"Id\" = @id", barrierConnection, barrierTransaction))
+            {
+                duringCmd.Parameters.AddWithValue("id", customerId);
+                await duringCmd.ExecuteNonQueryAsync();
+            }
+            await barrierTransaction.CommitAsync();
+
+            var result = await callTask;
+            Assert.False(result.Success);
+            Assert.Equal(VerificationFailureReason.CustomerErasureInProgress, result.Reason);
+        }
+        finally
+        {
+            await barrierConnection.DisposeAsync();
+        }
+
+        await using var afterScope = _provider.CreateAsyncScope();
+        var afterDb = afterScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var afterConversation = await afterDb.Conversations.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == conversation.Id);
+        Assert.Null(afterConversation.CustomerId);
+
+        var codeRow = await afterDb.VerificationCodes.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(v => v.BusinessId == businessId && v.ConversationId == conversation.Id && v.CustomerId == customerId);
+        Assert.False(codeRow.Used);
+        Assert.Equal(0, codeRow.AttemptCount);
+
+        var customer = await afterDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerId);
+        Assert.NotNull(customer.PendingErasureAt);
+        Assert.False(customer.IsAnonymized);
+    }
+
+    /// <summary>
+    /// Test D — "erasure already won" ordering (design §6). PendingErasureAt
+    /// is already committed before VerifyCodeAsync ever starts — no race,
+    /// no interceptor needed (this is the design's own "erasure operation
+    /// wins the race" scenario, sequential by construction). The
+    /// conversation is pre-bound to a DIFFERENT customer (Z) specifically
+    /// so the two possible code paths produce distinguishable reasons: if
+    /// the Phase 7 check were bypassed and control reached the existing
+    /// CAS, the CAS's own WHERE clause (CustomerId IS NULL OR
+    /// CustomerId == X) would not match Z, so the CAS's own reattribution
+    /// branch — the sole source of AlreadyBoundToDifferentCustomer/NotFound
+    /// in this method — would report AlreadyBoundToDifferentCustomer, never
+    /// CustomerErasureInProgress. Observing CustomerErasureInProgress is
+    /// therefore direct, positive evidence that the CAS's own affected==0
+    /// branch was never reached — not an inference from "final state is
+    /// unchanged" alone.
+    /// </summary>
+    [Fact]
+    public async Task VerifyCodeAsync_PendingErasureAlreadyCommitted_FailsClosedBeforeReachingCas()
+    {
+        var (businessId, conversation) = await SeedConversationAsync();
+        await using var scope = _provider.CreateAsyncScope();
+        var service = scope.ServiceProvider.GetRequiredService<IVerificationCodeService>();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var emailZ = $"phase7-boundz-{Guid.NewGuid():N}@example.com";
+        var emailX = $"phase7-erased-{Guid.NewGuid():N}@example.com";
+
+        // Bind the conversation to Z first, via an ordinary successful verify.
+        await service.RequestCodeAsync(businessId, conversation.Id, conversation.Channel, emailZ, CancellationToken.None);
+        var codeZ = ExtractCode(_emailSender, emailZ);
+        var resultZ = await service.VerifyCodeAsync(businessId, conversation.Id, conversation.Channel, emailZ, codeZ, CancellationToken.None);
+        Assert.True(resultZ.Success);
+        var customerZ = await db.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.BusinessId == businessId && c.Email == emailZ);
+
+        // Issue a code for X, then commit X's erasure marker BEFORE calling
+        // VerifyCodeAsync at all — the "erasure operation wins the race"
+        // ordering, deliberately made non-concurrent here.
+        await service.RequestCodeAsync(businessId, conversation.Id, conversation.Channel, emailX, CancellationToken.None);
+        var codeX = ExtractCode(_emailSender, emailX);
+        var customerX = await db.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.BusinessId == businessId && c.Email == emailX);
+
+        await db.Customers.IgnoreQueryFilters()
+            .Where(c => c.Id == customerX.Id)
+            .ExecuteUpdateAsync(s => s.SetProperty(c => c.PendingErasureAt, DateTimeOffset.UtcNow));
+
+        var resultX = await service.VerifyCodeAsync(businessId, conversation.Id, conversation.Channel, emailX, codeX, CancellationToken.None);
+
+        Assert.False(resultX.Success);
+        Assert.Equal(VerificationFailureReason.CustomerErasureInProgress, resultX.Reason);
+
+        var afterConversation = await db.Conversations.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == conversation.Id);
+        Assert.Equal(customerZ.Id, afterConversation.CustomerId); // untouched — still Z, not X, not null
+
+        var codeRowX = await db.VerificationCodes.IgnoreQueryFilters().AsNoTracking()
+            .SingleAsync(v => v.BusinessId == businessId && v.ConversationId == conversation.Id && v.CustomerId == customerX.Id);
+        Assert.False(codeRowX.Used);
+        Assert.Equal(0, codeRowX.AttemptCount);
+    }
+
     private class FixedTenantAccessor(Guid? businessId) : ICurrentTenantAccessor
     {
         public Guid? BusinessId => businessId;
