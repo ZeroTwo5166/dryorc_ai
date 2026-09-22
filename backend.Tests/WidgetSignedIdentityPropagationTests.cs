@@ -186,6 +186,64 @@ public class WidgetSignedIdentityPropagationTests : IAsyncLifetime
         _ = businessId; // seeded for DisposeAsync cleanup scoping only
     }
 
+    /// <summary>
+    /// Identity-binding/erasure-integrity Phase 5 sibling to
+    /// Init_InvalidSignedToken_StillSucceedsAnonymously_NeverFailsInit
+    /// above (design §5a; implementation-plan.md's Phase 5): proves the
+    /// same silently-absorbed-rejection contract holds when
+    /// ValidateAndResolveAsync's Rejected outcome is reached specifically
+    /// via the new erasure-in-flight branch, not just the pre-existing
+    /// invalid-token causes.
+    /// </summary>
+    [Fact]
+    public async Task Init_SignedTokenForCustomerWithErasurePending_StillSucceedsAnonymously()
+    {
+        var (businessId, widget) = await CreateBusinessAndWidgetAsync();
+        using var signer = new FakeSignedTokenSigner();
+        var kid = await RegisterKeyAsync(businessId, signer);
+
+        using var client = NewClient();
+
+        var seedInit = await client.PostAsJsonAsync(
+            "/api/widget/init", new WidgetInitRequest(widget.PublicKey, null, signer.IssueToken(kid, ExternalCustomerId)));
+        Assert.Equal(HttpStatusCode.OK, seedInit.StatusCode);
+        var seedBody = await seedInit.Content.ReadFromJsonAsync<WidgetInitResponse>();
+        var seedClaims = DecodeClaims(seedBody!.Token).ToList();
+        var customerId = Guid.Parse(seedClaims.Single(c => c.Type == NivoraClaimTypes.CustomerId).Value);
+
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            await db.Customers.IgnoreQueryFilters()
+                .Where(c => c.Id == customerId)
+                .ExecuteUpdateAsync(s => s.SetProperty(c => c.PendingErasureAt, DateTimeOffset.UtcNow));
+        }
+
+        var raceInit = await client.PostAsJsonAsync(
+            "/api/widget/init", new WidgetInitRequest(widget.PublicKey, null, signer.IssueToken(kid, ExternalCustomerId)));
+
+        Assert.Equal(HttpStatusCode.OK, raceInit.StatusCode);
+        var raceBody = await raceInit.Content.ReadFromJsonAsync<WidgetInitResponse>();
+        Assert.NotNull(raceBody);
+        Assert.DoesNotContain(DecodeClaims(raceBody!.Token), c => c.Type == NivoraClaimTypes.CustomerId);
+
+        var messageResponse = await client.SendAsync(WithJsonBody(
+            Bearer(HttpMethod.Post, "/api/widget/messages", raceBody.Token), new PostWidgetMessageRequest("Erasure-pending hello")));
+        Assert.Equal(HttpStatusCode.OK, messageResponse.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        // Unchanged — no refresh/insert happened for the erasure-pending customer.
+        var identityCount = await verifyDb.ExternalIdentities.IgnoreQueryFilters()
+            .CountAsync(ei => ei.BusinessId == businessId && ei.CustomerId == customerId);
+        Assert.Equal(1, identityCount);
+
+        var conversation = await verifyDb.Conversations.IgnoreQueryFilters()
+            .SingleAsync(c => c.BusinessId == businessId && c.VisitorSessionId == raceBody.VisitorSessionId);
+        Assert.Null(conversation.CustomerId);
+    }
+
     [Fact]
     public async Task ExistingConversation_CustomerIdNeverOverwrittenByLaterMessage()
     {

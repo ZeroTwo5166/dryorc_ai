@@ -304,6 +304,39 @@ public class SignedIdentityTokenService(
             }
 
             customer = existingCustomer;
+
+            // Identity-binding/erasure-integrity design, Decision 3
+            // (docs/handoffs/identity-binding-erasure-integrity-design.md
+            // §5a; implementation plan Phase 5). Runs inside the already-
+            // open outer transaction (ValidateAndResolveAsync's own
+            // BeginTransactionAsync) — no new transaction here;
+            // pg_advisory_xact_lock is transaction-scoped and releases on
+            // that transaction's commit/rollback. Acquiring the lock alone
+            // says nothing about data already read before it was acquired
+            // — existingCustomer above was loaded before the lock, so the
+            // authoritative eligibility check is this fresh, AsNoTracking,
+            // lock-protected recheck immediately before the ExternalIdentity
+            // write it protects. The brand-new-customer branch above needs
+            // no such check — a Customer row that doesn't yet exist cannot
+            // be mid-erasure.
+            var lockKey = AdvisoryLockKeyGenerator.ForCustomerErasure(businessId, existingCustomer.Id);
+            await db.Database.ExecuteSqlInterpolatedAsync(
+                $"SELECT pg_advisory_xact_lock({lockKey})", cancellationToken);
+
+            var current = await db.Customers
+                .IgnoreQueryFilters()
+                .AsNoTracking()
+                .Where(c => c.BusinessId == businessId && c.Id == existingCustomer.Id)
+                .Select(c => new { c.IsAnonymized, c.PendingErasureAt })
+                .SingleOrDefaultAsync(cancellationToken);
+
+            if (current is null || current.IsAnonymized || current.PendingErasureAt is not null)
+            {
+                // Fail-closed — the caller (ValidateAndResolveAsync) rolls
+                // back the whole outer transaction on a null result, so no
+                // Customer/ExternalIdentity/jti row from this call persists.
+                return null;
+            }
         }
 
         var newIdentity = new ExternalIdentity
