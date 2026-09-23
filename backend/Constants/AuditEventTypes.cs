@@ -53,6 +53,19 @@ public static class AuditEventTypes
     /// </summary>
     public const string CustomerErased = "CustomerErased";
 
+    /// <summary>
+    /// Identity-binding/erasure-integrity design
+    /// (docs/handoffs/identity-binding-erasure-integrity-design.md §3.8/§11,
+    /// OQ-3; implementation plan Phase 8) — written by
+    /// CustomerErasureService.ClearPendingErasureAsync whenever an
+    /// OwnerOnly-authorized recovery-clear actually mutates
+    /// Customer.PendingErasureAt from non-null to null (never on the
+    /// already-null no-op path). ActorType.NivoraBusinessStaff,
+    /// ChangedByUserId = the acting Owner, in the same transaction as the
+    /// marker clear.
+    /// </summary>
+    public const string CustomerErasureRecoveryCleared = "CustomerErasureRecoveryCleared";
+
     // Commerce write actions
     public const string RefundIssued = "RefundIssued";
     public const string OrderCancelled = "OrderCancelled";

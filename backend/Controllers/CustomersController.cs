@@ -516,4 +516,32 @@ public class CustomersController(
 
         return NoContent();
     }
+
+    /// <summary>
+    /// Identity-binding/erasure-integrity design §3.8/§11 (OQ-3); implementation
+    /// plan Phase 8. Manual recovery for a Customer.PendingErasureAt marker left
+    /// by an abandoned/incomplete erasure — OwnerOnly is a deliberate
+    /// escalation above Erase's own OwnerOrAdmin, since clearing this marker
+    /// can reopen the erasure-escape race it exists to prevent. Same two-layer
+    /// load/SameTenant pattern as Erase/LinkIdentity/RevokeIdentity above; all
+    /// lock acquisition, the conditional clear, and its accepted lock-coverage
+    /// limitation (this endpoint blocks against CustomerErasureService's own
+    /// Phase 0 only, never against Phase 1/2/3 of an erasure already running —
+    /// see CustomerErasureService.ClearPendingErasureAsync's own doc comment)
+    /// live entirely in the service method this thin adapter delegates to.
+    /// </summary>
+    [HttpPost("{customerId:guid}/pending-erasure/clear")]
+    [Authorize(Policy = NivoraPolicies.OwnerOnly)]
+    public async Task<IActionResult> ClearPendingErasure(Guid customerId, CancellationToken cancellationToken)
+    {
+        var customer = await db.Customers.FirstOrDefaultAsync(c => c.Id == customerId, cancellationToken);
+        if (customer is null) return NotFound();
+
+        var authResult = await authorizationService.AuthorizeAsync(User, customer, NivoraPolicies.SameTenant);
+        if (!authResult.Succeeded) return NotFound();
+
+        await erasureService.ClearPendingErasureAsync(customer.BusinessId, customerId, CurrentUserId, cancellationToken);
+
+        return NoContent();
+    }
 }

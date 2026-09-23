@@ -1334,6 +1334,408 @@ public class CustomersApiTests : IAsyncLifetime
         Assert.Equal(auditCountAfterFirst, auditCountAfterSecond);
     }
 
+    // ── Identity-binding/erasure-integrity Phase 8 — OwnerOnly recovery-clear ──
+    //
+    // docs/handoffs/identity-binding-erasure-integrity-design.md §3.8/§11 (OQ-3);
+    // implementation plan Phase 8. Unlike Phase 4/5/6/7, this endpoint has no
+    // evidentiary check to race against an in-flight erasure with (§3.8: the
+    // codebase has no mechanical way to establish "genuinely abandoned") — the
+    // adversarial-concurrency case here is proving the advisory lock itself is
+    // real (T7) and that two concurrent Owner clears serialize to exactly one
+    // mutation (T8), not proving a rejection.
+
+    private static async Task<DateTimeOffset> SeedPendingErasureAtAsync(AppDbContext db, Guid customerId)
+    {
+        await db.Customers.IgnoreQueryFilters()
+            .Where(c => c.Id == customerId)
+            .ExecuteUpdateAsync(s => s.SetProperty(c => c.PendingErasureAt, DateTimeOffset.UtcNow));
+
+        var persisted = await db.Customers.IgnoreQueryFilters().AsNoTracking()
+            .Where(c => c.Id == customerId)
+            .Select(c => c.PendingErasureAt)
+            .SingleAsync();
+        return persisted!.Value;
+    }
+
+    /// <summary>T1 — real Phase 0 checkpoint (throws, simulating a crash/abandonment
+    /// immediately after Phase 0 commits, per design §3.7 point 4's own accepted
+    /// scenario), then the actual HTTP recovery-clear endpoint. Same
+    /// throws-at-a-named-checkpoint idiom as CustomerDataLifecycleTests.cs's own
+    /// ThrowAtCustomerErasureCheckpoint (duplicated here per this project's
+    /// established per-file convention for small concurrency-test doubles).</summary>
+    [Fact]
+    public async Task ClearPendingErasure_AbandonedAfterPhaseZero_ClearsMarkerAndAudits()
+    {
+        var (businessId, ownerId, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Clear Pending Erasure Abandoned Business");
+        using var _ = ownerClient;
+
+        Guid customerId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerId = await SeedCustomerAsync(db, businessId);
+        }
+
+        await using (var erasureScope = _factory.Services.CreateAsyncScope())
+        {
+            var erasureDb = erasureScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var purgeService = erasureScope.ServiceProvider.GetRequiredService<IConversationPurgeService>();
+            var auditLogService = erasureScope.ServiceProvider.GetRequiredService<IAuditLogService>();
+            var failingService = new CustomerErasureService(
+                erasureDb, purgeService, auditLogService, new ThrowAtCustomerErasureCheckpoint("after-phase-0-committed"));
+
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => failingService.EraseCustomerAsync(customerId, ownerId));
+        }
+
+        DateTimeOffset expectedOldValue;
+        await using (var midScope = _factory.Services.CreateAsyncScope())
+        {
+            var midDb = midScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var mid = await midDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerId);
+            Assert.NotNull(mid.PendingErasureAt);
+            Assert.False(mid.IsAnonymized);
+            expectedOldValue = mid.PendingErasureAt!.Value;
+        }
+
+        var response = await ownerClient.SendAsync(
+            Authed(HttpMethod.Post, $"/api/customers/{customerId}/pending-erasure/clear", ownerCookie));
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        await using var afterScope = _factory.Services.CreateAsyncScope();
+        var afterDb = afterScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var after = await afterDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerId);
+        Assert.Null(after.PendingErasureAt);
+
+        var audit = await afterDb.AuditLogs.IgnoreQueryFilters()
+            .SingleAsync(a => a.EntityId == customerId.ToString() && a.EventType == AuditEventTypes.CustomerErasureRecoveryCleared);
+        Assert.Equal(businessId, audit.BusinessId);
+        Assert.Equal(AuditEntityTypes.Customer, audit.EntityType);
+        Assert.Equal(ownerId, audit.ChangedByUserId);
+        Assert.Equal(ActorType.NivoraBusinessStaff, audit.Actor);
+        Assert.Equal(expectedOldValue.ToString("O"), audit.OldValue);
+        Assert.Null(audit.NewValue);
+    }
+
+    [Fact]
+    public async Task ClearPendingErasure_AlreadyNull_NoOp_NoAuditRow()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Clear Pending Erasure NoOp Business");
+        using var _ = ownerClient;
+
+        Guid customerId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerId = await SeedCustomerAsync(db, businessId);
+        }
+
+        var response = await ownerClient.SendAsync(
+            Authed(HttpMethod.Post, $"/api/customers/{customerId}/pending-erasure/clear", ownerCookie));
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var customer = await verifyDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerId);
+        Assert.Null(customer.PendingErasureAt);
+
+        var auditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.BusinessId == businessId && a.EventType == AuditEventTypes.CustomerErasureRecoveryCleared);
+        Assert.Equal(0, auditCount);
+    }
+
+    /// <summary>T3 — a Customer whose erasure already completed (IsAnonymized == true)
+    /// already has PendingErasureAt == null per C-3 (Phase 3 clears it on successful
+    /// completion) — this collapses into the same no-op path as T2. No special
+    /// IsAnonymized handling exists in the endpoint, matching the locked design's
+    /// unconditional-clear-under-lock scope (§ Phase 8, "no evidentiary check").</summary>
+    [Fact]
+    public async Task ClearPendingErasure_CompletedErasure_NoOp_NoAuditRow()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Clear Pending Erasure Completed Business");
+        using var _ = ownerClient;
+
+        Guid customerId;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerId = await SeedCustomerAsync(db, businessId, isAnonymized: true);
+        }
+
+        var response = await ownerClient.SendAsync(
+            Authed(HttpMethod.Post, $"/api/customers/{customerId}/pending-erasure/clear", ownerCookie));
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var customer = await verifyDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerId);
+        Assert.True(customer.IsAnonymized);
+        Assert.Null(customer.PendingErasureAt);
+
+        var auditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.BusinessId == businessId && a.EventType == AuditEventTypes.CustomerErasureRecoveryCleared);
+        Assert.Equal(0, auditCount);
+    }
+
+    [Fact]
+    public async Task ClearPendingErasure_Owner_Succeeds()
+    {
+        var (businessId, ownerId, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Clear Pending Erasure Owner Business");
+        using var _ = ownerClient;
+
+        Guid customerId;
+        DateTimeOffset seeded;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerId = await SeedCustomerAsync(db, businessId);
+            seeded = await SeedPendingErasureAtAsync(db, customerId);
+        }
+
+        var response = await ownerClient.SendAsync(
+            Authed(HttpMethod.Post, $"/api/customers/{customerId}/pending-erasure/clear", ownerCookie));
+        Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var customer = await verifyDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerId);
+        Assert.Null(customer.PendingErasureAt);
+
+        var audit = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .SingleAsync(a => a.EntityId == customerId.ToString() && a.EventType == AuditEventTypes.CustomerErasureRecoveryCleared);
+        Assert.Equal(ownerId, audit.ChangedByUserId);
+        Assert.Equal(seeded.ToString("O"), audit.OldValue);
+    }
+
+    [Fact]
+    public async Task ClearPendingErasure_AdminForbidden_MarkerUnchanged()
+    {
+        var (businessId, _, ownerClient, _) = await SetUpBusinessWithOwnerAsync("Clear Pending Erasure Admin Forbidden Business");
+        using var _ = ownerClient;
+
+        Guid customerId;
+        DateTimeOffset seeded;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerId = await SeedCustomerAsync(db, businessId);
+            seeded = await SeedPendingErasureAtAsync(db, customerId);
+        }
+
+        var adminEmail = $"admin-{Guid.NewGuid():N}@example.com";
+        await SeedStaffIntoBusinessAsync(businessId, adminEmail, RoleNames.Admin);
+        using var adminClient = NewClient();
+        var (_, _, adminCookie) = await LoginAsync(adminClient, adminEmail);
+
+        var response = await adminClient.SendAsync(
+            Authed(HttpMethod.Post, $"/api/customers/{customerId}/pending-erasure/clear", adminCookie!));
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode); // OwnerOnly — Admin excluded, unlike Erase's own OwnerOrAdmin
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var customer = await verifyDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerId);
+        Assert.Equal(seeded, customer.PendingErasureAt);
+    }
+
+    [Fact]
+    public async Task ClearPendingErasure_AgentForbidden_MarkerUnchanged()
+    {
+        var (businessId, _, ownerClient, _) = await SetUpBusinessWithOwnerAsync("Clear Pending Erasure Agent Forbidden Business");
+        using var _ = ownerClient;
+
+        Guid customerId;
+        DateTimeOffset seeded;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerId = await SeedCustomerAsync(db, businessId);
+            seeded = await SeedPendingErasureAtAsync(db, customerId);
+        }
+
+        var agentEmail = $"agent-{Guid.NewGuid():N}@example.com";
+        await SeedStaffIntoBusinessAsync(businessId, agentEmail, RoleNames.Agent);
+        using var agentClient = NewClient();
+        var (_, _, agentCookie) = await LoginAsync(agentClient, agentEmail);
+
+        var response = await agentClient.SendAsync(
+            Authed(HttpMethod.Post, $"/api/customers/{customerId}/pending-erasure/clear", agentCookie!));
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var customer = await verifyDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerId);
+        Assert.Equal(seeded, customer.PendingErasureAt);
+    }
+
+    [Fact]
+    public async Task ClearPendingErasure_CrossTenantCustomer_ReturnsNotFound_MarkerUnchanged_NoAuditRow()
+    {
+        var (businessIdA, _, ownerClientA, _) = await SetUpBusinessWithOwnerAsync("Clear Pending Erasure Tenant A");
+        using var _a = ownerClientA;
+        Guid customerIdA;
+        DateTimeOffset seeded;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerIdA = await SeedCustomerAsync(db, businessIdA);
+            seeded = await SeedPendingErasureAtAsync(db, customerIdA);
+        }
+
+        var (_, _, ownerClientB, ownerCookieB) = await SetUpBusinessWithOwnerAsync("Clear Pending Erasure Tenant B");
+        using var _b = ownerClientB;
+
+        var response = await ownerClientB.SendAsync(
+            Authed(HttpMethod.Post, $"/api/customers/{customerIdA}/pending-erasure/clear", ownerCookieB));
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode); // never 403 — cross-tenant existence not leaked
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var customerA = await verifyDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerIdA);
+        Assert.Equal(seeded, customerA.PendingErasureAt);
+
+        var auditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.EventType == AuditEventTypes.CustomerErasureRecoveryCleared);
+        Assert.Equal(0, auditCount);
+    }
+
+    [Fact]
+    public async Task ClearPendingErasure_UnknownCustomerId_ReturnsNotFound_NoAuditRow()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Clear Pending Erasure Unknown Customer Business");
+        using var _ = ownerClient;
+
+        var response = await ownerClient.SendAsync(
+            Authed(HttpMethod.Post, $"/api/customers/{Guid.NewGuid()}/pending-erasure/clear", ownerCookie));
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var auditCount = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .CountAsync(a => a.BusinessId == businessId && a.EventType == AuditEventTypes.CustomerErasureRecoveryCleared);
+        Assert.Equal(0, auditCount);
+    }
+
+    /// <summary>T7 — proves the recovery-clear transaction actually waits for
+    /// ForCustomerErasure, not merely documents that it should. Same
+    /// AcquireBarrierAsync/WaitForAdvisoryLockWaitersAsync idiom as
+    /// LinkIdentity_BlockedOnLock_ObservesPendingErasureCommittedWhileWaiting
+    /// above (Phase 4's own lock-freshness proof) — deterministic via
+    /// pg_locks, never a sleep/timing assumption.</summary>
+    [Fact]
+    public async Task ClearPendingErasure_BlockedOnLock_CompletesOnlyAfterLockReleased()
+    {
+        var (businessId, ownerId, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Clear Pending Erasure Lock Business");
+        using var _ = ownerClient;
+
+        Guid customerId;
+        DateTimeOffset seeded;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerId = await SeedCustomerAsync(db, businessId);
+            seeded = await SeedPendingErasureAtAsync(db, customerId);
+        }
+
+        var lockKey = AdvisoryLockKeyGenerator.ForCustomerErasure(businessId, customerId);
+        var (barrierConnection, barrierTransaction) = await AcquireBarrierAsync(lockKey);
+        try
+        {
+            var clearTask = ownerClient.SendAsync(
+                Authed(HttpMethod.Post, $"/api/customers/{customerId}/pending-erasure/clear", ownerCookie));
+
+            await WaitForAdvisoryLockWaitersAsync(barrierConnection, lockKey, expected: 1, raceName: "ClearPendingErasure vs simulated in-flight erasure");
+            Assert.False(clearTask.IsCompleted);
+
+            await barrierTransaction.CommitAsync();
+
+            var response = await clearTask;
+            Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+        }
+        finally
+        {
+            await barrierConnection.DisposeAsync();
+        }
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var customer = await verifyDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerId);
+        Assert.Null(customer.PendingErasureAt);
+
+        var audit = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .SingleAsync(a => a.EntityId == customerId.ToString() && a.EventType == AuditEventTypes.CustomerErasureRecoveryCleared);
+        Assert.Equal(ownerId, audit.ChangedByUserId);
+        Assert.Equal(seeded.ToString("O"), audit.OldValue);
+    }
+
+    /// <summary>T8 — two genuine concurrent Owner requests, real HTTP + real DB
+    /// concurrency (Task.WhenAll, not sequential awaits). The conditional
+    /// ExecuteUpdateAsync's WHERE PendingErasureAt IS NOT NULL, evaluated under
+    /// the shared advisory lock, guarantees exactly one of the two transactions
+    /// observes a matching row — the other, running strictly after the winner's
+    /// commit releases the lock, observes an already-null marker and takes the
+    /// no-op path.</summary>
+    [Fact]
+    public async Task ClearPendingErasure_ConcurrentDoubleClear_ExactlyOneMutationAndAuditRow()
+    {
+        var (businessId, ownerId, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Clear Pending Erasure Concurrent Business");
+        using var _ = ownerClient;
+
+        Guid customerId;
+        DateTimeOffset seeded;
+        await using (var scope = _factory.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            customerId = await SeedCustomerAsync(db, businessId);
+            seeded = await SeedPendingErasureAtAsync(db, customerId);
+        }
+
+        using var secondClient = NewClient();
+
+        var task1 = ownerClient.SendAsync(Authed(HttpMethod.Post, $"/api/customers/{customerId}/pending-erasure/clear", ownerCookie));
+        var task2 = secondClient.SendAsync(Authed(HttpMethod.Post, $"/api/customers/{customerId}/pending-erasure/clear", ownerCookie));
+        var responses = await Task.WhenAll(task1, task2);
+
+        Assert.All(responses, r => Assert.Equal(HttpStatusCode.NoContent, r.StatusCode));
+
+        await using var verifyScope = _factory.Services.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var customer = await verifyDb.Customers.IgnoreQueryFilters().AsNoTracking().SingleAsync(c => c.Id == customerId);
+        Assert.Null(customer.PendingErasureAt);
+
+        var audits = await verifyDb.AuditLogs.IgnoreQueryFilters()
+            .Where(a => a.EntityId == customerId.ToString() && a.EventType == AuditEventTypes.CustomerErasureRecoveryCleared)
+            .ToListAsync();
+        var singleAudit = Assert.Single(audits);
+        Assert.Equal(ownerId, singleAudit.ChangedByUserId);
+        Assert.Equal(seeded.ToString("O"), singleAudit.OldValue);
+    }
+
+    [Fact]
+    public async Task ClearPendingErasure_Unauthenticated_ReturnsUnauthorized()
+    {
+        using var client = NewClient();
+        var response = await client.PostAsync($"/api/customers/{Guid.NewGuid()}/pending-erasure/clear", null);
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    /// <summary>Same throws-at-a-named-checkpoint idiom as
+    /// CustomerDataLifecycleTests.cs's own ThrowAtCustomerErasureCheckpoint —
+    /// duplicated here per this project's established per-file convention for
+    /// small concurrency-test doubles (see the doc comment on
+    /// GatedCustomerErasureCheckpoint below for the same note).</summary>
+    private class ThrowAtCustomerErasureCheckpoint(string checkpoint) : ICustomerErasureCheckpoint
+    {
+        public Task ReachedAsync(string checkpointName, CancellationToken cancellationToken)
+        {
+            if (checkpointName == checkpoint)
+            {
+                throw new InvalidOperationException($"Injected test failure at '{checkpointName}'.");
+            }
+
+            return Task.CompletedTask;
+        }
+    }
+
     // ── Identity-binding/erasure-integrity Phase 4 test helpers ──────────
 
     /// <summary>

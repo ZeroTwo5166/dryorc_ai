@@ -9,6 +9,14 @@ namespace backend.Services;
 public interface ICustomerErasureService
 {
     Task EraseCustomerAsync(Guid customerId, Guid changedByUserId, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Identity-binding/erasure-integrity design §3.8/§11 (OQ-3);
+    /// implementation plan Phase 8. See the implementation's own doc
+    /// comment for the full accepted lock-coverage limitation this
+    /// operation does not and cannot close.
+    /// </summary>
+    Task ClearPendingErasureAsync(Guid businessId, Guid customerId, Guid actingUserId, CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -306,4 +314,99 @@ public class CustomerErasureService(
     /// SerializeRetentionAuditValue convention.</summary>
     private static string SerializeErasureAuditValue(int conversationsPurged) =>
         JsonSerializer.Serialize(new { ConversationsPurged = conversationsPurged });
+
+    /// <summary>
+    /// Identity-binding/erasure-integrity design
+    /// (docs/handoffs/identity-binding-erasure-integrity-design.md §3.7-§3.8,
+    /// §11 OQ-3; implementation plan Phase 8) — the sole recovery path for a
+    /// Customer.PendingErasureAt marker left behind by an
+    /// EraseCustomerAsync run that crashed, timed out, or was otherwise
+    /// abandoned after Phase 0 committed but before Phase 3 completed. Callers
+    /// (CustomersController) must already have authorized this as OwnerOnly
+    /// and confirmed tenant ownership before calling — this method performs
+    /// no authorization of its own.
+    ///
+    /// Locked scope, per the design's explicit resolution of OQ-3: this
+    /// operation is authorization (OwnerOnly, enforced by the caller) +
+    /// advisory-lock acquisition + an unconditional clear once the lock is
+    /// held. It deliberately performs NO evidentiary check — no
+    /// IsAnonymized inspection, no identity/conversation/audit-row
+    /// inspection, no elapsed-time/staleness threshold — because the design
+    /// states plainly that this codebase has no mechanical way to establish
+    /// "genuinely abandoned" (unlike, e.g., ScheduledReportRun's tracking for
+    /// scheduled reports). That evidentiary judgment is an operator-procedure
+    /// obligation the design defers as explicit future work, not something
+    /// this method computes.
+    ///
+    /// ACCEPTED LOCK-COVERAGE LIMITATION (read before assuming this method is
+    /// safe against any in-flight erasure): ForCustomerErasure is acquired by
+    /// EraseCustomerAsync only inside Phase 0's own short transaction (see
+    /// that method's own Phase 0 block above) — it is never held across
+    /// Phase 1, the per-conversation Phase 2 loop, or Phase 3. Acquiring the
+    /// same lock here therefore only blocks against Phase 0 itself and
+    /// against the other four identity-mutating write sites that share this
+    /// key (LinkIdentity, SignedIdentityTokenService, WidgetConversationService,
+    /// VerifyCodeAsync) — it does NOT detect, wait for, or serialize against
+    /// an erasure that has already progressed into Phase 1, Phase 2, or
+    /// Phase 3. Calling this method while such an erasure is still
+    /// genuinely (not abandoned, merely slow) running can clear
+    /// PendingErasureAt out from under it, reopening exactly the
+    /// erasure-escape race Decision 2/Decision 3 exist to close. This is not
+    /// a defect here — it is the risk the locked design explicitly accepts
+    /// and documents (§3.8) rather than closes, because closing it would
+    /// require either a positive liveness signal this codebase has no
+    /// mechanism for, or automated reconciliation — both explicitly out of
+    /// scope per OQ-2's resolution. Confirming an erasure is genuinely
+    /// abandoned before calling this method is the operator's
+    /// responsibility, not this method's.
+    ///
+    /// Conditional clear, not unconditional overwrite: the WHERE clause
+    /// requires PendingErasureAt IS NOT NULL, so an already-null marker is
+    /// left untouched and produces no audit row — auditing only real
+    /// transitions, matching RevokeIdentity's own no-op-on-already-revoked
+    /// idiom. The affected-row count from this conditional update, not the
+    /// earlier snapshot read, is the source of truth for whether a real
+    /// mutation occurred; the snapshot exists solely to capture the exact
+    /// OldValue for the audit row, and cannot diverge from the update's own
+    /// result because both run inside the same transaction while holding the
+    /// same advisory lock — no third party can mutate this customer's
+    /// PendingErasureAt between the two without first acquiring the same
+    /// lock, which blocks until this transaction commits.
+    /// </summary>
+    public async Task ClearPendingErasureAsync(
+        Guid businessId, Guid customerId, Guid actingUserId, CancellationToken cancellationToken = default)
+    {
+        await using var transaction = await db.Database.BeginTransactionAsync(cancellationToken);
+
+        var lockKey = AdvisoryLockKeyGenerator.ForCustomerErasure(businessId, customerId);
+        await db.Database.ExecuteSqlInterpolatedAsync(
+            $"SELECT pg_advisory_xact_lock({lockKey})", cancellationToken);
+
+        var pendingErasureAt = await db.Customers
+            .IgnoreQueryFilters()
+            .AsNoTracking()
+            .Where(c => c.Id == customerId && c.BusinessId == businessId)
+            .Select(c => c.PendingErasureAt)
+            .SingleOrDefaultAsync(cancellationToken);
+
+        var affected = await db.Customers
+            .IgnoreQueryFilters()
+            .Where(c => c.Id == customerId && c.BusinessId == businessId && c.PendingErasureAt != null)
+            .ExecuteUpdateAsync(s => s.SetProperty(c => c.PendingErasureAt, (DateTimeOffset?)null), cancellationToken);
+
+        if (affected == 1)
+        {
+            await auditLogService.LogAsync(
+                businessId, AuditEntityTypes.Customer, customerId.ToString(),
+                AuditEventTypes.CustomerErasureRecoveryCleared, ActorType.NivoraBusinessStaff,
+                changedByUserId: actingUserId,
+                oldValue: pendingErasureAt!.Value.ToString("O"),
+                newValue: null,
+                cancellationToken: cancellationToken);
+
+            await db.SaveChangesAsync(cancellationToken);
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+    }
 }
