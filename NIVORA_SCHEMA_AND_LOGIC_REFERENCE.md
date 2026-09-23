@@ -178,15 +178,15 @@ Common pattern across all three:
 A scheduled background job, per business:
 1. Find `Conversation` rows where `CreatedAt < now - Business.RetentionDays`.
 2. Anonymize or delete per policy (Section 10.1 of the dev plan — delete or irreversibly anonymize).
-3. Cascade to `Message` (already `Cascade` at the FK level).
-4. Handle derived data: embeddings tied to conversation content (not yet relevant — no conversation embeddings exist), `MessageKnowledgeSource` rows referencing deleted messages (cascade), `ConversationHandoff`/`AuditLog`/`Ticket`/`OrderCancellation`/`Refund` rows referencing the conversation (all `SetNull`, not cascade — they survive).
+3. `Message` rows (plus `Notification` and any non-`Consumed` `Approval` for the conversation) are explicitly, directly deleted by `ConversationPurgeService` — not via a fired FK cascade (a `Cascade` FK is configured toward `Conversation`, but `Conversation` rows are never deleted, so it never actually fires).
+4. Handle derived data: embeddings tied to conversation content (not yet relevant — no conversation embeddings exist), `MessageKnowledgeSource` rows referencing deleted messages (a real `Cascade`, since `Message` rows genuinely are deleted), `ConversationHandoff`/`AuditLog`/`Ticket`/`OrderCancellation`/`Refund` rows referencing the conversation — they survive because `Conversation` itself is never deleted, not because a `SetNull` fired.
 
-### 3.6 Customer anonymization (`CustomerAnonymizationService`) — GDPR deletion request handling
+### 3.6 Customer anonymization (`CustomerAnonymizationService`, shipped as `CustomerErasureService`) — GDPR deletion request handling
 
-1. Null `Customer.Email`, `Name`, `ExternalId`; set `IsAnonymized = true`, `AnonymizedAt = now`.
-2. Explicitly delete all `ExternalIdentities` rows for this customer (does not cascade automatically).
-3. Explicitly delete `FlaggedCustomerActivityLog` rows (cascades via FK, but confirm this fires).
-4. Leave `Conversation`, `Ticket`, `Message`, `OrderCancellation`, `CustomerUpdateAction`, `Refund` untouched — they survive independently via their FK behavior.
+1. Null `Customer.Email`, `Name`, `ExternalId`; set `IsAnonymized = true`, `AnonymizedAt = now`; clear `PendingErasureAt`.
+2. Explicitly delete `ExternalIdentity`, `CustomerExtendedLoggingHistory`, and `VerificationCode` rows, and any non-`Consumed` `Approval`, for this customer — explicit deletes; any `Cascade` FK configured toward `Customer` never fires, since `Customer` rows are never deleted.
+3. Explicitly delete `FlaggedCustomerActivityLog` rows — an explicit delete, not a fired FK cascade (a `Cascade` FK is configured toward `Customer`, but `Customer` rows are never deleted, so it never actually fires).
+4. Each conversation is purged: `Message` (+ `MessageKnowledgeSource`) and `Notification` rows are hard-deleted; `Conversation` itself is kept as an anonymized shell (`VisitorSessionId` nulled, `IsAnonymized`/`AnonymizedAt` set), never deleted. `Ticket`, `OrderCancellation`, `CustomerUpdateAction`, `Refund`, `RefundItem`, `AuditLog`, `ConversationHandoff`, and any `Consumed` `Approval` are left untouched — they survive because `Customer`/`Conversation` rows are never deleted, not via FK behavior.
 5. `AuditLog` needs no action — it's PII-free by design.
 
 ### 3.7 Extended logging toggle (`Customer.ExtendedLoggingEnabled`)
