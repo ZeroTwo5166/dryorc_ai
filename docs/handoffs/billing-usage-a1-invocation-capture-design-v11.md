@@ -100,7 +100,7 @@ The completed-batch running total must remain available to the wrapper's recordi
 
 ## 3. Record shape: `AiProviderInvocation`
 
-The table is `ITenantOwned`. Table name: `AiProviderInvocation` (entity), `ai_provider_invocations` (table, per this codebase's naming convention).
+The table is `ITenantOwned`. Table name: `AiProviderInvocation` (entity), `AiProviderInvocations` (table — corrected post-Slice 1: this codebase's actual convention is PascalCase table names matching the entity name pluralized, e.g. `Businesses`, `AuditLogs`, `Tickets`; no `UseSnakeCaseNamingConvention()` is registered anywhere, so the original `ai_provider_invocations` snake_case claim did not match the real convention).
 
 **Immutability:** the application never updates or deletes an individual event after insert. Only the retention policy (§7, Decision 4) may delete expired events.
 
@@ -109,7 +109,7 @@ The table is `ITenantOwned`. Table name: `AiProviderInvocation` (entity), `ai_pr
 | `Id` | Guid | |
 | `BusinessId` | Guid | FK Restrict |
 | `Provider` | string(32) | Constants `AiProviders.Anthropic`, `AiProviders.Voyage` |
-| `Model` | string(64) | Model identifier sent — `AnthropicModels.Default` or `VoyageModels.Embedding` (Decision 5 — locked: compile-time constants, §6) |
+| `Model` | string(64) | Model identifier sent — `AnthropicModels.Default` or `VoyageModels.Voyage3` (corrected post-Slice 1: `VoyageModels.Embedding` never existed in source; the real, already-shipped constant is `VoyageModels.Voyage3`) (Decision 5 — locked: compile-time constants, §6) |
 | `Operation` | string(64) | Business purpose only, never a class, endpoint, or method name. Values are the `AiOperations` constants (Decision 6 — locked): `CustomerReply`, `ConversationClassification`, `AnalystSelection`, `AnalystSynthesis`, `KnowledgeIndexing`, `KnowledgeRetrievalQuery`. `CustomerReply` covers both `ClaudeReplyService`'s no-tool path and `ToolDispatchService`'s tool-loop iterations; `KnowledgeIndexing` covers both the create and update indexing paths. Each pair shares one business purpose and is distinguished by `CorrelationId`/`Sequence`, not by separate `Operation` values. **Independently re-verified against all 8 live Anthropic/Voyage call sites in the codebase — confirmed complete, with every call site mapping to exactly one value and no value left unused.** |
 | `CorrelationId` | Guid | One logical application operation, however many provider invocations it causes |
 | `Sequence` | int | Starts at zero and increases monotonically within a `CorrelationId`. It means ordering only; phase identity belongs in `Operation` |
@@ -131,11 +131,17 @@ The table is `ITenantOwned`. Table name: `AiProviderInvocation` (entity), `ai_pr
 - `ErrorCategory IS NULL` if and only if `Outcome = 'Succeeded'`.
 - `Sequence >= 0`.
 - **v11, locked.** `IsUsagePartial = true` implies `Outcome = 'Failed'`, `Provider = AiProviders.Voyage`, and `InputTokens IS NOT NULL`.
+- **(post-v11 owner decision, Slice 1 review).** `Provider IN (...)`, enumerating `AiProviders`' two values, built from constants.
+- **(post-v11 owner decision, Slice 1 review).** `ErrorCategory IS NULL OR ErrorCategory IN (...)`, enumerating `AiErrorCategories`' six values, built from constants.
+- **(post-v11 owner decision, Slice 1 review).** If `Provider = 'Voyage'`, then `OutputTokens`, `CacheCreationInputTokens`, and `CacheReadInputTokens` must all be `NULL`. This section's own prose already stated "For Voyage: always null" / "Always null for Voyage rows" for these fields (see the field table above), but no earlier version specified it as a CHECK.
+- **Declined (post-v11 owner decision, Slice 1 review).** No CHECK on `Operation` — its six values were judged more likely to grow than `Provider`'s two, so no DB-level enumeration was added. No CHECK pairing `Provider` to `Model` (e.g. requiring Anthropic rows to use `AnthropicModels.Default`) — considered and declined in the same review. Recorded here so their absence isn't mistaken for an oversight.
 
 **Indexes:**
 - `(BusinessId, CreatedAt)`, for period aggregation.
-- `(BusinessId, CorrelationId)`, for tracing an operation.
-- An index supporting the `ConversationId` FK action should be evaluated, because usage rows may outlive their conversation's active state (though, per Decision 3, `ConversationId` is not cleared at erasure — this index consideration is about the general SetNull FK convention in this codebase, evaluated for consistency, not because a deletion trigger is expected to fire on this field in the shipped lifecycle). Its exact shape is ENGINEERING-DETERMINED against the actual schema. (Verification found a split precedent in the current codebase — some SetNull FKs to `Conversation` rely on EF's bare auto-index, others have an explicit `BusinessId`-led composite index.)
+- ~~`(BusinessId, CorrelationId)`, for tracing an operation.~~ **Superseded (post-v11 owner decision, Slice 1 review)** — replaced by the unique index below.
+- **(post-v11 owner decision, Slice 1 review).** `(BusinessId, CorrelationId, Sequence)`, unique. Enforces uniqueness only — no two rows may share the same `(CorrelationId, Sequence)` pair within a business. Does **not** enforce that `Sequence` values are monotonic or contiguous within a `CorrelationId`; that remains the application-level invariant this section's own `Sequence` field definition already states, unchanged.
+- **(post-v11 owner decision, Slice 1 review).** A standalone `CreatedAt` index, for the future retention job's global (not per-business) 90-day delete (§7, Decision 4) — neither index above has `CreatedAt` as a leading column usable without a fixed `BusinessId`.
+- An index supporting the `ConversationId` FK action should be evaluated, because usage rows may outlive their conversation's active state (though, per Decision 3, `ConversationId` is not cleared at erasure — this index consideration is about the general SetNull FK convention in this codebase, evaluated for consistency, not because a deletion trigger is expected to fire on this field in the shipped lifecycle). Its exact shape is ENGINEERING-DETERMINED against the actual schema. (Verification found a split precedent in the current codebase — some SetNull FKs to `Conversation` rely on EF's bare auto-index, others have an explicit `BusinessId`-led composite index.) **(post-v11 owner decision, Slice 1 review):** left to EF Core's default single-column index on the FK column itself.
 
 ---
 
@@ -181,7 +187,7 @@ The table is `ITenantOwned`. Table name: `AiProviderInvocation` (entity), `ai_pr
 
 ## 6. Model identifiers
 
-**Decision 5 (locked): compile-time constants.** `AnthropicModels.Default = "claude-sonnet-5"` and `VoyageModels.Embedding = "voyage-3"` are compile-time constants, extending the already-shipped `VoyageModels.Voyage3` pattern to Anthropic (which currently has none — the literal model string is hardcoded independently at five call sites across four files today). No call site hardcodes a model string.
+**Decision 5 (locked): compile-time constants.** `AnthropicModels.Default = "claude-sonnet-5"` is a compile-time constant, extending the already-shipped `VoyageModels.Voyage3` pattern to Anthropic (which currently has none — the literal model string is hardcoded independently at five call sites across four files today). Voyage rows use the existing `VoyageModels.Voyage3` constant directly (corrected post-Slice 1: this section previously named a non-existent `VoyageModels.Embedding`; the real, already-shipped constant is `VoyageModels.Voyage3`). No call site hardcodes a model string.
 
 `AnthropicModels` and `VoyageModels` are separate constants classes, consistent with `VoyageModels.cs` already existing as its own file in the codebase — this design does not propose merging them into one shared file.
 
@@ -215,7 +221,7 @@ Each test must be shown to fail when its invariant is removed.
 5. **(v11, revised.)** A call that fails, is cancelled, or times out before any usage is obtained (for Voyage, before any batch completes) records `Failed` with null tokens and `IsUsagePartial = false`. A Voyage call that fails, is cancelled, or times out after one or more batches completed records `Failed` with the non-null sum of the completed batches and `IsUsagePartial = true`; the failed batch's own usage is never estimated. Either way, the write succeeds after the caller's token is cancelled.
 6. Error categories never contain raw provider text.
 7. Architecture test: no raw provider usage exists outside the wrappers. (New test infrastructure — see §4.)
-8. The entity's string properties match an explicit allowlist.
+8. The entity's string properties match an explicit allowlist. (Clarified post-Slice 1: this is the entity's *property set* — which string-typed properties exist on `AiProviderInvocation` — not the *values* those properties happen to hold. A reflection-based test over the property names satisfies this; a query checking stored values against a known set does not, and Slice 1's first implementation attempt built the latter by mistake.)
 9. Embedding-model provenance matches the `AnthropicModels`/`VoyageModels` constant sent.
 10. A simulated usage-write failure (e.g. a forced exception in the persistence layer) does not fail the caller's AI operation, and produces the structured diagnostic log described in §5's Decision 1.
 11. A retention job (once built) deletes `AiProviderInvocation` rows older than 90 days and leaves newer rows untouched.
@@ -235,7 +241,7 @@ All six decisions previously open in this design are now locked, following discu
 | 2 | Record failed/cancelled invocations | Yes, `Outcome = Failed` with `ErrorCategory`, null tokens, `IsUsagePartial = false` — **except** a Voyage invocation with one or more completed batches before a later-batch failure, whose tokens are the non-null sum of the completed batches only and `IsUsagePartial = true` (v11 carve-out) | §2, §3 |
 | 3 | `ConversationId` at customer erasure | Not explicitly nulled; retention is the minimization control | §7 |
 | 4 | Retention window | 90 days; revisit when A2/Step 26 state a concrete need | §7 |
-| 5 | Model identifiers | Compile-time constants: `AnthropicModels.Default`, `VoyageModels.Embedding` (separate classes/files) | §6 |
+| 5 | Model identifiers | Compile-time constants: `AnthropicModels.Default`, `VoyageModels.Voyage3` (corrected post-Slice 1; separate classes/files) | §6 |
 | 6 | Table and `Operation` naming | `AiProviderInvocation`; `AiOperations` constants class | §3 |
 
 ---
@@ -274,3 +280,17 @@ All six decisions previously open in this design are now locked, following discu
    `Actor = ActorType.Customer` because the widget request that invoked `GenerateReplyAsync` is the actual request origin, per `ActorType`'s own documented convention and `VerificationCodeService`'s identical use of `ActorType.Customer` for a customer-triggered security-relevant audit event (`VerificationCodeService.cs:57`) — no staff member is involved in this call path, so `OrderCancelApprovedActionExecutor`'s own `NivoraBusinessStaff` choice for its `UnauthorizedActionBlocked` write does not transfer literally, only the underlying "match Actor to the real request origin" convention does.
 
 2. **`IsUsagePartial` (§2, §3).** A new non-null `bool` column on `AiProviderInvocation`, default `false`, `true` only on a Voyage `Failed` row carrying the non-null sum of completed batches — with a `CHECK` constraint enforcing that `IsUsagePartial = true` implies `Outcome = 'Failed'`, `Provider = AiProviders.Voyage`, and `InputTokens IS NOT NULL` (§3). This resolves what this pass's first draft had left as an open legibility question, by adding the schema-level marker that draft explicitly declined to propose.
+
+---
+
+## Errata (post-Slice 1)
+
+Corrections and additions made during Slice 1's implementation and review, applied inline at the sections cited below; this list is an index only — the inline text governs.
+
+1. **Table name.** §3 claimed `ai_provider_invocations` (snake_case) is "per this codebase's naming convention." It wasn't — the actual convention is PascalCase (`Businesses`, `AuditLogs`, `Tickets`, ...), and no `UseSnakeCaseNamingConvention()` is registered anywhere. Corrected to `AiProviderInvocations`. — §3
+2. **`VoyageModels.Voyage3`, not `.Embedding`.** §3 and §6 referenced a `VoyageModels.Embedding` constant that never existed in source. The real, already-shipped constant is `VoyageModels.Voyage3`. Corrected in both places, and in §9's summary table. — §3, §6, §9
+3. **Test 8's meaning.** §8 item 8 ("The entity's string properties match an explicit allowlist") is about the entity's *property set*, not stored *values* — clarified inline after Slice 1's first test implementation made exactly that misreading. — §8
+4. **Three owner-approved CHECK constraints**, not specified by v11: `Provider IN (...)`, `ErrorCategory IS NULL OR ErrorCategory IN (...)`, and a rule requiring Voyage rows to have null `OutputTokens`/cache-token fields — all built from constants, closing a gap this document's own prose implied (via the field table's Notes) but never enforced at the database level. — §3
+5. **Unique `(BusinessId, CorrelationId, Sequence)` index**, replacing the non-unique `(BusinessId, CorrelationId)` index this document originally specified. Enforces uniqueness only, never monotonic or contiguous `Sequence` ordering. — §3
+6. **Standalone `CreatedAt` index**, not one of this document's own two originally-locked indexes — added for the future retention job's global (not per-business) 90-day delete. — §3
+7. **Declined: no `Operation` CHECK, no `Provider`↔`Model` pairing CHECK.** Both considered and declined in the same Slice 1 review, recorded so their absence isn't mistaken for an oversight. — §3

@@ -66,6 +66,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
     public DbSet<ConsumedSignedIdentityToken> ConsumedSignedIdentityTokens => Set<ConsumedSignedIdentityToken>();
     public DbSet<Approval> Approvals => Set<Approval>();
     public DbSet<ScheduledReportRun> ScheduledReportRuns => Set<ScheduledReportRun>();
+    public DbSet<AiProviderInvocation> AiProviderInvocations => Set<AiProviderInvocation>();
 
     // Step 18: the ASP.NET Core Data Protection key ring, persisted here
     // (Postgres) instead of the framework's filesystem default — see
@@ -994,6 +995,145 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
 
             r.HasOne<ApplicationUser>().WithMany()
                 .HasForeignKey(x => x.RecipientOwnerId)
+                .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        // ─────────────────────────────────────────────────────────────
+        // AiProviderInvocation — Step 27 Slice A1. Persistence only; see
+        // docs/handoffs/billing-usage-a1-invocation-capture-design-v11.md §3
+        // for the authoritative field-by-field contract.
+        //
+        // Table name deliberately left at EF Core's default
+        // ("AiProviderInvocations", matching every other table in this
+        // schema) rather than the "ai_provider_invocations" snake_case name
+        // v11 §3 states as "per this codebase's naming convention" — no
+        // UseSnakeCaseNamingConvention() is registered anywhere
+        // (Program.cs's UseNpgsql call), and every other table
+        // (Businesses, AuditLogs, Tickets, ...) is PascalCase. v11's claim
+        // does not match the actual convention; following it literally
+        // would be the one table that breaks it.
+        // ─────────────────────────────────────────────────────────────
+        builder.Entity<AiProviderInvocation>(a =>
+        {
+            a.Property(x => x.Provider).HasMaxLength(32);
+            a.Property(x => x.Model).HasMaxLength(64);
+            a.Property(x => x.Operation).HasMaxLength(64);
+            a.Property(x => x.Outcome).HasMaxLength(16);
+            a.Property(x => x.ErrorCategory).HasMaxLength(32);
+            a.Property(x => x.IsUsagePartial).HasDefaultValue(false);
+
+            a.HasIndex(x => new { x.BusinessId, x.CreatedAt });
+
+            // Owner decision, post-v11 (not in v11 — see the A1 errata list):
+            // replaces v11's own non-unique (BusinessId, CorrelationId)
+            // index with a unique (BusinessId, CorrelationId, Sequence)
+            // index. This enforces uniqueness only — no two rows may share
+            // the same (CorrelationId, Sequence) pair — it does NOT enforce
+            // that Sequence values are monotonic or contiguous within a
+            // CorrelationId; that remains an application-level invariant
+            // only (see AiProviderInvocation.Sequence's own doc comment).
+            a.HasIndex(x => new { x.BusinessId, x.CorrelationId, x.Sequence }).IsUnique();
+
+            // v11 §3 leaves the ConversationId FK-supporting index shape
+            // ENGINEERING-DETERMINED — precedent exists both ways in this
+            // codebase (AuditLog relies on EF's bare FK auto-index;
+            // Notification uses an explicit BusinessId-led composite).
+            // Left to EF Core's default single-column index on the FK
+            // column itself, matching the simpler of the two precedents;
+            // v11 does not lock a composite shape.
+            //
+            // Standalone CreatedAt index — NOT one of v11's own two locked
+            // indexes, added here because neither has CreatedAt as its
+            // leading column: (BusinessId, CreatedAt) requires a fixed
+            // BusinessId to be useful. The future retention job (v11 §7,
+            // Decision 4) is a fixed 90-day GLOBAL window, not per-business
+            // (unlike Business.RetentionDays' existing per-business
+            // pattern), so its delete predicate filters on CreatedAt alone
+            // across every tenant — the one query path against this table
+            // that is not tenant-scoped, which is exactly why this
+            // codebase's usual "a standalone trailing-field index is
+            // redundant once a BusinessId-led composite exists" rule
+            // (see Notification's own index comment above) doesn't cover
+            // this case.
+            a.HasIndex(x => x.CreatedAt);
+
+            a.ToTable(t =>
+            {
+                t.HasCheckConstraint(
+                    "CK_AiProviderInvocations_Tokens_NonNegative",
+                    """
+                    ("InputTokens" IS NULL OR "InputTokens" >= 0)
+                    AND ("OutputTokens" IS NULL OR "OutputTokens" >= 0)
+                    AND ("CacheCreationInputTokens" IS NULL OR "CacheCreationInputTokens" >= 0)
+                    AND ("CacheReadInputTokens" IS NULL OR "CacheReadInputTokens" >= 0)
+                    AND ("InputItemCount" IS NULL OR "InputItemCount" >= 0)
+                    """);
+
+                t.HasCheckConstraint(
+                    "CK_AiProviderInvocations_Outcome",
+                    $"\"Outcome\" IN ('{AiOutcomes.Succeeded}', '{AiOutcomes.Failed}')");
+
+                t.HasCheckConstraint(
+                    "CK_AiProviderInvocations_ErrorCategory_OutcomePairing",
+                    $"""
+                    ("Outcome" = '{AiOutcomes.Succeeded}' AND "ErrorCategory" IS NULL)
+                    OR
+                    ("Outcome" != '{AiOutcomes.Succeeded}' AND "ErrorCategory" IS NOT NULL)
+                    """);
+
+                t.HasCheckConstraint(
+                    "CK_AiProviderInvocations_Sequence_NonNegative",
+                    "\"Sequence\" >= 0");
+
+                // v11 §2/§3, locked (Decision 2's v11 carve-out): IsUsagePartial
+                // = true only on a Voyage Failed row carrying a non-null
+                // completed-batch sum.
+                t.HasCheckConstraint(
+                    "CK_AiProviderInvocations_IsUsagePartial_Implication",
+                    $"""
+                    "IsUsagePartial" = false
+                    OR
+                    ("Outcome" = '{AiOutcomes.Failed}' AND "Provider" = '{AiProviders.Voyage}' AND "InputTokens" IS NOT NULL)
+                    """);
+
+                // Owner decisions, post-v11 (not specified by v11 §3's own
+                // CHECK constraints list — see the A1 errata list). v11's
+                // Notes column implies Provider/ErrorCategory are drawn from
+                // fixed constant sets but never lists a value-set CHECK for
+                // either; this closes that gap. Deliberately no CHECK on
+                // Operation (six values, more likely to grow) and no
+                // Provider↔Model pairing CHECK (per the same owner review).
+                t.HasCheckConstraint(
+                    "CK_AiProviderInvocations_Provider",
+                    $"\"Provider\" IN ('{AiProviders.Anthropic}', '{AiProviders.Voyage}')");
+
+                t.HasCheckConstraint(
+                    "CK_AiProviderInvocations_ErrorCategory_Allowlist",
+                    $"""
+                    "ErrorCategory" IS NULL
+                    OR
+                    "ErrorCategory" IN ('{AiErrorCategories.RateLimited}', '{AiErrorCategories.ServerError}', '{AiErrorCategories.Timeout}', '{AiErrorCategories.Cancelled}', '{AiErrorCategories.InvalidRequest}', '{AiErrorCategories.Unknown}')
+                    """);
+
+                // Owner decision, post-v11 (not in v11 — see the A1 errata
+                // list). v11 §3's prose states "For Voyage: always null" for
+                // OutputTokens and "Always null for Voyage rows" for both
+                // cache fields, but never specifies this as a CHECK.
+                t.HasCheckConstraint(
+                    "CK_AiProviderInvocations_Voyage_OutputAndCacheTokensNull",
+                    $"""
+                    "Provider" != '{AiProviders.Voyage}'
+                    OR
+                    ("OutputTokens" IS NULL AND "CacheCreationInputTokens" IS NULL AND "CacheReadInputTokens" IS NULL)
+                    """);
+            });
+
+            a.HasOne<Business>().WithMany()
+                .HasForeignKey(x => x.BusinessId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            a.HasOne<Conversation>().WithMany()
+                .HasForeignKey(x => x.ConversationId)
                 .OnDelete(DeleteBehavior.SetNull);
         });
 
