@@ -21,15 +21,16 @@ v11 resolves four call-chain-attribution questions raised by independent inspect
 
 | Section | v10 reference | Change |
 |---|---|---|
-| §2 Unit of recording | Outcome/Tokens table, lines 39–44; "Null semantics" paragraph, line 52; Decision 2, line 54 | Adds a Voyage multi-batch partial-failure row to the table; expands "Null semantics" to state the null-vs-zero-vs-partial-sum distinction explicitly; carves an exception into Decision 2's "token fields are null" rule for a Voyage invocation with one or more completed batches before a later failure; adds a new "Voyage multi-batch usage" subsection specifying the sum/never-estimate rule. |
-| §3 Record shape | `InputTokens` row, line 74 | Adds a one-sentence cross-reference to §2's new partial-usage rule. No field, type, or CHECK-constraint change. |
+| Header/Status/Provenance | Title and Status, lines 1–3; Provenance paragraph and item 1's fix description, lines 5–9; closing "short verification pass" sentence, line 11 | Retitles/re-states Status and Provenance for v11; replaces v10's own item-1 fix narrative and naming-clarity note with a 4-item list of what this pass resolves; replaces the closing "short verification pass" sentence with an equivalent v11 verification-pending sentence. |
+| §2 Unit of recording | Outcome/Tokens table, lines 39–44; "Null semantics" paragraph, line 52; Decision 2, line 54 | Adds a Voyage multi-batch partial-failure row to the table; adds an explicit carve-out pointer to the "Provider error" and "Timeout or cancellation after dispatch" rows (residual-sweep fix — these two rows still asserted unconditional "Null" without pointing to the exception below); expands "Null semantics" to state the null-vs-zero-vs-partial-sum distinction explicitly; carves an exception into Decision 2's "token fields are null" rule for a Voyage invocation with one or more completed batches before a later failure; adds a new "Voyage multi-batch usage" subsection specifying the sum/never-estimate rule and the requirement that the completed-batch running total remain available to the wrapper's recording path when the invocation throws (including on cancellation/timeout). |
+| §3 Record shape | `InputTokens` row, line 74; `Outcome` row, line 78 | Adds a one-sentence cross-reference to §2's new partial-usage rule on `InputTokens`. Adds a new normative sentence to the `Outcome` row: `Outcome` is the application-level invocation's own result, independent of the usage fields, which record known provider-reported consumption — so a `Failed` row may carry non-null usage. No field, type, or CHECK-constraint change. |
 | §4 Capture point | "Attribution" bullet, line 100; "Ownership of correlation" bullet, line 103 | Rewrites "Attribution" to state the ordering: `AiCallContext` is constructed only after the §5 trust-boundary check passes, never before and never independently re-verified afterward — required because v10's own wording ("verified at runtime") was ambiguous about whether the recorder re-verifies, which v11's §5 rewrite now explicitly rules out. Adds a worked three-operation illustration to "Ownership of correlation." |
-| §5 Write path | "Tenant boundary" paragraph, line 111; "Current call-site prerequisite" paragraph, line 113 | Replaces the recorder-guard sentences in the "Tenant boundary" paragraph with the locked two-part trust rule (a)/(b). Also rewrites the immediately-following "Current call-site prerequisite" paragraph, which is not itself named in this pass's instructions but described a per-site loaded-entity requirement that the new trust rule's inheritance model directly supersedes — left unchanged, it would contradict the new rule. Adds a new "Retrieval signature" bullet (new content, no v10 line) locking the `IKnowledgeRetrievalService.RetrieveAsync` parameter addition. |
-| §8 Tests | New item, after line 161 | Adds item 13: a `ClaudeReplyService`-level test of the §5(b) trust boundary, marked pending an owner decision (see Open questions). |
-| §9 Owner decisions | Decision 2 row, line 172 | Amends the "Locked outcome" cell to reference the v11 Voyage partial-batch carve-out, and adds a scope note that the four v11 call-chain decisions are documented directly in §2/§4/§5, not added as new rows to this six-item table. |
+| §5 Write path | "Tenant boundary" paragraph, line 111; "Current call-site prerequisite" paragraph, line 113 | Replaces the recorder-guard sentences in the "Tenant boundary" paragraph with the locked two-part trust rule (a)/(b). Replaces the "Current call-site prerequisite" paragraph's own contradicting sentence — "the implementation must establish... an already-loaded, tenant-checked entity... at those sites," which directly conflicts with rule (b)'s inheritance model — with a two-sentence "Current call-site status" naming `ClaudeReplyService.GenerateReplyAsync` as the sole check-performing layer and the three inheriting components; no per-site walkthrough. Adds a new "Retrieval signature" bullet (new content, no v10 line) locking the `IKnowledgeRetrievalService.RetrieveAsync` parameter addition. |
+| §8 Tests | Test 5, line 154; new item after line 161 | Replaces Test 5's blanket "null tokens" assertion with three cases: null before any usage is obtained; a Voyage partial-batch `Failed` row with the non-null completed-batch sum; the failed batch's own usage never estimated (residual-sweep fix — Test 5 as originally written in both v10 and the first v11 draft contradicted the Voyage carve-out). Adds item 13: a `ClaudeReplyService`-level test of the §5(b) trust boundary, marked pending an owner decision (see Open questions). |
+| §9 Owner decisions | Decision 2 row, line 172 | Amends the "Locked outcome" cell to reference the v11 Voyage partial-batch carve-out. (The scope-note sentence added in the first v11 draft, clarifying that the four v11 call-chain decisions aren't added as new table rows, has been removed on review — restoring v10's text at that point exactly; removing it does not leave the table ambiguous, since its own intro sentence still correctly says "six" and the table still lists exactly six.) |
 | (new) Open questions for owner | — | New final section. Contains the mismatch-handling mechanism question (§5(b)) and the partial-usage-row legibility question (§2), per this pass's own findings — neither is resolved here. |
 
-§1, §6, §7, and §10 are unchanged from v10 and are reproduced below only for document completeness.
+§1, §6, §7, and §10 are unchanged from v10 and are reproduced below only for document completeness. (An earlier v11 draft added a one-sentence cross-reference to §10's `MaxTextsPerRequest` bullet; removed on review, restoring v10's text there exactly — the bullet stands on its own and §2's own Voyage subsection already makes the connection.)
 
 ---
 
@@ -58,8 +59,8 @@ Nivora writes one record per provider invocation attempt that reaches the provid
 | Outcome | Record | Tokens |
 |---|---|---|
 | Success | Yes | Provider-reported, where exposed |
-| Provider error | Yes (Decision 2 — locked: record) | Null |
-| Timeout or cancellation after dispatch | Yes (Decision 2 — locked: record) | Null (unknown; tokens may still be billed) |
+| Provider error | Yes (Decision 2 — locked: record) | Null (except the Voyage partial-batch case below) |
+| Timeout or cancellation after dispatch | Yes (Decision 2 — locked: record) | Null (unknown; tokens may still be billed — except the Voyage partial-batch case below) |
 | Voyage: one or more batches succeeded, a later batch failed (v11) | Yes (Decision 2 — locked: record, with the v11 carve-out below) | Non-null — the sum of only the batches that completed before the failure. Never an estimate of the failed batch. |
 | Never reached the provider | No | Not applicable |
 
@@ -83,6 +84,7 @@ Every consumer, including A2, must handle all three states — null, zero, and a
 - When every batch in one `EmbedAsync` call succeeds, the row is `Succeeded` and its token fields are the sum across all batches.
 - When a later batch fails after one or more earlier batches already succeeded, the row is `Failed`, and its token fields carry the non-null sum of only the batches that completed before the failure — never an estimate of the failed batch's own usage, and never a value representing the full request that was attempted, since the full request was never completed.
 - A `Failed` row's non-null partial sum therefore describes only the completed portion of an attempted call, not the attempted call as a whole. This is a real, structural difference from every other `Failed` row governed by the unamended Decision 2 rule above (every Anthropic call, and a Voyage call whose very first batch fails), whose token fields remain null.
+- The completed-batch running total must remain available to the wrapper's recording path at the exact moment the invocation throws — including on cancellation and on timeout, not only on a batch's own explicit failure — since that is precisely when a partial-batch `Failed` row is written.
 - **Distinguishing a partial-usage `Failed` row from an ordinary null-tokens `Failed` row** is possible today only by checking whether the row's token fields are non-null (and, incidentally, that `Provider = AiProviders.Voyage`) — no explicit marker exists for this. See "Open questions for owner" below.
 
 ---
@@ -107,7 +109,7 @@ The table is `ITenantOwned`. Table name: `AiProviderInvocation` (entity), `ai_pr
 | `OutputTokens` | long? | Provider-reported output usage. For Anthropic: `Usage.OutputTokens` directly. For Voyage: always null — embeddings have no output-token concept, and Voyage's response reports none |
 | `CacheCreationInputTokens`, `CacheReadInputTokens` | long? | Anthropic only. Kept because the SDK in use exposes both (`Anthropic.Models.Messages.Usage.CacheCreationInputTokens` / `CacheReadInputTokens`, both `long?`). Always null for Voyage rows |
 | `InputItemCount` | int? | Number of texts in an embedding request |
-| `Outcome` | string(16) | `Succeeded` or `Failed` |
+| `Outcome` | string(16) | `Succeeded` or `Failed`. **v11:** `Outcome` is the result of the application-level invocation; the usage fields independently record provider-reported consumption actually known for that invocation. A `Failed` row may therefore carry non-null usage (§2). |
 | `ErrorCategory` | string(32)? | One of `RateLimited`, `ServerError`, `Timeout`, `Cancelled`, `InvalidRequest`, `Unknown`. Never raw error text |
 | `CreatedAt` | DateTimeOffset | Server-generated, UTC, at the time the attempt completes or fails |
 
@@ -146,7 +148,7 @@ The table is `ITenantOwned`. Table name: `AiProviderInvocation` (entity), `ai_pr
 
   The recorder performs no ownership comparison and no database read of its own. `AiCallContext` does not gain a `Conversation` field; it remains exactly the shape §4 defines (`BusinessId`, `Operation`, `CorrelationId`, `Sequence`, optional `ConversationId`).
 
-  **Current call-site status (v11, replaces the v10 "Current call-site prerequisite" paragraph):** in the verified production call graph, `ClaudeReplyService.GenerateReplyAsync` is the only place a `Conversation` is loaded for a customer-turn operation, and it is therefore the only layer that performs the check in (b) above — once, for the whole turn. `ToolDispatchService`'s tool loop, `ConversationClassificationService.ClassifyAsync`, and `KnowledgeRetrievalService.RetrieveAsync` each receive `BusinessId`/`ConversationId` that already passed through that single upstream check; none of them loads its own `Conversation` entity or re-verifies the pairing, and under (b)'s inheritance rule none needs to. `KnowledgeIndexingService.UpdateAsync`'s caller (`KnowledgeDocumentsController`) independently loads and authorization-checks the `KnowledgeDocument` it passes in — a different entity, not a `Conversation` — so (b) does not apply to it at all; only (a) governs its `BusinessId`, and it is satisfied. `KnowledgeIndexingService.CreateAsync` and both Analyst calls have no `ConversationId` in scope at all, so only (a) applies to them, satisfied by `ICurrentTenantAccessor`/JWT-derived `BusinessId` in each case. The exact call-chain plumbing needed to carry the inherited invariant (e.g. which parameters `ToolDispatchContext`/`ClassifyAsync`/`RetrieveAsync` already carry vs. would need) is implementation scope and is not prescribed by this design.
+  **Current call-site status (v11, replaces the v10 "Current call-site prerequisite" paragraph):** in the verified production call graph, `ClaudeReplyService.GenerateReplyAsync` is the only customer-turn layer that loads the `Conversation` and performs the check in (b) above. `ToolDispatchService`'s tool loop, `ConversationClassificationService.ClassifyAsync`, and `KnowledgeRetrievalService.RetrieveAsync` each inherit that check without re-verifying it, per (b)'s inheritance rule.
 
   **Retrieval signature (v11, locked):** `IKnowledgeRetrievalService.RetrieveAsync` gains a new `conversationId` parameter, sourced from `ClaudeReplyService.cs:139`'s own already-checked `conversationId`. This document specifies the signature change only; implementation (including the call-site update at `ClaudeReplyService.cs:139`) is out of scope here.
 
@@ -189,7 +191,7 @@ Each test must be shown to fail when its invariant is removed.
 2. A no-tool reply produces 1 record, an Analyst query 2, and a retrieval query 1 Voyage record.
 3. Tenant isolation holds on reads.
 4. Background-job invocations are attributed to the iterated tenant. (No background service makes any Anthropic or Voyage call today — verified across all three hosted background services. This test currently has nothing in production to exercise and should be scoped as forward-looking, not as validating existing behavior.)
-5. A cancelled or timed-out call records `Failed` with null tokens, and the write succeeds after the caller's token is cancelled.
+5. **(v11, revised.)** A call that fails, is cancelled, or times out before any usage is obtained (for Voyage, before any batch completes) records `Failed` with null tokens. A Voyage call that fails, is cancelled, or times out after one or more batches completed records `Failed` with the non-null sum of the completed batches; the failed batch's own usage is never estimated. Either way, the write succeeds after the caller's token is cancelled.
 6. Error categories never contain raw provider text.
 7. Architecture test: no raw provider usage exists outside the wrappers. (New test infrastructure — see §4.)
 8. The entity's string properties match an explicit allowlist.
@@ -204,8 +206,6 @@ Each test must be shown to fail when its invariant is removed.
 ## 9. Owner decisions — all locked
 
 All six decisions previously open in this design are now locked, following discussion among Claude, GPT, and Gemini in advisory chat. Each is folded into its relevant section above; this table is a summary index, not the authoritative text — the inline text in §2, §5, §6, §7 governs.
-
-(The four v11 call-chain-attribution decisions — `CorrelationId` scope, the trust boundary, Voyage multi-batch usage, and the retrieval `ConversationId` signature — are documented directly in §2, §4, and §5 above. They are not added as new rows to this table, which indexes only the original six schema/retention/model decisions.)
 
 | # | Decision | Locked outcome | Section |
 |---|---|---|---|
@@ -240,7 +240,7 @@ All six decisions previously open in this design are now locked, following discu
 - Voyage's embeddings API returns `usage.total_tokens`, and only that field — no input/output split (v3 pass, freshly re-confirmed against Voyage's official API reference during the v9 pass); the current client does not parse it.
 - SDK default retry count: 2 (v3 pass).
 - `Message.ID` available for free; HTTP `request-id` header requires a raw-response calling convention not currently used anywhere (v3 pass) — not added to the schema.
-- Knowledge indexing batches sequentially at `VoyageModels.MaxTextsPerRequest = 1000`; largest fixture found anywhere in the repository (exhaustively searched across all 12 content strings reaching the chunker) produces 7 chunks (v7 re-verification pass). This is the same batching mechanism §2's new Voyage multi-batch usage rule (v11) concerns.
+- Knowledge indexing batches sequentially at `VoyageModels.MaxTextsPerRequest = 1000`; largest fixture found anywhere in the repository (exhaustively searched across all 12 content strings reaching the chunker) produces 7 chunks (v7 re-verification pass).
 - `Conversation` is never deleted by either the retention job or GDPR erasure, only anonymized in place; re-confirmed directly against `ConversationPurgeService.cs`, `RetentionEnforcementService.cs`, and `CustomerErasureService.cs` across two separate verification passes.
 
 ---
