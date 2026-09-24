@@ -151,14 +151,34 @@ public class AiProviderInvocationPersistenceTests : IAsyncLifetime
     }
 
     // ── Test 8: string-property allowlist ───────────────────────────────
-    // The allowlist is derived by reflection from the constants classes
-    // themselves (not a second, hand-typed copy that could drift), then
-    // every value actually persisted by this test's own seeded rows is
+    // v11's own wording ("The entity's string properties match an explicit
+    // allowlist") is about the entity's PROPERTY SET, not stored values —
+    // v11 §1's "no conversation content" purpose is a structural guard
+    // against a future string property being added that could hold
+    // arbitrary content. This reflection test is the actual Test 8; the
+    // value-level test below it is additional coverage, not a replacement.
+
+    [Fact]
+    public void StringProperties_AreExactlyTheDesignatedFiveFields()
+    {
+        var actual = typeof(AiProviderInvocation)
+            .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Where(p => p.PropertyType == typeof(string))
+            .Select(p => p.Name)
+            .ToHashSet();
+
+        var expected = new HashSet<string> { "Provider", "Model", "Operation", "Outcome", "ErrorCategory" };
+
+        Assert.Equal(expected, actual);
+    }
+
+    // The allowlist below is derived by reflection from the constants
+    // classes themselves (not a second, hand-typed copy that could drift),
+    // then every value actually persisted by this test's own seeded rows is
     // checked against it. Mutation check performed manually: insert a row
     // with Provider = 'BogusProvider' via raw SQL (nothing at the DB level
-    // stops this — no CHECK constraint enforces Provider's value set,
-    // reported separately as a prose-only invariant), confirm this test
-    // fails, then delete that row.
+    // stopped this before the owner-approved CK_AiProviderInvocations_Provider
+    // constraint was added), confirm this test fails, then delete that row.
 
     [Fact]
     public async Task StringProperties_AllPersistedValues_AreWithinExplicitAllowlists()
@@ -304,6 +324,112 @@ public class AiProviderInvocationPersistenceTests : IAsyncLifetime
         SetTenant(businessId);
         var reloaded = await db.AiProviderInvocations.SingleAsync();
         Assert.True(reloaded.IsUsagePartial);
+    }
+
+    // ── Owner-approved CHECKs (post-v11, see A1 errata list) ────────────
+
+    [Fact]
+    public async Task InvalidProvider_RawInsert_RejectedByCheckConstraint()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var businessId = await SeedBusinessAsync(db, "Invalid Provider Business");
+
+        var ex = await Assert.ThrowsAsync<PostgresException>(() => db.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO "AiProviderInvocations"
+                ("Id", "BusinessId", "Provider", "Model", "Operation", "CorrelationId", "Sequence",
+                 "InputTokens", "Outcome", "IsUsagePartial", "CreatedAt")
+            VALUES
+                ({Guid.NewGuid()}, {businessId}, 'BogusProvider', 'some-model', {AiOperations.CustomerReply},
+                 {Guid.NewGuid()}, 0, 10, {AiOutcomes.Succeeded}, false, {DateTimeOffset.UtcNow})
+            """));
+        Assert.Equal("23514", ex.SqlState);
+        Assert.Equal("CK_AiProviderInvocations_Provider", ex.ConstraintName);
+    }
+
+    [Fact]
+    public async Task InvalidErrorCategory_RawInsert_RejectedByCheckConstraint()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var businessId = await SeedBusinessAsync(db, "Invalid ErrorCategory Business");
+
+        var ex = await Assert.ThrowsAsync<PostgresException>(() => db.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO "AiProviderInvocations"
+                ("Id", "BusinessId", "Provider", "Model", "Operation", "CorrelationId", "Sequence",
+                 "Outcome", "ErrorCategory", "IsUsagePartial", "CreatedAt")
+            VALUES
+                ({Guid.NewGuid()}, {businessId}, {AiProviders.Anthropic}, {AnthropicModels.Default}, {AiOperations.CustomerReply},
+                 {Guid.NewGuid()}, 0, {AiOutcomes.Failed}, 'BogusCategory', false, {DateTimeOffset.UtcNow})
+            """));
+        Assert.Equal("23514", ex.SqlState);
+        Assert.Equal("CK_AiProviderInvocations_ErrorCategory_Allowlist", ex.ConstraintName);
+    }
+
+    [Fact]
+    public async Task VoyageRowWithNonNullOutputTokens_RawInsert_RejectedByCheckConstraint()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var businessId = await SeedBusinessAsync(db, "Voyage OutputTokens Business");
+
+        var ex = await Assert.ThrowsAsync<PostgresException>(() => db.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO "AiProviderInvocations"
+                ("Id", "BusinessId", "Provider", "Model", "Operation", "CorrelationId", "Sequence",
+                 "InputTokens", "OutputTokens", "Outcome", "IsUsagePartial", "CreatedAt")
+            VALUES
+                ({Guid.NewGuid()}, {businessId}, {AiProviders.Voyage}, 'voyage-3', {AiOperations.KnowledgeRetrievalQuery},
+                 {Guid.NewGuid()}, 0, 10, 5, {AiOutcomes.Succeeded}, false, {DateTimeOffset.UtcNow})
+            """));
+        Assert.Equal("23514", ex.SqlState);
+        Assert.Equal("CK_AiProviderInvocations_Voyage_OutputAndCacheTokensNull", ex.ConstraintName);
+    }
+
+    [Fact]
+    public async Task DuplicateBusinessCorrelationSequence_RawInsert_RejectedByUniqueIndex()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var businessId = await SeedBusinessAsync(db, "Duplicate Correlation Sequence Business");
+        var correlationId = Guid.NewGuid();
+
+        db.AiProviderInvocations.Add(new AiProviderInvocation
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            Provider = AiProviders.Anthropic,
+            Model = AnthropicModels.Default,
+            Operation = AiOperations.CustomerReply,
+            CorrelationId = correlationId,
+            Sequence = 0,
+            InputTokens = 10,
+            Outcome = AiOutcomes.Succeeded,
+            IsUsagePartial = false,
+            CreatedAt = DateTimeOffset.UtcNow,
+        });
+        await db.SaveChangesAsync();
+
+        await using var secondScope = _provider.CreateAsyncScope();
+        var secondDb = secondScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        secondDb.AiProviderInvocations.Add(new AiProviderInvocation
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            Provider = AiProviders.Anthropic,
+            Model = AnthropicModels.Default,
+            Operation = AiOperations.CustomerReply,
+            CorrelationId = correlationId,
+            Sequence = 0, // same (BusinessId, CorrelationId, Sequence) as row above
+            InputTokens = 10,
+            Outcome = AiOutcomes.Succeeded,
+            IsUsagePartial = false,
+            CreatedAt = DateTimeOffset.UtcNow,
+        });
+
+        var ex = await Assert.ThrowsAsync<DbUpdateException>(() => secondDb.SaveChangesAsync());
+        var pgEx = Assert.IsType<PostgresException>(ex.InnerException);
+        Assert.Equal("23505", pgEx.SqlState); // unique_violation
+        Assert.Equal("IX_AiProviderInvocations_BusinessId_CorrelationId_Sequence", pgEx.ConstraintName);
     }
 
     private void SetTenant(Guid? businessId) =>

@@ -244,21 +244,28 @@ namespace backend.Migrations
 
                     b.HasIndex("CreatedAt");
 
-                    b.HasIndex("BusinessId", "CorrelationId");
-
                     b.HasIndex("BusinessId", "CreatedAt");
+
+                    b.HasIndex("BusinessId", "CorrelationId", "Sequence")
+                        .IsUnique();
 
                     b.ToTable("AiProviderInvocations", t =>
                         {
+                            t.HasCheckConstraint("CK_AiProviderInvocations_ErrorCategory_Allowlist", "\"ErrorCategory\" IS NULL\r\nOR\r\n\"ErrorCategory\" IN ('RateLimited', 'ServerError', 'Timeout', 'Cancelled', 'InvalidRequest', 'Unknown')");
+
                             t.HasCheckConstraint("CK_AiProviderInvocations_ErrorCategory_OutcomePairing", "(\"Outcome\" = 'Succeeded' AND \"ErrorCategory\" IS NULL)\r\nOR\r\n(\"Outcome\" != 'Succeeded' AND \"ErrorCategory\" IS NOT NULL)");
 
                             t.HasCheckConstraint("CK_AiProviderInvocations_IsUsagePartial_Implication", "\"IsUsagePartial\" = false\r\nOR\r\n(\"Outcome\" = 'Failed' AND \"Provider\" = 'Voyage' AND \"InputTokens\" IS NOT NULL)");
 
                             t.HasCheckConstraint("CK_AiProviderInvocations_Outcome", "\"Outcome\" IN ('Succeeded', 'Failed')");
 
+                            t.HasCheckConstraint("CK_AiProviderInvocations_Provider", "\"Provider\" IN ('Anthropic', 'Voyage')");
+
                             t.HasCheckConstraint("CK_AiProviderInvocations_Sequence_NonNegative", "\"Sequence\" >= 0");
 
                             t.HasCheckConstraint("CK_AiProviderInvocations_Tokens_NonNegative", "(\"InputTokens\" IS NULL OR \"InputTokens\" >= 0)\r\nAND (\"OutputTokens\" IS NULL OR \"OutputTokens\" >= 0)\r\nAND (\"CacheCreationInputTokens\" IS NULL OR \"CacheCreationInputTokens\" >= 0)\r\nAND (\"CacheReadInputTokens\" IS NULL OR \"CacheReadInputTokens\" >= 0)\r\nAND (\"InputItemCount\" IS NULL OR \"InputItemCount\" >= 0)");
+
+                            t.HasCheckConstraint("CK_AiProviderInvocations_Voyage_OutputAndCacheTokensNull", "\"Provider\" != 'Voyage'\r\nOR\r\n(\"OutputTokens\" IS NULL AND \"CacheCreationInputTokens\" IS NULL AND \"CacheReadInputTokens\" IS NULL)");
                         });
                 });
 

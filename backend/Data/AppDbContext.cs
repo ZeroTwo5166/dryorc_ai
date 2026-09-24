@@ -1023,7 +1023,16 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
             a.Property(x => x.IsUsagePartial).HasDefaultValue(false);
 
             a.HasIndex(x => new { x.BusinessId, x.CreatedAt });
-            a.HasIndex(x => new { x.BusinessId, x.CorrelationId });
+
+            // Owner decision, post-v11 (not in v11 — see the A1 errata list):
+            // replaces v11's own non-unique (BusinessId, CorrelationId)
+            // index with a unique (BusinessId, CorrelationId, Sequence)
+            // index. This enforces uniqueness only — no two rows may share
+            // the same (CorrelationId, Sequence) pair — it does NOT enforce
+            // that Sequence values are monotonic or contiguous within a
+            // CorrelationId; that remains an application-level invariant
+            // only (see AiProviderInvocation.Sequence's own doc comment).
+            a.HasIndex(x => new { x.BusinessId, x.CorrelationId, x.Sequence }).IsUnique();
 
             // v11 §3 leaves the ConversationId FK-supporting index shape
             // ENGINEERING-DETERMINED — precedent exists both ways in this
@@ -1085,6 +1094,37 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
                     "IsUsagePartial" = false
                     OR
                     ("Outcome" = '{AiOutcomes.Failed}' AND "Provider" = '{AiProviders.Voyage}' AND "InputTokens" IS NOT NULL)
+                    """);
+
+                // Owner decisions, post-v11 (not specified by v11 §3's own
+                // CHECK constraints list — see the A1 errata list). v11's
+                // Notes column implies Provider/ErrorCategory are drawn from
+                // fixed constant sets but never lists a value-set CHECK for
+                // either; this closes that gap. Deliberately no CHECK on
+                // Operation (six values, more likely to grow) and no
+                // Provider↔Model pairing CHECK (per the same owner review).
+                t.HasCheckConstraint(
+                    "CK_AiProviderInvocations_Provider",
+                    $"\"Provider\" IN ('{AiProviders.Anthropic}', '{AiProviders.Voyage}')");
+
+                t.HasCheckConstraint(
+                    "CK_AiProviderInvocations_ErrorCategory_Allowlist",
+                    $"""
+                    "ErrorCategory" IS NULL
+                    OR
+                    "ErrorCategory" IN ('{AiErrorCategories.RateLimited}', '{AiErrorCategories.ServerError}', '{AiErrorCategories.Timeout}', '{AiErrorCategories.Cancelled}', '{AiErrorCategories.InvalidRequest}', '{AiErrorCategories.Unknown}')
+                    """);
+
+                // Owner decision, post-v11 (not in v11 — see the A1 errata
+                // list). v11 §3's prose states "For Voyage: always null" for
+                // OutputTokens and "Always null for Voyage rows" for both
+                // cache fields, but never specifies this as a CHECK.
+                t.HasCheckConstraint(
+                    "CK_AiProviderInvocations_Voyage_OutputAndCacheTokensNull",
+                    $"""
+                    "Provider" != '{AiProviders.Voyage}'
+                    OR
+                    ("OutputTokens" IS NULL AND "CacheCreationInputTokens" IS NULL AND "CacheReadInputTokens" IS NULL)
                     """);
             });
 
