@@ -16,13 +16,24 @@ namespace backend.Services;
 /// </summary>
 public class VoyageEmbeddingClient(HttpClient httpClient) : IVoyageEmbeddingClient
 {
-    public async Task<IReadOnlyList<float[]>> EmbedAsync(
-        IReadOnlyList<string> texts, VoyageInputType inputType, CancellationToken cancellationToken = default)
+    public Task<IReadOnlyList<float[]>> EmbedAsync(
+        IReadOnlyList<string> texts, VoyageInputType inputType, CancellationToken cancellationToken = default) =>
+        // Unchanged caller-visible behavior: the usage total is simply
+        // discarded on this path (A1 Slice 3 decisions addendum Q1).
+        EmbedWithUsageAsync(texts, inputType, new VoyageUsageAccumulator(), cancellationToken);
+
+    public async Task<IReadOnlyList<float[]>> EmbedWithUsageAsync(
+        IReadOnlyList<string> texts, VoyageInputType inputType, VoyageUsageAccumulator usage,
+        CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(usage);
+
         if (texts.Count == 0)
         {
             return [];
         }
+
+        usage.SetRequestedBatches((texts.Count + VoyageModels.MaxTextsPerRequest - 1) / VoyageModels.MaxTextsPerRequest);
 
         var results = new float[texts.Count][];
         var offset = 0;
@@ -34,7 +45,7 @@ public class VoyageEmbeddingClient(HttpClient httpClient) : IVoyageEmbeddingClie
         {
             var batchSize = Math.Min(VoyageModels.MaxTextsPerRequest, texts.Count - offset);
             var batch = texts.Skip(offset).Take(batchSize).ToList();
-            var batchResults = await EmbedBatchAsync(batch, inputType, cancellationToken);
+            var batchResults = await EmbedBatchAsync(batch, inputType, usage, cancellationToken);
 
             for (var i = 0; i < batch.Count; i++)
             {
@@ -48,7 +59,8 @@ public class VoyageEmbeddingClient(HttpClient httpClient) : IVoyageEmbeddingClie
     }
 
     private async Task<float[][]> EmbedBatchAsync(
-        IReadOnlyList<string> batch, VoyageInputType inputType, CancellationToken cancellationToken)
+        IReadOnlyList<string> batch, VoyageInputType inputType, VoyageUsageAccumulator usage,
+        CancellationToken cancellationToken)
     {
         var requestBody = new VoyageEmbeddingRequest
         {
@@ -85,8 +97,31 @@ public class VoyageEmbeddingClient(HttpClient httpClient) : IVoyageEmbeddingClie
         }
         catch (JsonException ex)
         {
+            // A 2xx whose body can't be parsed never yielded a usable
+            // usage.total_tokens: OD-2 governs, not OD-4 (A1 Slice 3
+            // decisions addendum items 2-3) — the invocation's whole usage
+            // becomes unknown.
+            usage.AddCompletedBatch(null);
             throw new VoyageEmbeddingException("Voyage embeddings response could not be parsed.", ex);
         }
+        catch (InvalidOperationException ex) when (ex is not ObjectDisposedException)
+        {
+            // A 2xx body that can't be decoded (e.g. an invalid charset) is
+            // treated exactly like an unparseable one for usage (OD-2); the
+            // caller still observes the same exception as before. A disposed
+            // content stream means the body was never received — the batch
+            // did not complete (OD-9), so it propagates untouched.
+            usage.AddCompletedBatch(null);
+            throw;
+        }
+
+        // Count this batch's usage now — after the 2xx body parsed, before
+        // any Nivora-side validation below and before the next batch's
+        // request — so the running total is already in the caller's
+        // accumulator if anything after this point throws (A1 design v11
+        // §2:97). A batch that later fails validation still counts: the
+        // provider processed and billed it (addendum OD-4).
+        usage.AddCompletedBatch(ReadTotalTokens(parsed?.Usage));
 
         if (parsed?.Data is null)
         {
@@ -124,6 +159,19 @@ public class VoyageEmbeddingClient(HttpClient httpClient) : IVoyageEmbeddingClie
         return mapped;
     }
 
+    // usage.total_tokens, or null when missing or unusable (addendum OD-2).
+    // Read from a raw JsonElement, never a typed property, so an unexpected
+    // shape can't turn into a JsonException — a malformed usage object must
+    // never change whether the embedding call itself succeeds (R4).
+    private static long? ReadTotalTokens(JsonElement? usage) =>
+        usage is { ValueKind: JsonValueKind.Object } u
+        && u.TryGetProperty("total_tokens", out var total)
+        && total.ValueKind == JsonValueKind.Number
+        && total.TryGetInt64(out var value)
+        && value >= 0
+            ? value
+            : null;
+
     private class VoyageEmbeddingRequest
     {
         [JsonPropertyName("input")]
@@ -142,6 +190,9 @@ public class VoyageEmbeddingClient(HttpClient httpClient) : IVoyageEmbeddingClie
     {
         [JsonPropertyName("data")]
         public List<VoyageEmbeddingDatum>? Data { get; init; }
+
+        [JsonPropertyName("usage")]
+        public JsonElement? Usage { get; init; }
     }
 
     private class VoyageEmbeddingDatum
