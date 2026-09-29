@@ -2,7 +2,7 @@
 
 Addendum to `docs/handoffs/billing-usage-a1-invocation-capture-design-v11.md`, as amended by errata 1 (commit `506759c`, applied inline to v11 with a closing "Errata (post-Slice 1)" index) and errata 2 (commit `59a21ad`, standalone file `billing-usage-a1-invocation-capture-errata-2.md`). Like errata 2, this addendum is a standalone file and does not edit v11's text. Where this file and v11 or errata 2 differ, this file governs for the items below. v11 and errata 2 govern everything else.
 
-This file records Slice 3 owner decisions, post-implementation rulings, and independent-verification results (sections 1-5) that v11 and the existing errata do not state and that can't be derived from them. Slice 3's design-level decisions (Q1, OD-2, OD-4, OD-5, OD-6, OD-8) are recorded in `docs/handoffs/billing-usage-a1-slice3-decisions-addendum.md`, against the Slice 3 design pass.
+This file records Slice 3 owner decisions, post-implementation rulings, and independent-verification results (sections 1-6) that v11 and the existing errata do not state and that can't be derived from them. Slice 3's design-level decisions (Q1, OD-2, OD-4, OD-5, OD-6, OD-8) are recorded in `docs/handoffs/billing-usage-a1-slice3-decisions-addendum.md`, against the Slice 3 design pass.
 
 Each item is marked with its source:
 - **(v11)**: stated by v11 itself.
@@ -197,3 +197,56 @@ C9 (section 4) added test coverage for C5's failure-path behavior; it made no pr
 - That test is future work. This pass does not perform it, and nothing here implies that V-Q2 was verified.
 
 17/17 hashes match c9_end_hashes.txt.
+
+---
+
+## 6. Voyage V-Q2 live observations
+
+Added 2026-09-29, docs-only. The observations in 6.2 are **owner-supplied**, made on 2026-09-29 through manual PowerShell calls and live test runs. The raw call output is not stored in the repo. They are recorded here as owner-observed. Only the test file's input string, its `> 0` assertion, its gate, and the commit hashes were cross-checked against the repo. This section does not edit 5.6 and does not restate sections 1-5.
+
+### 6.1 - Test and gate
+
+- Commit `69b371061d536b03aec911f241e08ee684099b9b` added a `[LiveVoyageFact]` test (`backend.Tests/VoyageEmbeddingClientLiveTests.cs`) that makes one voyage-3 query embedding call through the real `VoyageEmbeddingClient`.
+- It runs only when user-secrets hold `Voyage:EnableLiveIntegrationTests=true` and a non-blank `Voyage:ApiKey`. Otherwise it skips.
+- Commit `a6b69b18067c9b95c03a0a536de8178ba310e8d1` changed its input to an ordinary sentence (see 6.2(b)/(c)).
+
+### 6.2 - Observations, in order
+
+- **(a) First live run:** HTTP 401 "Provided API key is invalid". This was a credential problem and gave no evidence about usage.
+- **(b) Second live run, input "hello":** the call succeeded and assertions 1-4 held (no throw, one vector, length equal to `EmbeddingDimensions.VoyageThree` = 1024, one requested and one completed batch). The `usage.total_tokens > 0` assertion failed: the value was 0.
+- **(c) Three manual raw calls** to `POST /v1/embeddings` with model `voyage-3`:
+  - input "hello", input_type "query": usage `{"total_tokens":0}`.
+  - input "The quick brown fox jumps over the lazy dog near the river bank.", input_type "query": usage `{"total_tokens":13}`.
+  - input "hello" with no input_type: usage `{"total_tokens":1}`.
+  - Each response had top-level fields `object`, `data`, `model`, `usage`. `usage` held only `total_tokens`. Each vector had length 1024.
+- **(d) Corrected test (sentence input):** one live run passed all five assertions.
+
+### 6.3 - What this establishes and does not establish
+
+**Established, for these responses only:**
+- voyage-3 returned a `usage` object containing `total_tokens` as a small non-negative integer.
+- The value can be 0 for a non-empty short query input.
+- The 1024 dimension held live.
+- The client's parse path handled these responses.
+
+**NOT established:**
+- Why the 0 occurred. The cause is unknown, and this record does not offer one.
+- Whether it depends on input length or input_type, or varies between identical requests.
+- V-Q2 item 2 (full integer range), item 3 (never absent or null on a 2xx), and item 4 (other usage fields, beyond the three observed responses), all as listed at `billing-usage-a1-slice3-design-pass.md:210-214`.
+- Behaviour for input_type "document".
+- That every non-empty input yields `> 0`.
+
+The corrected test's pass is one observation on one sentence. It is not a confirmation of V-Q2.
+
+### 6.4 - Status
+
+- V-Q2 is partially characterized and remains open.
+- The 5.6 status (REQUIRES VERIFICATION, deferred) is not closed by this section. The follow-up test that 5.6 called for now exists and has been run once.
+- The original assumption that a non-empty input always yields `usage.total_tokens > 0` is disproven by 6.2(b) and 6.2(c).
+- No ruling in 5.1-5.3 is changed by this section.
+
+### 6.5 - Open billing-semantics question (not decided here)
+
+- Voyage voyage-3 reported `total_tokens = 0` for a non-empty short query input.
+- Whether provider-reported usage is the authoritative source for Nivora's usage/billing, and how a provider-reported 0 should be treated, is an open owner question for later slices.
+- No Slice 3 production behaviour changes. v11's null-vs-zero invariant (§2:78-80) is unchanged: `0` means the provider explicitly reported zero, and `null` means no usage was obtained, as qualified for the OD-2 case by section 3 of this errata.
