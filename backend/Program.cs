@@ -250,6 +250,18 @@ builder.Services.AddScoped<IKnowledgeIndexingService, KnowledgeIndexingService>(
 // is configured.
 builder.Services.AddScoped<IKnowledgeRetrievalService, KnowledgeRetrievalService>();
 
+// Step 27 Slice A1, Slice 3: the isolated invocation recorder (Slice 2) and
+// the two provider wrappers over the IMessageService/IVoyageEmbeddingClient
+// registrations above — see
+// docs/handoffs/billing-usage-a1-slice3-decisions-addendum.md (OD-8). No
+// production caller yet: migrating the call sites is Slice 4. The raw
+// clients stay registered as they are (DI lockdown is Slice 5), and the
+// rule (c) IUnauthorizedActionAuditWriter is deliberately not registered
+// here — it lands with its only caller.
+builder.Services.AddScoped<IAiInvocationRecorder, AiInvocationRecorder>();
+builder.Services.AddScoped<IAnthropicInvoker, AnthropicInvoker>();
+builder.Services.AddScoped<IVoyageEmbeddingInvoker, VoyageEmbeddingInvoker>();
+
 // Step 13A: ConversationModeService/TicketSlaService — standalone domain
 // logic, no production caller yet (see each service's own doc comment).
 // AuditLogService — minimal, deliberately narrower than Step 29's eventual

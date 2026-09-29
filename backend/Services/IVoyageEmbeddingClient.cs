@@ -22,6 +22,20 @@ public interface IVoyageEmbeddingClient
     /// </summary>
     Task<IReadOnlyList<float[]>> EmbedAsync(
         IReadOnlyList<string> texts, VoyageInputType inputType, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Same behavior as <see cref="EmbedAsync"/>, additionally reporting
+    /// usage into <paramref name="usage"/> as each batch completes, so the
+    /// running total survives a later throw (A1 design v11 §2:97; Slice 3
+    /// decisions addendum Q1). Intended for <see cref="IVoyageEmbeddingInvoker"/>
+    /// only — a naming/code-review convention until the Slice 5 architecture
+    /// test enforces it. <paramref name="usage"/> is required and deliberately
+    /// has no default interface body (addendum OD-8): every implementer
+    /// supplies its own accumulator handling.
+    /// </summary>
+    Task<IReadOnlyList<float[]>> EmbedWithUsageAsync(
+        IReadOnlyList<string> texts, VoyageInputType inputType, VoyageUsageAccumulator usage,
+        CancellationToken cancellationToken = default);
 }
 
 /// <summary>
