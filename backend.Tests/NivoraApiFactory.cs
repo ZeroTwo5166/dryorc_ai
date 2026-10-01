@@ -45,6 +45,20 @@ namespace backend.Tests;
 /// </summary>
 public class NivoraApiFactory : WebApplicationFactory<Program>
 {
+    /// <summary>
+    /// Step 27 Slice A1, Slice 4b (design §7.2): the one non-persisting
+    /// recorder this host's invokers write to, unless a subclass opts into
+    /// the real recorder via <see cref="UsesRealInvocationRecorder"/>.
+    /// </summary>
+    public ConcurrentCapturingAiInvocationRecorder InvocationCapture { get; } = new();
+
+    /// <summary>
+    /// True keeps Program.cs's real, persisting AiInvocationRecorder
+    /// (PersistingInvocationRecorderApiFactory). Read inside the single
+    /// ConfigureTestServices lambda below (design §7.3).
+    /// </summary>
+    protected virtual bool UsesRealInvocationRecorder => false;
+
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
@@ -93,6 +107,16 @@ public class NivoraApiFactory : WebApplicationFactory<Program>
         {
             services.AddSingleton<IMessageService, FakeMessageService>();
             services.AddSingleton<IVoyageEmbeddingClient, FakeVoyageEmbeddingClient>();
+
+            // Step 27 Slice A1, Slice 4b (design §7.2-§7.3): AI invocation
+            // rows are captured in memory by default, never persisted — no
+            // test using this factory has to delete AiProviderInvocations
+            // before its Businesses (Restrict FK). Overrides Program.cs's
+            // scoped AiInvocationRecorder (last registration wins).
+            if (!UsesRealInvocationRecorder)
+            {
+                services.AddSingleton<IAiInvocationRecorder>(InvocationCapture);
+            }
 
             // Step 21: overrides the real AddHttpClient<IEmailSender,
             // ResendEmailSender> registration — same reasoning as the two
