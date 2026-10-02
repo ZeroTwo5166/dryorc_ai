@@ -10,8 +10,10 @@ namespace backend.Services;
 /// — after the call returns or throws, then returns or rethrows, with caller
 /// behavior otherwise unchanged (v11 §4:153). Usage is summed across the
 /// client's internal batches via a per-call <see cref="VoyageUsageAccumulator"/>
-/// (Slice 3 decisions addendum Q1). No call site uses this yet — migrating
-/// them is Slice 4 (errata 2 §1).
+/// (Slice 3 decisions addendum Q1). Production caller so far:
+/// KnowledgeIndexingService (Slice 4b). Customer-turn retrieval
+/// (KnowledgeRetrievalService) still calls IVoyageEmbeddingClient directly
+/// until it migrates in Slice 4a (errata 2 §1).
 /// </summary>
 public interface IVoyageEmbeddingInvoker
 {
