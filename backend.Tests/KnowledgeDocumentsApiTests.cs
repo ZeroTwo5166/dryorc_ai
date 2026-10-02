@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using backend.Auth;
+using backend.Constants;
 using backend.Controllers;
 using backend.Data;
 using backend.Models;
@@ -133,6 +134,26 @@ public class KnowledgeDocumentsApiTests : IAsyncLifetime
         Assert.NotNull(cookie);
 
         return (registerBody.BusinessId, cookie!);
+    }
+
+    // ── T-API2 (A1 Slice 4b design §10.4): invocation capture over HTTP ─
+    // Mutation: revert V1 in KnowledgeIndexingService to the raw
+    // IVoyageEmbeddingClient.EmbedAsync path — no row is captured.
+
+    [Fact]
+    public async Task Create_CapturesOneKnowledgeIndexingRowForTheBusiness()
+    {
+        using var anonClient = NewClient();
+        using var ownerClient = NewClient();
+        var (businessId, ownerCookie) = await CreateBusinessAndLoginAsOwnerAsync(anonClient, ownerClient, "Knowledge Capture Business");
+
+        var createResponse = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/knowledge", ownerCookie),
+            new CreateKnowledgeDocumentRequest("Faq", "Shipping times", "We ship within 2 business days.")));
+
+        Assert.Equal(HttpStatusCode.Created, createResponse.StatusCode);
+        var record = Assert.Single(_factory.InvocationCapture.ForBusiness(businessId));
+        Assert.Equal(AiOperations.KnowledgeIndexing, record.Operation);
     }
 
     // ── Full CRUD lifecycle (Owner) ─────────────────────────────────

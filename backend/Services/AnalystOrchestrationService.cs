@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using Anthropic.Exceptions;
 using Anthropic.Models.Messages;
-using Anthropic.Services;
+using backend.Constants;
 using Microsoft.Extensions.Logging;
 
 namespace backend.Services;
@@ -33,7 +33,7 @@ namespace backend.Services;
 /// </summary>
 public class AnalystOrchestrationService(
     IEnumerable<IAnalystCapability> capabilities,
-    IMessageService messageService,
+    IAnthropicInvoker anthropicInvoker,
     ILogger<AnalystOrchestrationService> logger) : IAnalystOrchestrationService
 {
     private const int MaxCapabilityCalls = 3;
@@ -65,14 +65,20 @@ public class AnalystOrchestrationService(
     public async Task<AnalystOutcome> AnswerAsync(Guid businessId, string question, CancellationToken cancellationToken = default)
     {
         var stopwatch = Stopwatch.StartNew();
+        // A1 Slice 4b design §2.2/§3: this method starts the logical
+        // operation, so it owns the CorrelationId and the Sequence counter
+        // (v11 §4:154). Sequence is taken as each context is built, i.e. per
+        // attempt, not per recorded row.
+        var correlationId = Guid.NewGuid();
+        var sequence = 0;
         var messages = new List<MessageParam> { new() { Role = Role.User, Content = question } };
 
         Message selectionResponse;
         try
         {
-            selectionResponse = await messageService.Create(new MessageCreateParams
+            selectionResponse = await anthropicInvoker.CreateMessageAsync(new AiCallContext(businessId, AiOperations.AnalystSelection, correlationId, sequence++), new MessageCreateParams
             {
-                Model = "claude-sonnet-5",
+                Model = AnthropicModels.Default,
                 MaxTokens = MaxSelectionTokens,
                 System = SelectionSystemPrompt,
                 Messages = messages,
@@ -204,9 +210,9 @@ public class AnalystOrchestrationService(
         Message synthesisResponse;
         try
         {
-            synthesisResponse = await messageService.Create(new MessageCreateParams
+            synthesisResponse = await anthropicInvoker.CreateMessageAsync(new AiCallContext(businessId, AiOperations.AnalystSynthesis, correlationId, sequence++), new MessageCreateParams
             {
-                Model = "claude-sonnet-5",
+                Model = AnthropicModels.Default,
                 MaxTokens = MaxSynthesisTokens,
                 System = SynthesisSystemPrompt,
                 Messages = messages,

@@ -23,7 +23,7 @@ namespace backend.Tests;
 /// </summary>
 public class AiProviderWrapperRegistrationTests : IAsyncLifetime
 {
-    private readonly NivoraApiFactory _factory = new();
+    private readonly NivoraApiFactory _factory = new PersistingInvocationRecorderApiFactory();
     private readonly List<Guid> _businessIdsToClean = [];
 
     public Task InitializeAsync() => Task.CompletedTask;

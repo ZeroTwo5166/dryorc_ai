@@ -35,7 +35,7 @@ public interface IKnowledgeIndexingService
         CancellationToken cancellationToken = default);
 }
 
-public class KnowledgeIndexingService(AppDbContext db, IVoyageEmbeddingClient embeddingClient) : IKnowledgeIndexingService
+public class KnowledgeIndexingService(AppDbContext db, IVoyageEmbeddingInvoker embeddingInvoker) : IKnowledgeIndexingService
 {
     public async Task<KnowledgeDocument> CreateAsync(
         Guid businessId, KnowledgeDocumentType type, string title, string content,
@@ -47,8 +47,11 @@ public class KnowledgeIndexingService(AppDbContext db, IVoyageEmbeddingClient em
         // transaction open across an external HTTP call, same rule
         // ClaudeReplyService/WidgetConversationService already follow. If
         // this throws, nothing below has run yet: no document, no chunks.
+        // A1 Slice 4b design §2.1/§3: this method starts its own logical
+        // operation with at most one provider call, so it owns a fresh
+        // CorrelationId and Sequence 0 (v11 §4:154).
         var embeddings = chunkTexts.Count > 0
-            ? await embeddingClient.EmbedAsync(chunkTexts, VoyageInputType.Document, cancellationToken)
+            ? await embeddingInvoker.EmbedAsync(new AiCallContext(businessId, AiOperations.KnowledgeIndexing, Guid.NewGuid(), 0), chunkTexts, VoyageInputType.Document, cancellationToken)
             : [];
 
         var now = DateTimeOffset.UtcNow;
@@ -102,9 +105,10 @@ public class KnowledgeIndexingService(AppDbContext db, IVoyageEmbeddingClient em
         // database write. If this throws, the transaction below never
         // opens — document.Content/Type/Title/IsActive are never mutated,
         // so the document and its existing chunks are left exactly as they
-        // were.
+        // were. Its own logical operation, separate from CreateAsync's: a
+        // fresh CorrelationId and Sequence 0 (A1 Slice 4b design §2.1/§3).
         var embeddings = chunkTexts.Count > 0
-            ? await embeddingClient.EmbedAsync(chunkTexts, VoyageInputType.Document, cancellationToken)
+            ? await embeddingInvoker.EmbedAsync(new AiCallContext(document.BusinessId, AiOperations.KnowledgeIndexing, Guid.NewGuid(), 0), chunkTexts, VoyageInputType.Document, cancellationToken)
             : [];
 
         var lockKey = AdvisoryLockKeyGenerator.ForKnowledgeDocument(document.BusinessId, document.Id);

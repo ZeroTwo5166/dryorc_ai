@@ -329,6 +329,34 @@ public class AnthropicInvokerTests : IAsyncLifetime
         Assert.Empty(recorder.Records);
     }
 
+    // ── F1 (Slice 4b design §10.6) ──────────────────────────────────────
+    // The bare `throw;` must keep MissingAnthropicApiKeyMessageService.Create
+    // in the caught trace. Type-qualified on purpose: the bare
+    // nameof(...Create) is "Create", which AnthropicInvoker.CreateMessageAsync
+    // also contains, so it would pass under the mutant. Mutation: `throw nce;`.
+
+    [Fact]
+    public async Task CreateMessageAsync_AnthropicNotConfigured_RethrowKeepsMissingKeyThrowSiteInStackTrace()
+    {
+        var (invoker, recorder) = Build(new MissingAnthropicApiKeyMessageService());
+
+        Exception? caught = null;
+        string? stackTrace = null;
+        try
+        {
+            await invoker.CreateMessageAsync(Context(), Params());
+        }
+        catch (Exception ex)
+        {
+            caught = ex;
+            stackTrace = ex.StackTrace;
+        }
+
+        Assert.IsType<AnthropicNotConfiguredException>(caught);
+        Assert.Contains($"{nameof(MissingAnthropicApiKeyMessageService)}.{nameof(MissingAnthropicApiKeyMessageService.Create)}", stackTrace);
+        Assert.Empty(recorder.Records);
+    }
+
     // Locked OD-6: no wrapper-level pre-check; every call that reaches the
     // SDK gets a row. A token cancelled before the call still reaches
     // Create; SequencedFakeMessageService.Create checks the token first and

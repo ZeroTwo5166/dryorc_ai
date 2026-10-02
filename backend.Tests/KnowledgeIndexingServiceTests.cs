@@ -1,3 +1,4 @@
+using backend.Constants;
 using backend.Data;
 using backend.Enums;
 using backend.Interfaces;
@@ -22,6 +23,9 @@ public class KnowledgeIndexingServiceTests : IAsyncLifetime
 {
     private ServiceProvider _provider = null!;
     private FakeVoyageEmbeddingClient _fakeVoyage = null!;
+    // A1 Slice 4b design §7.5: invocation rows are captured, never persisted,
+    // so the cleanup below needs no AiProviderInvocations delete.
+    private readonly ConcurrentCapturingAiInvocationRecorder _capture = new();
     private readonly List<Guid> _businessIdsToClean = [];
 
     public Task InitializeAsync()
@@ -39,7 +43,10 @@ public class KnowledgeIndexingServiceTests : IAsyncLifetime
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
                 PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()))
+            .AddLogging()
             .AddSingleton<IVoyageEmbeddingClient>(_fakeVoyage)
+            .AddSingleton<IAiInvocationRecorder>(_capture)
+            .AddScoped<IVoyageEmbeddingInvoker, VoyageEmbeddingInvoker>()
             .AddScoped<IKnowledgeIndexingService, KnowledgeIndexingService>()
             .BuildServiceProvider();
 
@@ -310,6 +317,132 @@ public class KnowledgeIndexingServiceTests : IAsyncLifetime
         // is implied by both updates completing successfully above, but
         // re-confirmed directly here too.
         Assert.Equal(finalChunks.Select(c => c.ChunkIndex).Distinct().Count(), finalChunks.Count);
+    }
+
+    // ── A1 Slice 4b (design §10.3): invocation capture at V1/V2 ────────
+
+    // T-V4b1. Mutations: wrong Operation; Guid.Empty as the business.
+    [Fact]
+    public async Task CreateAsync_RecordsOneKnowledgeIndexingRowSeq0_WithChunkCount()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var indexing = scope.ServiceProvider.GetRequiredService<IKnowledgeIndexingService>();
+        var businessId = await CreateBusinessAsync(db);
+
+        var content = "MARKER_ONE " + new string('a', 300) + "\n\n" + "MARKER_TWO " + new string('b', 300) + "\n\n" + new string('c', 300);
+        var chunkCount = KnowledgeChunker.Chunk(content).Count;
+        Assert.True(chunkCount > 1);
+
+        await indexing.CreateAsync(businessId, KnowledgeDocumentType.Faq, "Capture Doc", content);
+
+        var record = Assert.Single(_capture.ForBusiness(businessId));
+        Assert.Equal(AiOperations.KnowledgeIndexing, record.Operation);
+        Assert.Equal(0, record.Sequence);
+        Assert.Equal(businessId, record.BusinessId);
+        Assert.Null(record.ConversationId);
+        Assert.Equal(AiProviders.Voyage, record.Provider);
+        Assert.Equal(AiOutcomes.Succeeded, record.Outcome);
+        Assert.Equal(chunkCount, record.InputItemCount);
+    }
+
+    // T-V4b2. Mutation: reuse one static/field CorrelationId.
+    [Fact]
+    public async Task UpdateAsync_ContentChanged_RecordsOneRowForDocumentBusiness_WithItsOwnCorrelation()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var indexing = scope.ServiceProvider.GetRequiredService<IKnowledgeIndexingService>();
+        var businessId = await CreateBusinessAsync(db);
+
+        var document = await indexing.CreateAsync(businessId, KnowledgeDocumentType.Faq, "Doc", "MARKER_OLD content here.");
+        await indexing.UpdateAsync(document, KnowledgeDocumentType.Faq, "Doc", "MARKER_NEW content here.", true);
+
+        var records = _capture.ForBusiness(businessId);
+        Assert.Equal(2, records.Count);
+        var (create, update) = (records[0], records[1]);
+        Assert.Equal(document.BusinessId, update.BusinessId);
+        Assert.Equal(AiOperations.KnowledgeIndexing, update.Operation);
+        Assert.Equal(0, update.Sequence);
+        Assert.Equal(AiOutcomes.Succeeded, update.Outcome);
+        Assert.NotEqual(create.CorrelationId, update.CorrelationId);
+    }
+
+    // T-V4b3. Mutation: move the invoker call above the contentChanged
+    // early return.
+    [Fact]
+    public async Task UpdateAsync_ContentUnchanged_RecordsNothing()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var indexing = scope.ServiceProvider.GetRequiredService<IKnowledgeIndexingService>();
+        var businessId = await CreateBusinessAsync(db);
+
+        var content = "Stable content that will not change.";
+        var document = await indexing.CreateAsync(businessId, KnowledgeDocumentType.Faq, "Original Title", content);
+        var recordsBefore = _capture.ForBusiness(businessId).Count;
+        var callCountBefore = _fakeVoyage.CallCount;
+
+        await indexing.UpdateAsync(document, KnowledgeDocumentType.Policy, "New Title", content, false);
+
+        Assert.Equal(1, recordsBefore);
+        Assert.Equal(recordsBefore, _capture.ForBusiness(businessId).Count);
+        Assert.Equal(callCountBefore, _fakeVoyage.CallCount);
+    }
+
+    // T-V4b4 (create). Mutation: catch-and-swallow the Voyage failure in
+    // the service (the throw assertion goes red).
+    [Fact]
+    public async Task CreateAsync_VoyageFailure_StillThrows_RecordsOneFailedRow()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var indexing = scope.ServiceProvider.GetRequiredService<IKnowledgeIndexingService>();
+        var businessId = await CreateBusinessAsync(db);
+
+        _fakeVoyage.ExceptionToThrow = new VoyageEmbeddingException("simulated failure");
+        try
+        {
+            await Assert.ThrowsAsync<VoyageEmbeddingException>(() =>
+                indexing.CreateAsync(businessId, KnowledgeDocumentType.Faq, "Should Not Persist", "Some real content here."));
+        }
+        finally
+        {
+            _fakeVoyage.ExceptionToThrow = null;
+        }
+
+        var record = Assert.Single(_capture.ForBusiness(businessId));
+        Assert.Equal(AiOperations.KnowledgeIndexing, record.Operation);
+        Assert.Equal(AiOutcomes.Failed, record.Outcome);
+    }
+
+    // T-V4b4 (update). Same mutation, on the V2 path.
+    [Fact]
+    public async Task UpdateAsync_VoyageFailure_StillThrows_RecordsOneFailedRow()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var indexing = scope.ServiceProvider.GetRequiredService<IKnowledgeIndexingService>();
+        var businessId = await CreateBusinessAsync(db);
+
+        var document = await indexing.CreateAsync(businessId, KnowledgeDocumentType.Faq, "Doc", "MARKER_ORIGINAL content.");
+
+        _fakeVoyage.ExceptionToThrow = new VoyageEmbeddingException("simulated failure");
+        try
+        {
+            await Assert.ThrowsAsync<VoyageEmbeddingException>(() =>
+                indexing.UpdateAsync(document, KnowledgeDocumentType.Faq, "Doc", "MARKER_ATTEMPTED_CHANGE content.", true));
+        }
+        finally
+        {
+            _fakeVoyage.ExceptionToThrow = null;
+        }
+
+        var records = _capture.ForBusiness(businessId);
+        Assert.Equal(2, records.Count);
+        Assert.Equal(AiOutcomes.Succeeded, records[0].Outcome);
+        Assert.Equal(AiOutcomes.Failed, records[1].Outcome);
+        Assert.Single(records, r => r.Outcome == AiOutcomes.Failed);
     }
 
     private class FixedTenantAccessor(Guid? businessId) : ICurrentTenantAccessor
