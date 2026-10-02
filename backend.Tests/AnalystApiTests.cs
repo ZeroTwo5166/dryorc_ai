@@ -5,9 +5,11 @@ using Anthropic.Exceptions;
 using Anthropic.Models.Messages;
 using Anthropic.Services;
 using backend.Auth;
+using backend.Constants;
 using backend.Controllers;
 using backend.Data;
 using backend.Models;
+using backend.Services;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -209,6 +211,10 @@ public class AnalystApiTests : IAsyncLifetime
             builder.ConfigureTestServices(services =>
             {
                 services.AddSingleton<IMessageService>(fake);
+                // Defence in depth only (A1 Slice 4b design §7.3, §13 #10): the
+                // inherited base ConfigureTestServices already registers this
+                // capture; stated here so the scripted host never relies on it.
+                services.AddSingleton<IAiInvocationRecorder>(_factory.InvocationCapture);
             });
         });
         return (factory, fake);
@@ -396,6 +402,48 @@ public class AnalystApiTests : IAsyncLifetime
         Assert.Equal(HttpStatusCode.BadGateway, response.StatusCode);
         var body = await response.Content.ReadFromJsonAsync<AnalystAnswerResponse>();
         Assert.Equal("ClaudeCallFailed", body!.Outcome);
+    }
+
+    // ── T-API1 (A1 Slice 4b design §10.4): invocation capture over HTTP ─
+    // Mutation: revert A4 (and A5) in AnalystOrchestrationService to the raw
+    // IMessageService.Create path — no row is captured, so both go red.
+
+    [Fact]
+    public async Task Ask_WhenEnabled_DefaultFake_CapturesOneAnalystSelectionRow()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Analyst Ask Capture Refused Business");
+        using var _o = ownerClient;
+        await EnableAnalystAsync(ownerClient, ownerCookie);
+
+        var response = await ownerClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/analyst", ownerCookie), new AnalystQuestionRequest("Anything?")));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var record = Assert.Single(_factory.InvocationCapture.ForBusiness(businessId));
+        Assert.Equal(AiOperations.AnalystSelection, record.Operation);
+    }
+
+    [Fact]
+    public async Task Ask_ScriptedAnswered_CapturesTwoRowsUnderOneCorrelation()
+    {
+        var (businessId, _, ownerClient, ownerCookie) = await SetUpBusinessWithOwnerAsync("Analyst Ask Capture Answered Business");
+        using var _o = ownerClient;
+        await EnableAnalystAsync(ownerClient, ownerCookie);
+
+        var (scriptedFactory, fake) = NewScriptedFactory();
+        using var scriptedClient = scriptedFactory.CreateClient(new() { BaseAddress = new Uri("https://localhost") });
+        fake.Enqueue(ToolUseResponse("getConversationsByDay", Args(new { range = "7d" })));
+        fake.Enqueue(TextResponse("There were no conversations in the last 7 days."));
+
+        var response = await scriptedClient.SendAsync(WithBody(
+            Authed(HttpMethod.Post, "/api/analyst", ownerCookie), new AnalystQuestionRequest("How many conversations this week?")));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var records = _factory.InvocationCapture.ForBusiness(businessId);
+        Assert.Equal(2, records.Count);
+        Assert.Equal(records[0].CorrelationId, records[1].CorrelationId);
+        Assert.Equal(AiOperations.AnalystSelection, records[0].Operation);
+        Assert.Equal(AiOperations.AnalystSynthesis, records[1].Operation);
     }
 
     public static IEnumerable<object[]> ClaudeFailureExceptions()

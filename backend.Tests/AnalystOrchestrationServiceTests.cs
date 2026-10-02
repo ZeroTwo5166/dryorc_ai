@@ -6,6 +6,7 @@ using Anthropic.Exceptions;
 using Anthropic.Models.Messages;
 using Anthropic.Services;
 using Anthropic.Services.Messages;
+using backend.Constants;
 using backend.Services;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -119,6 +120,20 @@ public class AnalystOrchestrationServiceTests
     private static Dictionary<string, JsonElement> Args(object anonymous) =>
         JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(JsonSerializer.Serialize(anonymous))!;
 
+    // A1 Slice 4b design §7.5: the service now takes IAnthropicInvoker, so
+    // every test wraps its fake IMessageService in a real AnthropicInvoker.
+    // A test that doesn't pass a recorder still gets a throwaway capture, so
+    // nothing ever persists.
+    private static AnalystOrchestrationService NewService(
+        IEnumerable<IAnalystCapability> capabilities,
+        IMessageService fakeMessages,
+        ConcurrentCapturingAiInvocationRecorder? recorder = null,
+        ILogger<AnalystOrchestrationService>? logger = null) =>
+        new(
+            capabilities,
+            new AnthropicInvoker(fakeMessages, recorder ?? new ConcurrentCapturingAiInvocationRecorder(), NullLogger<AnthropicInvoker>.Instance),
+            logger ?? NullLogger<AnalystOrchestrationService>.Instance);
+
     // A tool_use selection response that also carries a ThinkingBlock — the
     // exact shape a real claude-sonnet-5 selection turn produced in Step
     // 23's live validation (adaptive thinking, on by default when Thinking
@@ -169,7 +184,7 @@ public class AnalystOrchestrationServiceTests
         var capability = new RecordingAnalystCapability { Name = "getConversationsByDay" };
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseWithThinkingResponse("getConversationsByDay", Args(new { range = "7d" }), "tu_1"));
-        var service = new AnalystOrchestrationService([capability], fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+        var service = NewService([capability], fakeMessages);
 
         var outcome = await service.AnswerAsync(BusinessId, "How many conversations this week?", CancellationToken.None);
 
@@ -184,7 +199,7 @@ public class AnalystOrchestrationServiceTests
         var capability = new RecordingAnalystCapability { Name = "getConversationsByDay" };
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseWithUnrecognizedBlockResponse("getConversationsByDay", Args(new { range = "7d" }), "tu_1"));
-        var service = new AnalystOrchestrationService([capability], fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+        var service = NewService([capability], fakeMessages);
 
         var outcome = await service.AnswerAsync(BusinessId, "How many conversations this week?", CancellationToken.None);
 
@@ -200,7 +215,7 @@ public class AnalystOrchestrationServiceTests
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseResponse("getConversationsByDay", Args(new { range = "7d" }), "tu_1"));
         fakeMessages.Enqueue(TextResponse("Here is the summary."));
-        var service = new AnalystOrchestrationService([capability], fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+        var service = NewService([capability], fakeMessages);
 
         await service.AnswerAsync(BusinessId, "How many conversations this week?", CancellationToken.None);
 
@@ -225,7 +240,7 @@ public class AnalystOrchestrationServiceTests
 
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(TextResponse(fabricatedButPlausibleText));
-        var service = new AnalystOrchestrationService([], fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+        var service = NewService([], fakeMessages);
 
         var outcome = await service.AnswerAsync(BusinessId, "How has AI handling changed recently?", CancellationToken.None);
 
@@ -257,7 +272,7 @@ public class AnalystOrchestrationServiceTests
             ("getHandoffsByDay", Args(new { range = "7d" }), "tu_3"),
             ("getTicketStatusDistribution", Args(new { range = "7d" }), "tu_4"),
         ]));
-        var service = new AnalystOrchestrationService(capabilities, fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+        var service = NewService(capabilities, fakeMessages);
 
         var outcome = await service.AnswerAsync(BusinessId, "Give me everything.", CancellationToken.None);
 
@@ -282,7 +297,7 @@ public class AnalystOrchestrationServiceTests
             ("getHandoffsByDay", Args(new { range = "7d" }), "tu_3"),
         ]));
         fakeMessages.Enqueue(TextResponse("Here is the summary."));
-        var service = new AnalystOrchestrationService(capabilities, fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+        var service = NewService(capabilities, fakeMessages);
 
         var outcome = await service.AnswerAsync(BusinessId, "Give me everything you reasonably can.", CancellationToken.None);
 
@@ -305,7 +320,7 @@ public class AnalystOrchestrationServiceTests
         };
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseResponse("getConversationsByDay", Args(new { range = "7d" }), "tu_1"));
-        var service = new AnalystOrchestrationService([failingCapability], fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+        var service = NewService([failingCapability], fakeMessages);
 
         var outcome = await service.AnswerAsync(BusinessId, "How many conversations this week?", CancellationToken.None);
 
@@ -320,8 +335,7 @@ public class AnalystOrchestrationServiceTests
     {
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseResponse("throwingCapability", Args(new { }), "tu_throw"));
-        var service = new AnalystOrchestrationService(
-            [new ThrowingAnalystCapability()], fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+        var service = NewService([new ThrowingAnalystCapability()], fakeMessages);
 
         var outcome = await service.AnswerAsync(BusinessId, "Anything?", CancellationToken.None);
 
@@ -335,7 +349,7 @@ public class AnalystOrchestrationServiceTests
     {
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseResponse("thisCapabilityDoesNotExist", Args(new { }), "tu_unknown"));
-        var service = new AnalystOrchestrationService([], fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+        var service = NewService([], fakeMessages);
 
         var outcome = await service.AnswerAsync(BusinessId, "Anything?", CancellationToken.None);
 
@@ -352,7 +366,7 @@ public class AnalystOrchestrationServiceTests
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseResponse("getConversationsByDay", Args(new { range = "7d" }), "tu_1"));
         fakeMessages.Enqueue(TextResponse("You had 3 conversations on September 1st."));
-        var service = new AnalystOrchestrationService([capability], fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+        var service = NewService([capability], fakeMessages);
 
         var outcome = await service.AnswerAsync(BusinessId, "How many conversations on Sept 1?", CancellationToken.None);
 
@@ -400,7 +414,7 @@ public class AnalystOrchestrationServiceTests
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseResponse("getHandledBySnapshot", Args(new { }), "tu_snapshot"));
         fakeMessages.Enqueue(TextResponse(trendFreeSynthesisText));
-        var service = new AnalystOrchestrationService([capability], fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+        var service = NewService([capability], fakeMessages);
 
         var outcome = await service.AnswerAsync(
             BusinessId, "How has AI-vs-human handling trended over the last 30 days?", CancellationToken.None);
@@ -445,7 +459,7 @@ public class AnalystOrchestrationServiceTests
     public async Task AnswerAsync_ClaudeCallFailsDuringSelection_ReturnsClaudeCallFailed_NeverThrows(Exception exception)
     {
         var fakeMessages = new SequencedFakeMessageService { ExceptionToThrow = exception };
-        var service = new AnalystOrchestrationService([], fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+        var service = NewService([], fakeMessages);
 
         var outcome = await service.AnswerAsync(BusinessId, "Anything?", CancellationToken.None);
 
@@ -464,7 +478,7 @@ public class AnalystOrchestrationServiceTests
         var capability = new RecordingAnalystCapability { Name = "getConversationsByDay" };
         var fakeMessages = new SelectionThenThrowingMessageService(
             ToolUseResponse("getConversationsByDay", Args(new { range = "7d" }), "tu_1"), exception);
-        var service = new AnalystOrchestrationService([capability], fakeMessages, NullLogger<AnalystOrchestrationService>.Instance);
+        var service = NewService([capability], fakeMessages);
 
         var outcome = await service.AnswerAsync(BusinessId, "Anything?", CancellationToken.None);
 
@@ -482,12 +496,188 @@ public class AnalystOrchestrationServiceTests
         var capturingLogger = new CapturingLogger<AnalystOrchestrationService>();
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(TextResponse("some plausible-sounding text"));
-        var service = new AnalystOrchestrationService([], fakeMessages, capturingLogger);
+        var service = NewService([], fakeMessages, logger: capturingLogger);
 
         await service.AnswerAsync(BusinessId, distinctiveQuestion, CancellationToken.None);
 
         Assert.NotEmpty(capturingLogger.Entries);
         Assert.DoesNotContain(capturingLogger.Entries, e => e.Message.Contains(distinctiveQuestion));
+    }
+
+    // ── A1 Slice 4b (design §10.2): invocation capture at A4/A5 ────────
+
+    // T-A4b1. Mutations: Guid.NewGuid() per call; Sequence order swapped
+    // (A4 takes 1, A5 takes 0); the two Operations swapped; a different
+    // BusinessId; one Sequence value reused for both calls.
+    [Fact]
+    public async Task AnswerAsync_Answered_RecordsSelectionSeq0AndSynthesisSeq1_UnderOneCorrelation()
+    {
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var capability = new RecordingAnalystCapability { Name = "getConversationsByDay" };
+        var fakeMessages = new SequencedFakeMessageService();
+        fakeMessages.Enqueue(ToolUseResponse("getConversationsByDay", Args(new { range = "7d" }), "tu_1"));
+        fakeMessages.Enqueue(TextResponse("Here is the summary."));
+        var service = NewService([capability], fakeMessages, capture);
+
+        var outcome = await service.AnswerAsync(BusinessId, "How many conversations this week?", CancellationToken.None);
+
+        Assert.Equal(AnalystOutcomeType.Answered, outcome.Type);
+        var records = capture.ForBusiness(BusinessId);
+        Assert.Equal(2, records.Count);
+        var (selection, synthesis) = (records[0], records[1]);
+        Assert.Equal(selection.CorrelationId, synthesis.CorrelationId);
+        Assert.Equal(AiOperations.AnalystSelection, selection.Operation);
+        Assert.Equal(0, selection.Sequence);
+        Assert.Equal(AiOperations.AnalystSynthesis, synthesis.Operation);
+        Assert.Equal(1, synthesis.Sequence);
+        Assert.All(records, r =>
+        {
+            Assert.Equal(BusinessId, r.BusinessId);
+            Assert.Null(r.ConversationId);
+            Assert.Equal(AiProviders.Anthropic, r.Provider);
+            Assert.Equal(AiOutcomes.Succeeded, r.Outcome);
+        });
+    }
+
+    // T-A4b2 (§14 Q1 ruling): every path that ends after the selection call
+    // records exactly one row. Mutation: the selection context takes
+    // Sequence 1.
+    [Theory]
+    [InlineData("NoToolUse", AnalystOutcomeType.Refused)]
+    [InlineData("OverCeiling", AnalystOutcomeType.Refused)]
+    [InlineData("NotSupportedReplay", AnalystOutcomeType.ClaudeCallFailed)]
+    [InlineData("CapabilityFailed", AnalystOutcomeType.CapabilityFailed)]
+    public async Task AnswerAsync_PathEndsAfterSelection_RecordsExactlyOneSelectionRowSeq0(string path, AnalystOutcomeType expectedOutcome)
+    {
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var capabilities = new[]
+        {
+            new RecordingAnalystCapability { Name = "getConversationsByDay", ResultIsError = path == "CapabilityFailed" },
+            new RecordingAnalystCapability { Name = "getConversationStatusDistribution" },
+            new RecordingAnalystCapability { Name = "getHandoffsByDay" },
+            new RecordingAnalystCapability { Name = "getTicketStatusDistribution" },
+        };
+        var fakeMessages = new SequencedFakeMessageService();
+        fakeMessages.Enqueue(path switch
+        {
+            "NoToolUse" => TextResponse("some plausible-sounding text"),
+            "OverCeiling" => MultiToolUseResponse(capabilities.Select((c, i) => (c.Name, Args(new { range = "7d" }), $"tu_{i}")).ToList()),
+            "NotSupportedReplay" => ToolUseWithThinkingResponse("getConversationsByDay", Args(new { range = "7d" }), "tu_1"),
+            "CapabilityFailed" => ToolUseResponse("getConversationsByDay", Args(new { range = "7d" }), "tu_1"),
+            _ => throw new ArgumentOutOfRangeException(nameof(path)),
+        });
+        var service = NewService(capabilities, fakeMessages, capture);
+
+        var outcome = await service.AnswerAsync(BusinessId, "Anything?", CancellationToken.None);
+
+        Assert.Equal(expectedOutcome, outcome.Type);
+        var record = Assert.Single(capture.ForBusiness(BusinessId));
+        Assert.Equal(AiOperations.AnalystSelection, record.Operation);
+        Assert.Equal(0, record.Sequence);
+        Assert.Equal(AiOutcomes.Succeeded, record.Outcome);
+    }
+
+    public static IEnumerable<object[]> SelectionOrSynthesisFailureExceptions() =>
+        ClaudeFailureExceptions().Append([new TaskCanceledException("Simulated timeout")]);
+
+    // T-A4b3. Mutations: swallow the selection failure inside the call site
+    // (outcome changes); or let the call site see a different exception
+    // type than the provider threw (outcome changes).
+    [Theory]
+    [MemberData(nameof(SelectionOrSynthesisFailureExceptions))]
+    public async Task AnswerAsync_SelectionFails_StillClaudeCallFailed_RecordsOneFailedSelectionRowSeq0(Exception exception)
+    {
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var fakeMessages = new SequencedFakeMessageService { ExceptionToThrow = exception };
+        var service = NewService([], fakeMessages, capture);
+
+        var outcome = await service.AnswerAsync(BusinessId, "Anything?", CancellationToken.None);
+
+        Assert.Equal(AnalystOutcomeType.ClaudeCallFailed, outcome.Type);
+        var record = Assert.Single(capture.ForBusiness(BusinessId));
+        Assert.Equal(AiOperations.AnalystSelection, record.Operation);
+        Assert.Equal(0, record.Sequence);
+        Assert.Equal(AiOutcomes.Failed, record.Outcome);
+    }
+
+    // T-A4b4. Mutations: one Sequence value reused for both calls (the
+    // failed row's Seq 1 goes red); Sequence order swapped (both go red).
+    [Theory]
+    [MemberData(nameof(SelectionOrSynthesisFailureExceptions))]
+    public async Task AnswerAsync_SynthesisFails_StillClaudeCallFailed_RecordsSucceededSeq0AndFailedSeq1(Exception exception)
+    {
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var capability = new RecordingAnalystCapability { Name = "getConversationsByDay" };
+        var fakeMessages = new SelectionThenThrowingMessageService(
+            ToolUseResponse("getConversationsByDay", Args(new { range = "7d" }), "tu_1"), exception);
+        var service = NewService([capability], fakeMessages, capture);
+
+        var outcome = await service.AnswerAsync(BusinessId, "Anything?", CancellationToken.None);
+
+        Assert.Equal(AnalystOutcomeType.ClaudeCallFailed, outcome.Type);
+        var records = capture.ForBusiness(BusinessId);
+        Assert.Equal(2, records.Count);
+        Assert.Equal(records[0].CorrelationId, records[1].CorrelationId);
+        Assert.Equal(AiOperations.AnalystSelection, records[0].Operation);
+        Assert.Equal(0, records[0].Sequence);
+        Assert.Equal(AiOutcomes.Succeeded, records[0].Outcome);
+        Assert.Equal(AiOperations.AnalystSynthesis, records[1].Operation);
+        Assert.Equal(1, records[1].Sequence);
+        Assert.Equal(AiOutcomes.Failed, records[1].Outcome);
+    }
+
+    // T-A4b5. Mutation: hoist correlationId to a field.
+    [Fact]
+    public async Task AnswerAsync_TwoCallsOnOneInstance_GetDistinctCorrelationIds()
+    {
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var fakeMessages = new SequencedFakeMessageService();
+        fakeMessages.Enqueue(TextResponse("first"));
+        fakeMessages.Enqueue(TextResponse("second"));
+        var service = NewService([], fakeMessages, capture);
+
+        await service.AnswerAsync(BusinessId, "First question?", CancellationToken.None);
+        await service.AnswerAsync(BusinessId, "Second question?", CancellationToken.None);
+
+        var records = capture.ForBusiness(BusinessId);
+        Assert.Equal(2, records.Count);
+        Assert.NotEqual(records[0].CorrelationId, records[1].CorrelationId);
+    }
+
+    // T-A4b6. Mutation: change one call's model literal. Reverting to the
+    // identical "claude-sonnet-5" literal is value-equal and can't be seen
+    // here (design §10.2; caught by the verifier's grep instead).
+    [Fact]
+    public async Task AnswerAsync_BothCalls_SendAndRecordAnthropicModelsDefault()
+    {
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var capability = new RecordingAnalystCapability { Name = "getConversationsByDay" };
+        var fakeMessages = new SequencedFakeMessageService();
+        fakeMessages.Enqueue(ToolUseResponse("getConversationsByDay", Args(new { range = "7d" }), "tu_1"));
+        fakeMessages.Enqueue(TextResponse("Here is the summary."));
+        var service = NewService([capability], fakeMessages, capture);
+
+        await service.AnswerAsync(BusinessId, "How many conversations this week?", CancellationToken.None);
+
+        Assert.Equal(2, fakeMessages.Requests.Count);
+        Assert.All(fakeMessages.Requests, r => Assert.Equal(AnthropicModels.Default, r.Model.Raw()));
+        var records = capture.ForBusiness(BusinessId);
+        Assert.Equal(2, records.Count);
+        Assert.All(records, r => Assert.Equal(AnthropicModels.Default, r.Model));
+    }
+
+    // T-A4b7 (behaviour pin). Mutation: catch AnthropicNotConfiguredException
+    // in AnswerAsync and return Finish(ClaudeCallFailed, ...).
+    [Fact]
+    public async Task AnswerAsync_AnthropicNotConfigured_Propagates_RecordsNothing()
+    {
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var service = NewService([], new MissingAnthropicApiKeyMessageService(), capture);
+
+        await Assert.ThrowsAsync<AnthropicNotConfiguredException>(
+            () => service.AnswerAsync(BusinessId, "Anything?", CancellationToken.None));
+
+        Assert.Empty(capture.ForBusiness(BusinessId));
     }
 
     private sealed class ThrowingAnalystCapability : IAnalystCapability
