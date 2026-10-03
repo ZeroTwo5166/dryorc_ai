@@ -257,10 +257,11 @@ builder.Services.AddScoped<IKnowledgeRetrievalService, KnowledgeRetrievalService
 // Production callers so far are the Slice 4b call sites
 // (AnalystOrchestrationService, KnowledgeIndexingService); the customer-turn
 // call sites still use the raw clients until Slice 4a. The raw
-// clients stay registered as they are (DI lockdown is Slice 5), and the
-// rule (c) IUnauthorizedActionAuditWriter is deliberately not registered
-// here — it lands with its only caller.
+// clients stay registered as they are (DI lockdown is Slice 5). The rule (c)
+// IUnauthorizedActionAuditWriter lands with its only caller,
+// ClaudeReplyService (Slice 4a, rule (b)/(c)).
 builder.Services.AddScoped<IAiInvocationRecorder, AiInvocationRecorder>();
+builder.Services.AddScoped<IUnauthorizedActionAuditWriter, UnauthorizedActionAuditWriter>();
 builder.Services.AddScoped<IAnthropicInvoker, AnthropicInvoker>();
 builder.Services.AddScoped<IVoyageEmbeddingInvoker, VoyageEmbeddingInvoker>();
 

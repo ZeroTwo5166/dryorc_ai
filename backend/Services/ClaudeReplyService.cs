@@ -28,10 +28,19 @@ public interface IClaudeReplyService
     /// is HandledBy.Human (Step 9: a staff member has already replied — see
     /// Conversation.HandledBy's own doc comment) — the customer's own
     /// message (already committed by the time this is called) is never
-    /// affected either way.
+    /// affected either way. Throws ConversationBusinessMismatchException,
+    /// after writing the rule (c) audit row and before any provider call,
+    /// when the conversation does not belong to businessId (v11 §5).
     /// </summary>
     Task<AiReplyResult?> GenerateReplyAsync(Guid businessId, Guid conversationId, CancellationToken cancellationToken = default);
 }
+
+/// <summary>
+/// v11 §5 rule (c) step 3. Carries no conversation or business id: the
+/// audit row (written first) is the record; this only blocks the turn.
+/// </summary>
+public sealed class ConversationBusinessMismatchException()
+    : Exception("The conversation does not belong to the authenticated business; the AI reply was blocked.");
 
 /// <summary>
 /// Step 8: conversation reply. Step 12 added RAG grounding — retrieves the
@@ -65,6 +74,7 @@ public class ClaudeReplyService(
     IKnowledgeRetrievalService retrievalService,
     IToolDispatchService toolDispatchService,
     IConversationClassificationService classificationService,
+    IUnauthorizedActionAuditWriter auditWriter,
     ILogger<ClaudeReplyService> logger) : IClaudeReplyService
 {
     private const int MaxReplyTokens = 1024;
@@ -85,6 +95,14 @@ public class ClaudeReplyService(
         if (conversation is null)
         {
             return null;
+        }
+
+        // v11 §5 rule (b)/(c): checked once, here, before any provider-call context
+        // exists; A1/A2/A3/V3 inherit it (v11 §5:178).
+        if (conversation.BusinessId != businessId)
+        {
+            await auditWriter.WriteConversationBusinessMismatchBlockedAsync(businessId);
+            throw new ConversationBusinessMismatchException();
         }
 
         // Step 9: once a staff member has replied, HandledBy flips to Human
