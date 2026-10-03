@@ -265,6 +265,25 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         Assert.Contains("Knowledge base context", sentSystemPrompt);
     }
 
+    // T-V3c (A1 Slice 4a). Mutant: pass Guid.Empty as the conversation id to
+    // RetrieveAsync.
+    [Fact]
+    public async Task GenerateReplyAsync_PassesCheckedConversationIdToRetrieval()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+
+        var retrieval = new FakeKnowledgeRetrievalService();
+        var fake = new FakeMessageService();
+        var service = NewService(db, fake, retrieval, new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService());
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.Equal(1, retrieval.CallCount);
+        Assert.Equal(conversation.Id, retrieval.Requests[0].ConversationId);
+    }
+
     [Fact]
     public async Task GenerateReplyAsync_MultipleRetrievedChunks_NumberedInOrderInSystemPrompt()
     {

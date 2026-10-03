@@ -1,3 +1,4 @@
+using backend.Constants;
 using backend.Data;
 using backend.Enums;
 using Microsoft.EntityFrameworkCore;
@@ -13,7 +14,7 @@ namespace backend.Services;
 /// RelevanceThreshold are code constants for MVP, deliberately not
 /// configuration (see the class doc comments on each).
 /// </summary>
-public class KnowledgeRetrievalService(AppDbContext db, IVoyageEmbeddingClient embeddingClient) : IKnowledgeRetrievalService
+public class KnowledgeRetrievalService(AppDbContext db, IVoyageEmbeddingInvoker embeddingInvoker) : IKnowledgeRetrievalService
 {
     /// <summary>Max chunks returned per query. Tune here — not scattered through the query.</summary>
     public const int TopK = 5;
@@ -30,7 +31,7 @@ public class KnowledgeRetrievalService(AppDbContext db, IVoyageEmbeddingClient e
     public const float RelevanceThreshold = 0.5f;
 
     public async Task<IReadOnlyList<RetrievedKnowledgeChunk>> RetrieveAsync(
-        Guid businessId, string queryText, CancellationToken cancellationToken = default)
+        Guid businessId, Guid conversationId, string queryText, CancellationToken cancellationToken = default)
     {
         IReadOnlyList<float[]> embeddings;
         try
@@ -42,7 +43,7 @@ public class KnowledgeRetrievalService(AppDbContext db, IVoyageEmbeddingClient e
             // turn," not "break the conversation" — the opposite of Step
             // 11's write-path philosophy, where the same failure types are
             // fatal to the request. See this interface's own doc comment.
-            embeddings = await embeddingClient.EmbedAsync([queryText], VoyageInputType.Query, cancellationToken);
+            embeddings = await embeddingInvoker.EmbedAsync(new AiCallContext(businessId, AiOperations.KnowledgeRetrievalQuery, Guid.NewGuid(), 0, conversationId), [queryText], VoyageInputType.Query, cancellationToken);
         }
         catch (VoyageEmbeddingException)
         {

@@ -20,5 +20,5 @@ public record RetrievedKnowledgeChunk(
 public interface IKnowledgeRetrievalService
 {
     Task<IReadOnlyList<RetrievedKnowledgeChunk>> RetrieveAsync(
-        Guid businessId, string queryText, CancellationToken cancellationToken = default);
+        Guid businessId, Guid conversationId, string queryText, CancellationToken cancellationToken = default);
 }

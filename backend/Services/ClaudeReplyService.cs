@@ -154,7 +154,7 @@ public class ClaudeReplyService(
         {
             try
             {
-                retrievedChunks = await retrievalService.RetrieveAsync(businessId, queryText, cancellationToken);
+                retrievedChunks = await retrievalService.RetrieveAsync(businessId, conversationId, queryText, cancellationToken);
             }
             catch (Exception ex)
             {
