@@ -339,7 +339,9 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseResponse(new { primaryTag = (string?)null, secondaryTags = Array.Empty<string>() }));
         var classificationService = new ConversationClassificationService(
-            classificationDb, fakeMessages, classificationModeService, NullLoggerFor<ConversationClassificationService>());
+            classificationDb,
+            new AnthropicInvoker(fakeMessages, new ConcurrentCapturingAiInvocationRecorder(), NullLoggerFor<AnthropicInvoker>()),
+            classificationModeService, NullLoggerFor<ConversationClassificationService>());
 
         await classificationService.ClassifyAsync(businessId, conversation.Id, EmptyHistory, CancellationToken.None);
 
@@ -440,7 +442,9 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseResponse(new { primaryTag = (string?)null, secondaryTags = new[] { "refund" } }));
         var classificationService = new ConversationClassificationService(
-            db2, fakeMessages, new ConversationModeService(db2), NullLoggerFor<ConversationClassificationService>());
+            db2,
+            new AnthropicInvoker(fakeMessages, new ConcurrentCapturingAiInvocationRecorder(), NullLoggerFor<AnthropicInvoker>()),
+            new ConversationModeService(db2), NullLoggerFor<ConversationClassificationService>());
 
         var task2 = classificationService.ClassifyAsync(businessId, conversation.Id, EmptyHistory, CancellationToken.None);
 

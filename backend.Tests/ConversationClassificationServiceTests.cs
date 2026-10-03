@@ -10,6 +10,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace backend.Tests;
@@ -170,6 +171,13 @@ public class ConversationClassificationServiceTests : IAsyncLifetime
 
     private static readonly List<MessageParam> EmptyHistory = [];
 
+    // A1 Slice 4a (design §6.1): the fake goes behind a real AnthropicInvoker
+    // with a non-persisting capture recorder, so nothing reaches
+    // AiProviderInvocations and no cleanup is needed for it.
+    private static AnthropicInvoker Invoker(
+        SequencedFakeMessageService fakeMessages, ConcurrentCapturingAiInvocationRecorder? recorder = null) =>
+        new(fakeMessages, recorder ?? new ConcurrentCapturingAiInvocationRecorder(), NullLogger<AnthropicInvoker>.Instance);
+
     // ── §B: cross-tenant allowed-tag union — repository-backed ───────
 
     [Fact]
@@ -180,7 +188,7 @@ public class ConversationClassificationServiceTests : IAsyncLifetime
         var modeService = scope.ServiceProvider.GetRequiredService<IConversationModeService>();
         var logger = new CapturingLogger<ConversationClassificationService>();
         var fakeMessages = new SequencedFakeMessageService();
-        var classification = new ConversationClassificationService(db, fakeMessages, modeService, logger);
+        var classification = new ConversationClassificationService(db, Invoker(fakeMessages), modeService, logger);
 
         var businessAId = await CreateBusinessAsync(db);
         var businessBId = await CreateBusinessAsync(db);
@@ -209,7 +217,7 @@ public class ConversationClassificationServiceTests : IAsyncLifetime
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var modeService = scope.ServiceProvider.GetRequiredService<IConversationModeService>();
         var classification = new ConversationClassificationService(
-            db, new SequencedFakeMessageService(), modeService, new CapturingLogger<ConversationClassificationService>());
+            db, Invoker(new SequencedFakeMessageService()), modeService, new CapturingLogger<ConversationClassificationService>());
 
         var businessAId = await CreateBusinessAsync(db);
         var businessBId = await CreateBusinessAsync(db);
@@ -231,7 +239,7 @@ public class ConversationClassificationServiceTests : IAsyncLifetime
         var modeService = scope.ServiceProvider.GetRequiredService<IConversationModeService>();
         var logger = new CapturingLogger<ConversationClassificationService>();
         var fakeMessages = new SequencedFakeMessageService();
-        var classification = new ConversationClassificationService(db, fakeMessages, modeService, logger);
+        var classification = new ConversationClassificationService(db, Invoker(fakeMessages), modeService, logger);
 
         var businessId = await CreateBusinessAsync(db);
         var widgetId = await CreateWidgetAsync(db, businessId);
@@ -269,7 +277,7 @@ public class ConversationClassificationServiceTests : IAsyncLifetime
         var modeService = scope.ServiceProvider.GetRequiredService<IConversationModeService>();
         var logger = new CapturingLogger<ConversationClassificationService>();
         var fakeMessages = new SequencedFakeMessageService();
-        var classification = new ConversationClassificationService(db, fakeMessages, modeService, logger);
+        var classification = new ConversationClassificationService(db, Invoker(fakeMessages), modeService, logger);
 
         var businessId = await CreateBusinessAsync(db);
         var widgetId = await CreateWidgetAsync(db, businessId);
@@ -299,7 +307,7 @@ public class ConversationClassificationServiceTests : IAsyncLifetime
         var modeService = scope.ServiceProvider.GetRequiredService<IConversationModeService>();
         var logger = new CapturingLogger<ConversationClassificationService>();
         var fakeMessages = new SequencedFakeMessageService();
-        var classification = new ConversationClassificationService(db, fakeMessages, modeService, logger);
+        var classification = new ConversationClassificationService(db, Invoker(fakeMessages), modeService, logger);
 
         var businessId = await CreateBusinessAsync(db);
         var widgetId = await CreateWidgetAsync(db, businessId);
@@ -334,7 +342,7 @@ public class ConversationClassificationServiceTests : IAsyncLifetime
         var modeService = scope.ServiceProvider.GetRequiredService<IConversationModeService>();
         var logger = new CapturingLogger<ConversationClassificationService>();
         var fakeMessages = new SequencedFakeMessageService();
-        var classification = new ConversationClassificationService(db, fakeMessages, modeService, logger);
+        var classification = new ConversationClassificationService(db, Invoker(fakeMessages), modeService, logger);
 
         var businessId = await CreateBusinessAsync(db);
         var widgetId = await CreateWidgetAsync(db, businessId);
@@ -362,7 +370,7 @@ public class ConversationClassificationServiceTests : IAsyncLifetime
         var modeService = scope.ServiceProvider.GetRequiredService<IConversationModeService>();
         var fakeMessages = new SequencedFakeMessageService();
         var classification = new ConversationClassificationService(
-            db, fakeMessages, modeService, new CapturingLogger<ConversationClassificationService>());
+            db, Invoker(fakeMessages), modeService, new CapturingLogger<ConversationClassificationService>());
 
         var businessId = await CreateBusinessAsync(db);
         var widgetId = await CreateWidgetAsync(db, businessId);
@@ -379,6 +387,130 @@ public class ConversationClassificationServiceTests : IAsyncLifetime
         var toolChoiceTool = Assert.IsType<ToolChoiceTool>(request.ToolChoice!.Value);
         Assert.Equal("classifyConversation", toolChoiceTool.Name);
         Assert.Single(request.Tools);
+    }
+
+    // ── A1 Slice 4a (design §6.2 "A3"): the call goes through IAnthropicInvoker ──
+
+    /// <summary>
+    /// T-A3a. Mutation: wrong Operation; ConversationId omitted (null);
+    /// revert to the raw IMessageService (0 records).
+    /// </summary>
+    [Fact]
+    public async Task ClassifyAsync_Success_RecordsOneConversationClassificationRowAtSeq0()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var modeService = scope.ServiceProvider.GetRequiredService<IConversationModeService>();
+        var fakeMessages = new SequencedFakeMessageService();
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var classification = new ConversationClassificationService(
+            db, Invoker(fakeMessages, capture), modeService, new CapturingLogger<ConversationClassificationService>());
+
+        var businessId = await CreateBusinessAsync(db);
+        var widgetId = await CreateWidgetAsync(db, businessId);
+        var conversation = await CreateConversationAsync(
+            db, businessId, widgetId, tags: [], primaryTag: null, effectiveMode: ConversationMode.Auto);
+
+        fakeMessages.Enqueue(ToolUseResponse(new { primaryTag = "general", secondaryTags = Array.Empty<string>() }));
+
+        await classification.ClassifyAsync(businessId, conversation.Id, EmptyHistory, CancellationToken.None);
+
+        var record = Assert.Single(capture.ForBusiness(businessId));
+        Assert.Equal(AiOperations.ConversationClassification, record.Operation);
+        Assert.Equal(0, record.Sequence);
+        Assert.Equal(businessId, record.BusinessId);
+        Assert.Equal(conversation.Id, record.ConversationId);
+        Assert.Equal(AiProviders.Anthropic, record.Provider);
+    }
+
+    /// <summary>
+    /// T-A3b (owner ruling 2026-10-03: a new test; design §6.2 :439 cites a
+    /// failure scenario this class never had). Mutation: an inner try whose
+    /// catch (Exception) returns without LogOutcome — red at the
+    /// ClaudeCallFailed assertion.
+    /// </summary>
+    [Fact]
+    public async Task ClassifyAsync_HttpRequestException_LogsClaudeCallFailed_LeavesTags_RecordsOneFailedRow()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var modeService = scope.ServiceProvider.GetRequiredService<IConversationModeService>();
+        var logger = new CapturingLogger<ConversationClassificationService>();
+        var fakeMessages = new SequencedFakeMessageService { ExceptionToThrow = new HttpRequestException("Simulated network failure") };
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var classification = new ConversationClassificationService(db, Invoker(fakeMessages, capture), modeService, logger);
+
+        var businessId = await CreateBusinessAsync(db);
+        var widgetId = await CreateWidgetAsync(db, businessId);
+        var conversation = await CreateConversationAsync(
+            db, businessId, widgetId, tags: ["refund"], primaryTag: "refund", effectiveMode: ConversationMode.Manual);
+
+        await classification.ClassifyAsync(businessId, conversation.Id, EmptyHistory, CancellationToken.None);
+
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Warning && e.Message.Contains("ClaudeCallFailed"));
+
+        var persisted = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        Assert.Equal(["refund"], persisted.Tags);
+
+        var record = Assert.Single(capture.ForBusiness(businessId));
+        Assert.Equal(AiOutcomes.Failed, record.Outcome);
+        Assert.Equal(AiOperations.ConversationClassification, record.Operation);
+    }
+
+    /// <summary>T-A3c. Mutation: a static correlation id.</summary>
+    [Fact]
+    public async Task ClassifyAsync_TwoCalls_RecordDistinctCorrelationIds()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var modeService = scope.ServiceProvider.GetRequiredService<IConversationModeService>();
+        var fakeMessages = new SequencedFakeMessageService();
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var classification = new ConversationClassificationService(
+            db, Invoker(fakeMessages, capture), modeService, new CapturingLogger<ConversationClassificationService>());
+
+        var businessId = await CreateBusinessAsync(db);
+        var widgetId = await CreateWidgetAsync(db, businessId);
+        var conversation = await CreateConversationAsync(
+            db, businessId, widgetId, tags: [], primaryTag: null, effectiveMode: ConversationMode.Auto);
+
+        fakeMessages.Enqueue(ToolUseResponse(new { primaryTag = (string?)null, secondaryTags = Array.Empty<string>() }));
+        fakeMessages.Enqueue(ToolUseResponse(new { primaryTag = (string?)null, secondaryTags = Array.Empty<string>() }));
+
+        await classification.ClassifyAsync(businessId, conversation.Id, EmptyHistory, CancellationToken.None);
+        await classification.ClassifyAsync(businessId, conversation.Id, EmptyHistory, CancellationToken.None);
+
+        var records = capture.ForBusiness(businessId);
+        Assert.Equal(2, records.Count);
+        Assert.NotEqual(records[0].CorrelationId, records[1].CorrelationId);
+    }
+
+    /// <summary>
+    /// T-A3d. Mutation: change the model literal. A value-equal literal is
+    /// undetectable here (design §6.2 :441); the recorded model is the sent
+    /// model, so only the sent model is asserted (4b errata §3b).
+    /// </summary>
+    [Fact]
+    public async Task ClassifyAsync_SendsAnthropicModelsDefault()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var modeService = scope.ServiceProvider.GetRequiredService<IConversationModeService>();
+        var fakeMessages = new SequencedFakeMessageService();
+        var classification = new ConversationClassificationService(
+            db, Invoker(fakeMessages), modeService, new CapturingLogger<ConversationClassificationService>());
+
+        var businessId = await CreateBusinessAsync(db);
+        var widgetId = await CreateWidgetAsync(db, businessId);
+        var conversation = await CreateConversationAsync(
+            db, businessId, widgetId, tags: [], primaryTag: null, effectiveMode: ConversationMode.Auto);
+
+        fakeMessages.Enqueue(ToolUseResponse(new { primaryTag = (string?)null, secondaryTags = Array.Empty<string>() }));
+
+        await classification.ClassifyAsync(businessId, conversation.Id, EmptyHistory, CancellationToken.None);
+
+        Assert.NotEmpty(fakeMessages.Requests);
+        Assert.All(fakeMessages.Requests, r => Assert.Equal(AnthropicModels.Default, r.Model.Raw()));
     }
 
     private class FixedTenantAccessor(Guid? businessId) : ICurrentTenantAccessor
