@@ -1,6 +1,7 @@
 using Anthropic.Exceptions;
 using Anthropic.Models.Messages;
 using Anthropic.Services;
+using backend.Constants;
 using backend.Data;
 using backend.Enums;
 using backend.Models;
@@ -70,7 +71,7 @@ public sealed class ConversationBusinessMismatchException()
 /// </summary>
 public class ClaudeReplyService(
     AppDbContext db,
-    IMessageService messageService,
+    IAnthropicInvoker anthropicInvoker,
     IKnowledgeRetrievalService retrievalService,
     IToolDispatchService toolDispatchService,
     IConversationClassificationService classificationService,
@@ -185,6 +186,11 @@ public class ClaudeReplyService(
 
         string replyText;
 
+        // v11 §4:154: this turn's one CustomerReply operation, owned here
+        // (created after rule (b) and retrieval); the reply call takes its
+        // Sequence from it.
+        var replyCorrelation = new CustomerReplyCorrelation();
+
         // Step 23K: tools are offered only when a customer is actually
         // resolved on this conversation — ToolDispatchContext.CustomerId is
         // non-nullable (IDispatchTool.cs), so a conversation with no
@@ -273,9 +279,9 @@ public class ClaudeReplyService(
         {
             try
             {
-                var response = await messageService.Create(new MessageCreateParams
+                var response = await anthropicInvoker.CreateMessageAsync(new AiCallContext(businessId, AiOperations.CustomerReply, replyCorrelation.CorrelationId, replyCorrelation.NextSequence(), conversationId), new MessageCreateParams
                 {
-                    Model = "claude-sonnet-5",
+                    Model = AnthropicModels.Default,
                     MaxTokens = MaxReplyTokens,
                     System = BuildSystemPrompt(business.Name, retrievedChunks),
                     Messages = messages,

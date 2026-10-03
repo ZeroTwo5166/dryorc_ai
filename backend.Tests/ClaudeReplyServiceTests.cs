@@ -95,16 +95,20 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         await _provider.DisposeAsync();
     }
 
+    // A1 Slice 4a (design §6.1): messages go behind a real AnthropicInvoker
+    // with a non-persisting capture recorder, so nothing reaches
+    // AiProviderInvocations and no cleanup is needed for it.
     private ClaudeReplyService NewService(
         AppDbContext db,
         IMessageService messages,
         IKnowledgeRetrievalService? retrieval = null,
         IToolDispatchService? toolDispatch = null,
         IConversationClassificationService? classification = null,
-        IUnauthorizedActionAuditWriter? auditWriter = null) =>
+        IUnauthorizedActionAuditWriter? auditWriter = null,
+        ConcurrentCapturingAiInvocationRecorder? recorder = null) =>
         new(
             db,
-            messages,
+            new AnthropicInvoker(messages, recorder ?? new ConcurrentCapturingAiInvocationRecorder(), NullLogger<AnthropicInvoker>.Instance),
             retrieval ?? new FakeKnowledgeRetrievalService(),
             toolDispatch ?? new ToolDispatchService([], messages, NullLogger<ToolDispatchService>.Instance),
             classification ?? new NoOpConversationClassificationService(),
@@ -231,6 +235,73 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
 
         var updatedConversation = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
         Assert.Equal(aiMessage.CreatedAt, updatedConversation.LastMessageAt);
+    }
+
+    // ── A1 Slice 4a (design §6.2 "A1"): the no-tool reply goes through IAnthropicInvoker ──
+
+    /// <summary>
+    /// T-A1a (v11 test 2). Mutation: revert A1 to the raw IMessageService
+    /// (0 records); A1's NextSequence() replaced by 1; ConversationId omitted.
+    /// </summary>
+    [Fact]
+    public async Task GenerateReplyAsync_NoToolReply_RecordsOneCustomerReplyRowAtSeq0()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+
+        var fake = new FakeMessageService();
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var service = NewService(db, fake, recorder: capture);
+
+        var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.NotNull(reply);
+        var record = Assert.Single(capture.ForBusiness(business.Id));
+        Assert.Equal(AiOperations.CustomerReply, record.Operation);
+        Assert.Equal(0, record.Sequence);
+        Assert.Equal(conversation.Id, record.ConversationId);
+        Assert.Equal(business.Id, record.BusinessId);
+    }
+
+    /// <summary>T-A1b. Mutation: hoist the turn's correlation to a field.</summary>
+    [Fact]
+    public async Task GenerateReplyAsync_TwoTurnsOnOneService_RecordDistinctCorrelationIds()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var service = NewService(db, new FakeMessageService(), recorder: capture);
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        var records = capture.ForBusiness(business.Id);
+        Assert.Equal(2, records.Count);
+        Assert.NotEqual(records[0].CorrelationId, records[1].CorrelationId);
+    }
+
+    /// <summary>
+    /// T-A1e. Mutation: change the model literal. A value-equal literal is
+    /// undetectable here (design §6.2, as T-A3d); the recorded model is the
+    /// sent model, so only the sent model is asserted (4b errata §3b).
+    /// </summary>
+    [Fact]
+    public async Task GenerateReplyAsync_NoToolReply_SendsAnthropicModelsDefault()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+
+        var fake = new FakeMessageService();
+        var service = NewService(db, fake);
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.NotEmpty(fake.Requests);
+        Assert.All(fake.Requests, r => Assert.Equal(AnthropicModels.Default, r.Model.Raw()));
     }
 
     // â”€â”€ Step 12: RAG retrieval wiring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -467,6 +538,9 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
     //    but a structurally different exception family (not the SDK's own
     //    typed hierarchy) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+    // T-A1c (A1 Slice 4a): also exactly one Failed CustomerReply record.
+    // Mutation (owner ruling 2026-10-03): revert A1 to the raw
+    // IMessageService (0 records).
     [Fact]
     public async Task GenerateReplyAsync_HttpRequestException_ReturnsNull_PersistsNothing()
     {
@@ -475,16 +549,24 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
 
         var fake = new FakeMessageService { ExceptionToThrow = new HttpRequestException("Simulated network failure") };
-        var service = NewService(db, fake, new FakeKnowledgeRetrievalService(), new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService());
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var service = NewService(db, fake, new FakeKnowledgeRetrievalService(), new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), recorder: capture);
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
         Assert.Null(reply);
         await AssertNoAiMessageOrLastMessageAtChangeAsync(db, conversation.Id);
+
+        var record = Assert.Single(capture.ForBusiness(business.Id));
+        Assert.Equal(AiOutcomes.Failed, record.Outcome);
+        Assert.Equal(AiOperations.CustomerReply, record.Operation);
     }
 
     // â”€â”€ Missing configuration — must NOT be swallowed into a null reply â”€
 
+    // T-A1d (A1 Slice 4a): also no record (the invoker rethrows
+    // AnthropicNotConfiguredException without one). Mutation: catch it at
+    // A1 and return null (ThrowsAsync red).
     [Fact]
     public async Task GenerateReplyAsync_MissingApiKeyConfiguration_ThrowsDistinctException_IsNotSwallowed()
     {
@@ -495,7 +577,8 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         // No real secrets touched — this constructs the exact stub
         // Program.cs registers when Anthropic:ApiKey is absent, directly,
         // independent of whatever's actually configured in this environment.
-        var service = NewService(db, new MissingAnthropicApiKeyMessageService(), new FakeKnowledgeRetrievalService(), new ToolDispatchService([], new MissingAnthropicApiKeyMessageService(), NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService());
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var service = NewService(db, new MissingAnthropicApiKeyMessageService(), new FakeKnowledgeRetrievalService(), new ToolDispatchService([], new MissingAnthropicApiKeyMessageService(), NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), recorder: capture);
 
         await Assert.ThrowsAsync<AnthropicNotConfiguredException>(
             () => service.GenerateReplyAsync(business.Id, conversation.Id));
@@ -505,6 +588,8 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         // change, same as the other failure tests, but reached via a throw
         // the caller must handle, not a quiet null.
         await AssertNoAiMessageOrLastMessageAtChangeAsync(db, conversation.Id);
+
+        Assert.Empty(capture.ForBusiness(business.Id));
     }
 
     // â”€â”€ Step 9: HandledBy gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

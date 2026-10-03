@@ -15,6 +15,19 @@ namespace backend.Services;
 public record ToolDispatchContext(Guid BusinessId, Guid CustomerId, Guid? ConversationId);
 
 /// <summary>
+/// The one CustomerReply operation of a customer turn (v11 §4:154): created by
+/// ClaudeReplyService.GenerateReplyAsync; the A1 call or each A2 loop
+/// iteration takes the next Sequence value.
+/// Not thread-safe by design: the reply operation's calls are sequential.
+/// </summary>
+public sealed class CustomerReplyCorrelation
+{
+    public Guid CorrelationId { get; } = Guid.NewGuid();
+    private int _nextSequence;
+    public int NextSequence() => _nextSequence++;
+}
+
+/// <summary>
 /// The result of executing one tool call. IsError maps directly onto the
 /// Anthropic `tool_result` block's own `is_error` field — a tool failure
 /// (validation, authorization denial, downstream error) must always be
