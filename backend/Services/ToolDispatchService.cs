@@ -1,6 +1,7 @@
 using Anthropic.Exceptions;
 using Anthropic.Models.Messages;
 using Anthropic.Services;
+using backend.Constants;
 using Microsoft.Extensions.Logging;
 
 namespace backend.Services;
@@ -22,7 +23,7 @@ namespace backend.Services;
 /// </summary>
 public class ToolDispatchService(
     IEnumerable<IDispatchTool> tools,
-    IMessageService messageService,
+    IAnthropicInvoker anthropicInvoker,
     ILogger<ToolDispatchService> logger) : IToolDispatchService
 {
     private const int MaxToolIterations = 10;
@@ -45,9 +46,9 @@ public class ToolDispatchService(
             Message response;
             try
             {
-                response = await messageService.Create(new MessageCreateParams
+                response = await anthropicInvoker.CreateMessageAsync(new AiCallContext(context.BusinessId, AiOperations.CustomerReply, context.ReplyCorrelation.CorrelationId, context.ReplyCorrelation.NextSequence(), context.ConversationId), new MessageCreateParams
                 {
-                    Model = "claude-sonnet-5",
+                    Model = AnthropicModels.Default,
                     MaxTokens = MaxReplyTokens,
                     System = systemPrompt,
                     Messages = messages,

@@ -2,6 +2,7 @@ using System.Net;
 using System.Text.Json;
 using Anthropic.Exceptions;
 using Anthropic.Models.Messages;
+using backend.Constants;
 using backend.Services;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
@@ -81,6 +82,18 @@ public class ToolDispatchServiceTests
         CustomerId: Guid.Parse("22222222-2222-2222-2222-222222222222"),
         ConversationId: Guid.Parse("33333333-3333-3333-3333-333333333333"),
         ReplyCorrelation: new CustomerReplyCorrelation());
+
+    // A1 Slice 4a (design §6.1): the fake goes behind a real AnthropicInvoker
+    // with a non-persisting capture recorder, so nothing reaches
+    // AiProviderInvocations.
+    private static ToolDispatchService NewService(
+        IEnumerable<IDispatchTool> tools,
+        SequencedFakeMessageService fakeMessages,
+        ConcurrentCapturingAiInvocationRecorder? recorder = null) =>
+        new(
+            tools,
+            new AnthropicInvoker(fakeMessages, recorder ?? new ConcurrentCapturingAiInvocationRecorder(), NullLogger<AnthropicInvoker>.Instance),
+            NullLogger<ToolDispatchService>.Instance);
 
     private static Usage FakeUsage() => new()
     {
@@ -172,7 +185,7 @@ public class ToolDispatchServiceTests
         var readTool = new RecordingReadOnlyTool();
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseWithThinkingResponse("getOrderStatus", Args(new { orderId = "1" }), "toolu_1"));
-        var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+        var service = NewService([readTool], fakeMessages);
 
         var outcome = await service.RunAsync(NewContext(), "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
 
@@ -187,7 +200,7 @@ public class ToolDispatchServiceTests
         var readTool = new RecordingReadOnlyTool();
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseWithUnrecognizedBlockResponse("getOrderStatus", Args(new { orderId = "1" }), "toolu_1"));
-        var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+        var service = NewService([readTool], fakeMessages);
 
         var outcome = await service.RunAsync(NewContext(), "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
 
@@ -203,7 +216,7 @@ public class ToolDispatchServiceTests
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseResponse("getOrderStatus", Args(new { orderId = "1" }), "toolu_1"));
         fakeMessages.Enqueue(TextResponse("Done."));
-        var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+        var service = NewService([readTool], fakeMessages);
 
         await service.RunAsync(NewContext(), "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
 
@@ -213,6 +226,8 @@ public class ToolDispatchServiceTests
             Assert.NotNull(r.Thinking);
             Assert.IsType<ThinkingConfigDisabled>(r.Thinking!.Value);
         });
+        // A1 Slice 4a T-A2e (design §6.2): the locked model constant is sent.
+        Assert.All(fakeMessages.Requests, r => Assert.Equal(AnthropicModels.Default, r.Model.Raw()));
     }
 
     [Fact]
@@ -220,7 +235,7 @@ public class ToolDispatchServiceTests
     {
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(TextResponse("Hello, how can I help?"));
-        var service = new ToolDispatchService([], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+        var service = NewService([], fakeMessages);
         var messages = new List<MessageParam>();
 
         var outcome = await service.RunAsync(NewContext(), "system prompt", messages, new HashSet<string>(), CancellationToken.None);
@@ -237,7 +252,7 @@ public class ToolDispatchServiceTests
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseResponse("getOrderStatus", Args(new { orderId = "123" }), "toolu_1"));
         fakeMessages.Enqueue(TextResponse("Your order has shipped!"));
-        var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+        var service = NewService([readTool], fakeMessages);
         var messages = new List<MessageParam>();
         var context = NewContext();
 
@@ -271,7 +286,7 @@ public class ToolDispatchServiceTests
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseResponse("updateCustomer", maliciousInput, "toolu_write_1", "msg_write_1"));
         fakeMessages.Enqueue(TextResponse("Done!"));
-        var service = new ToolDispatchService([writeTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+        var service = NewService([writeTool], fakeMessages);
         var context = NewContext();
 
         var outcome = await service.RunAsync(context, "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
@@ -294,7 +309,7 @@ public class ToolDispatchServiceTests
         fakeMessages.Enqueue(ToolUseResponse("getOrderStatus", Args(new { orderId = "1" }), "toolu_1", "msg_1"));
         fakeMessages.Enqueue(ToolUseResponse("getOrderStatus", Args(new { orderId = "2" }), "toolu_2", "msg_2"));
         fakeMessages.Enqueue(TextResponse("All done."));
-        var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+        var service = NewService([readTool], fakeMessages);
 
         var outcome = await service.RunAsync(NewContext(), "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
 
@@ -304,12 +319,38 @@ public class ToolDispatchServiceTests
         Assert.Equal(2, readTool.CallCount);
     }
 
+    // ── A1 Slice 4a T-A2a (design §6.2; v11 test 1): the loop's calls are one
+    // CustomerReply operation, carried by the context's correlation ──
+
+    [Fact]
+    public async Task RunAsync_ThreeCalls_RecordOneCustomerReplyCorrelationAtSeq0To2()
+    {
+        var readTool = new RecordingReadOnlyTool();
+        var fakeMessages = new SequencedFakeMessageService();
+        fakeMessages.Enqueue(ToolUseResponse("getOrderStatus", Args(new { orderId = "1" }), "toolu_1", "msg_1"));
+        fakeMessages.Enqueue(ToolUseResponse("getOrderStatus", Args(new { orderId = "2" }), "toolu_2", "msg_2"));
+        fakeMessages.Enqueue(TextResponse("All done."));
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var service = NewService([readTool], fakeMessages, capture);
+        var context = NewContext();
+
+        var outcome = await service.RunAsync(context, "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
+
+        Assert.Equal(ToolDispatchStatus.Completed, outcome.Status);
+        var records = capture.ForBusiness(context.BusinessId);
+        Assert.Equal(3, records.Count);
+        Assert.All(records, r => Assert.Equal(context.ReplyCorrelation.CorrelationId, r.CorrelationId));
+        Assert.Equal([0, 1, 2], records.Select(r => r.Sequence));
+        Assert.All(records, r => Assert.Equal(AiOperations.CustomerReply, r.Operation));
+        Assert.All(records, r => Assert.Equal(context.ConversationId, r.ConversationId));
+    }
+
     [Fact]
     public async Task RunAsync_CancellationRequested_ThrowsAndNeverCallsClaude()
     {
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(TextResponse("should never be reached"));
-        var service = new ToolDispatchService([], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+        var service = NewService([], fakeMessages);
         using var cts = new CancellationTokenSource();
         await cts.CancelAsync();
 
@@ -331,9 +372,11 @@ public class ToolDispatchServiceTests
         {
             fakeMessages.Enqueue(ToolUseResponse("getOrderStatus", Args(new { orderId = i.ToString() }), $"toolu_{i}", $"msg_{i}"));
         }
-        var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var service = NewService([readTool], fakeMessages, capture);
+        var context = NewContext();
 
-        var outcome = await service.RunAsync(NewContext(), "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
+        var outcome = await service.RunAsync(context, "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
 
         Assert.Equal(ToolDispatchStatus.IterationLimitReached, outcome.Status);
         Assert.Null(outcome.ResponseText);
@@ -342,6 +385,11 @@ public class ToolDispatchServiceTests
         // decision (see the implementation report), so this only asserts
         // "bounded and small," not a specific number.
         Assert.True(fakeMessages.CallCount is > 0 and < 50);
+
+        // A1 Slice 4a T-A2b (design §6.2): one record per iteration, Seq 0..9.
+        var records = capture.ForBusiness(context.BusinessId);
+        Assert.Equal(10, records.Count);
+        Assert.Equal(Enumerable.Range(0, 10), records.Select(r => r.Sequence));
     }
 
     // ── Step 48: disabledToolNames gating ──
@@ -358,7 +406,7 @@ public class ToolDispatchServiceTests
         var readTool = new RecordingReadOnlyTool();
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(TextResponse("Hi there."));
-        var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+        var service = NewService([readTool], fakeMessages);
 
         await service.RunAsync(
             NewContext(), "system prompt", new List<MessageParam>(), new HashSet<string> { readTool.Name }, CancellationToken.None);
@@ -380,7 +428,7 @@ public class ToolDispatchServiceTests
         // disabled tool anyway — defense in depth, not the primary gate.
         fakeMessages.Enqueue(ToolUseResponse(readTool.Name, Args(new { orderId = "1" }), "toolu_disabled"));
         fakeMessages.Enqueue(TextResponse("Handled."));
-        var service = new ToolDispatchService([readTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+        var service = NewService([readTool], fakeMessages);
         var messages = new List<MessageParam>();
 
         var outcome = await service.RunAsync(
@@ -399,7 +447,7 @@ public class ToolDispatchServiceTests
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseResponse("thisToolDoesNotExist", Args(new { }), "toolu_unknown"));
         fakeMessages.Enqueue(TextResponse("Sorry, I could not do that."));
-        var service = new ToolDispatchService([], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+        var service = NewService([], fakeMessages);
         var messages = new List<MessageParam>();
 
         var outcome = await service.RunAsync(NewContext(), "system prompt", messages, new HashSet<string>(), CancellationToken.None);
@@ -418,7 +466,7 @@ public class ToolDispatchServiceTests
         var fakeMessages = new SequencedFakeMessageService();
         fakeMessages.Enqueue(ToolUseResponse(throwingTool.Name, Args(new { }), "toolu_throw"));
         fakeMessages.Enqueue(TextResponse("Handled gracefully."));
-        var service = new ToolDispatchService([throwingTool], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+        var service = NewService([throwingTool], fakeMessages);
         var messages = new List<MessageParam>();
 
         var outcome = await service.RunAsync(NewContext(), "system prompt", messages, new HashSet<string>(), CancellationToken.None);
@@ -436,12 +484,20 @@ public class ToolDispatchServiceTests
     public async Task RunAsync_ClaudeCallFails_ReturnsClaudeCallFailed_NeverThrows(Exception exception)
     {
         var fakeMessages = new SequencedFakeMessageService { ExceptionToThrow = exception };
-        var service = new ToolDispatchService([], fakeMessages, NullLogger<ToolDispatchService>.Instance);
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var service = NewService([], fakeMessages, capture);
+        var context = NewContext();
 
-        var outcome = await service.RunAsync(NewContext(), "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
+        var outcome = await service.RunAsync(context, "system prompt", new List<MessageParam>(), new HashSet<string>(), CancellationToken.None);
 
         Assert.Equal(ToolDispatchStatus.ClaudeCallFailed, outcome.Status);
         Assert.Null(outcome.ResponseText);
+
+        // A1 Slice 4a T-A2d (design §6.2): the outcome above is unchanged, and
+        // the failed call is recorded once, at Seq 0.
+        var failed = capture.ForBusiness(context.BusinessId).Where(r => r.Outcome == AiOutcomes.Failed).ToList();
+        Assert.Single(failed);
+        Assert.Equal(0, failed[0].Sequence);
     }
 
     public static IEnumerable<object[]> ClaudeFailureExceptions()
