@@ -1,5 +1,7 @@
 ﻿using System.Net;
 using Anthropic.Exceptions;
+using Anthropic.Services;
+using backend.Constants;
 using backend.Data;
 using backend.Enums;
 using backend.Interfaces;
@@ -51,6 +53,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
                 PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()))
+            .AddScoped<IAuditLogService, AuditLogService>()
             .BuildServiceProvider();
 
         return Task.CompletedTask;
@@ -83,11 +86,45 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Customers\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Widgets\" WHERE \"BusinessId\" = ANY({ids})");
+            // Rule (c) audit rows: AuditLog.BusinessId is FK Restrict, so
+            // AuditLogs go before Businesses.
+            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AuditLogs\" WHERE \"BusinessId\" = ANY({ids})");
             await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = ANY({ids})");
         }
 
         await _provider.DisposeAsync();
     }
+
+    // A1 Slice 4a (design §6.1): messages go behind a real AnthropicInvoker
+    // with a non-persisting capture recorder, so nothing reaches
+    // AiProviderInvocations and no cleanup is needed for it.
+    private ClaudeReplyService NewService(
+        AppDbContext db,
+        IMessageService messages,
+        IKnowledgeRetrievalService? retrieval = null,
+        IToolDispatchService? toolDispatch = null,
+        IConversationClassificationService? classification = null,
+        IUnauthorizedActionAuditWriter? auditWriter = null,
+        ConcurrentCapturingAiInvocationRecorder? recorder = null) =>
+        new(
+            db,
+            new AnthropicInvoker(messages, recorder ?? new ConcurrentCapturingAiInvocationRecorder(), NullLogger<AnthropicInvoker>.Instance),
+            retrieval ?? new FakeKnowledgeRetrievalService(),
+            toolDispatch ?? NewToolDispatch([], messages),
+            classification ?? new NoOpConversationClassificationService(),
+            auditWriter ?? new UnauthorizedActionAuditWriter(
+                _provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<UnauthorizedActionAuditWriter>.Instance),
+            NullLogger<ClaudeReplyService>.Instance);
+
+    // A1 Slice 4a (design §6.1): the same wrapping for ToolDispatchService.
+    private static ToolDispatchService NewToolDispatch(
+        IEnumerable<IDispatchTool> tools,
+        IMessageService messages,
+        ConcurrentCapturingAiInvocationRecorder? recorder = null) =>
+        new(
+            tools,
+            new AnthropicInvoker(messages, recorder ?? new ConcurrentCapturingAiInvocationRecorder(), NullLogger<AnthropicInvoker>.Instance),
+            NullLogger<ToolDispatchService>.Instance);
 
     private async Task<(Business Business, Conversation Conversation)> SeedConversationWithOneCustomerMessageAsync(AppDbContext db)
     {
@@ -191,7 +228,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
 
         var fake = new FakeMessageService { ReplyText = "Yes, we ship to Denmark within 3-5 business days." };
-        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(db, fake, new FakeKnowledgeRetrievalService(), NewToolDispatch([], fake), new NoOpConversationClassificationService());
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -208,6 +245,73 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
 
         var updatedConversation = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
         Assert.Equal(aiMessage.CreatedAt, updatedConversation.LastMessageAt);
+    }
+
+    // ── A1 Slice 4a (design §6.2 "A1"): the no-tool reply goes through IAnthropicInvoker ──
+
+    /// <summary>
+    /// T-A1a (v11 test 2). Mutation: revert A1 to the raw IMessageService
+    /// (0 records); A1's NextSequence() replaced by 1; ConversationId omitted.
+    /// </summary>
+    [Fact]
+    public async Task GenerateReplyAsync_NoToolReply_RecordsOneCustomerReplyRowAtSeq0()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+
+        var fake = new FakeMessageService();
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var service = NewService(db, fake, recorder: capture);
+
+        var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.NotNull(reply);
+        var record = Assert.Single(capture.ForBusiness(business.Id));
+        Assert.Equal(AiOperations.CustomerReply, record.Operation);
+        Assert.Equal(0, record.Sequence);
+        Assert.Equal(conversation.Id, record.ConversationId);
+        Assert.Equal(business.Id, record.BusinessId);
+    }
+
+    /// <summary>T-A1b. Mutation: hoist the turn's correlation to a field.</summary>
+    [Fact]
+    public async Task GenerateReplyAsync_TwoTurnsOnOneService_RecordDistinctCorrelationIds()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var service = NewService(db, new FakeMessageService(), recorder: capture);
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        var records = capture.ForBusiness(business.Id);
+        Assert.Equal(2, records.Count);
+        Assert.NotEqual(records[0].CorrelationId, records[1].CorrelationId);
+    }
+
+    /// <summary>
+    /// T-A1e. Mutation: change the model literal. A value-equal literal is
+    /// undetectable here (design §6.2, as T-A3d); the recorded model is the
+    /// sent model, so only the sent model is asserted (4b errata §3b).
+    /// </summary>
+    [Fact]
+    public async Task GenerateReplyAsync_NoToolReply_SendsAnthropicModelsDefault()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+
+        var fake = new FakeMessageService();
+        var service = NewService(db, fake);
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.NotEmpty(fake.Requests);
+        Assert.All(fake.Requests, r => Assert.Equal(AnthropicModels.Default, r.Model.Raw()));
     }
 
     // â”€â”€ Step 12: RAG retrieval wiring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -228,7 +332,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             ],
         };
         var fake = new FakeMessageService { ReplyText = "Yes, we do." };
-        var service = new ClaudeReplyService(db, fake, retrieval, new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(db, fake, retrieval, NewToolDispatch([], fake), new NoOpConversationClassificationService());
 
         await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -240,6 +344,25 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         Assert.Contains("MARKER_CHUNK_ONE: we ship worldwide.", sentSystemPrompt);
         Assert.Contains("[1]", sentSystemPrompt);
         Assert.Contains("Knowledge base context", sentSystemPrompt);
+    }
+
+    // T-V3c (A1 Slice 4a). Mutant: pass Guid.Empty as the conversation id to
+    // RetrieveAsync.
+    [Fact]
+    public async Task GenerateReplyAsync_PassesCheckedConversationIdToRetrieval()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+
+        var retrieval = new FakeKnowledgeRetrievalService();
+        var fake = new FakeMessageService();
+        var service = NewService(db, fake, retrieval, NewToolDispatch([], fake), new NoOpConversationClassificationService());
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.Equal(1, retrieval.CallCount);
+        Assert.Equal(conversation.Id, retrieval.Requests[0].ConversationId);
     }
 
     [Fact]
@@ -260,7 +383,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             ],
         };
         var fake = new FakeMessageService();
-        var service = new ClaudeReplyService(db, fake, retrieval, new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(db, fake, retrieval, NewToolDispatch([], fake), new NoOpConversationClassificationService());
 
         await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -289,7 +412,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             ],
         };
         var fake = new FakeMessageService { ReplyText = "Here's what I found." };
-        var service = new ClaudeReplyService(db, fake, retrieval, new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(db, fake, retrieval, NewToolDispatch([], fake), new NoOpConversationClassificationService());
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
         Assert.NotNull(reply);
@@ -322,7 +445,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
 
         var fake = new FakeMessageService { ReplyText = "Plain reply." };
-        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance); // default: returns nothing
+        var service = NewService(db, fake, new FakeKnowledgeRetrievalService(), NewToolDispatch([], fake), new NoOpConversationClassificationService()); // default: returns nothing
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
         Assert.NotNull(reply);
@@ -349,7 +472,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         // regardless of the reason retrieval failed.
         var retrieval = new FakeKnowledgeRetrievalService { ExceptionToThrow = new InvalidOperationException("simulated unexpected retrieval failure") };
         var fake = new FakeMessageService { ReplyText = "Still works." };
-        var service = new ClaudeReplyService(db, fake, retrieval, new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(db, fake, retrieval, NewToolDispatch([], fake), new NoOpConversationClassificationService());
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -375,7 +498,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         {
             ExceptionToThrow = new AnthropicRateLimitException { StatusCode = HttpStatusCode.TooManyRequests, ResponseBody = "{}" },
         };
-        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(db, fake, new FakeKnowledgeRetrievalService(), NewToolDispatch([], fake), new NoOpConversationClassificationService());
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -394,7 +517,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         {
             ExceptionToThrow = new Anthropic5xxException { StatusCode = HttpStatusCode.InternalServerError, ResponseBody = "{}" },
         };
-        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(db, fake, new FakeKnowledgeRetrievalService(), NewToolDispatch([], fake), new NoOpConversationClassificationService());
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -413,7 +536,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         {
             ExceptionToThrow = new AnthropicApiException("Simulated API error") { StatusCode = HttpStatusCode.BadRequest, ResponseBody = "{}" },
         };
-        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(db, fake, new FakeKnowledgeRetrievalService(), NewToolDispatch([], fake), new NoOpConversationClassificationService());
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -425,6 +548,9 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
     //    but a structurally different exception family (not the SDK's own
     //    typed hierarchy) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+    // T-A1c (A1 Slice 4a): also exactly one Failed CustomerReply record.
+    // Mutation (owner ruling 2026-10-03): revert A1 to the raw
+    // IMessageService (0 records).
     [Fact]
     public async Task GenerateReplyAsync_HttpRequestException_ReturnsNull_PersistsNothing()
     {
@@ -433,16 +559,24 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
 
         var fake = new FakeMessageService { ExceptionToThrow = new HttpRequestException("Simulated network failure") };
-        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var service = NewService(db, fake, new FakeKnowledgeRetrievalService(), NewToolDispatch([], fake), new NoOpConversationClassificationService(), recorder: capture);
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
         Assert.Null(reply);
         await AssertNoAiMessageOrLastMessageAtChangeAsync(db, conversation.Id);
+
+        var record = Assert.Single(capture.ForBusiness(business.Id));
+        Assert.Equal(AiOutcomes.Failed, record.Outcome);
+        Assert.Equal(AiOperations.CustomerReply, record.Operation);
     }
 
     // â”€â”€ Missing configuration — must NOT be swallowed into a null reply â”€
 
+    // T-A1d (A1 Slice 4a): also no record (the invoker rethrows
+    // AnthropicNotConfiguredException without one). Mutation: catch it at
+    // A1 and return null (ThrowsAsync red).
     [Fact]
     public async Task GenerateReplyAsync_MissingApiKeyConfiguration_ThrowsDistinctException_IsNotSwallowed()
     {
@@ -453,7 +587,8 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         // No real secrets touched — this constructs the exact stub
         // Program.cs registers when Anthropic:ApiKey is absent, directly,
         // independent of whatever's actually configured in this environment.
-        var service = new ClaudeReplyService(db, new MissingAnthropicApiKeyMessageService(), new FakeKnowledgeRetrievalService(), new ToolDispatchService([], new MissingAnthropicApiKeyMessageService(), NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var capture = new ConcurrentCapturingAiInvocationRecorder();
+        var service = NewService(db, new MissingAnthropicApiKeyMessageService(), new FakeKnowledgeRetrievalService(), NewToolDispatch([], new MissingAnthropicApiKeyMessageService()), new NoOpConversationClassificationService(), recorder: capture);
 
         await Assert.ThrowsAsync<AnthropicNotConfiguredException>(
             () => service.GenerateReplyAsync(business.Id, conversation.Id));
@@ -463,6 +598,8 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         // change, same as the other failure tests, but reached via a throw
         // the caller must handle, not a quiet null.
         await AssertNoAiMessageOrLastMessageAtChangeAsync(db, conversation.Id);
+
+        Assert.Empty(capture.ForBusiness(business.Id));
     }
 
     // â”€â”€ Step 9: HandledBy gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -479,7 +616,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         await db.SaveChangesAsync();
 
         var fake = new FakeMessageService { ReplyText = "Should never be sent." };
-        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(db, fake, new FakeKnowledgeRetrievalService(), NewToolDispatch([], fake), new NoOpConversationClassificationService());
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -502,7 +639,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         Assert.Equal(HandledBy.Ai, conversationEntity.HandledBy);
 
         var fake = new FakeMessageService { ReplyText = "Normal AI reply." };
-        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(db, fake, new FakeKnowledgeRetrievalService(), NewToolDispatch([], fake), new NoOpConversationClassificationService());
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -535,7 +672,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
 
         var client = new Anthropic.AnthropicClient { ApiKey = apiKey };
-        var service = new ClaudeReplyService(db, client.Messages, new FakeKnowledgeRetrievalService(), new ToolDispatchService([], client.Messages, NullLogger<ToolDispatchService>.Instance), new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(db, client.Messages, new FakeKnowledgeRetrievalService(), NewToolDispatch([], client.Messages), new NoOpConversationClassificationService());
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -649,7 +786,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         var fakeDispatch = new FakeToolDispatchService { OutcomeToReturn = ToolDispatchOutcome.Completed("Fake dispatch reply.") };
         var messageService = new FakeMessageService(); // must never be called directly in this branch — asserted below
 
-        var service = new ClaudeReplyService(db, messageService, new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(db, messageService, new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService());
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
         // Proves the CustomerId-resolved branch actually routes through
@@ -670,6 +807,32 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         Assert.Equal("Fake dispatch reply.", aiMessage.Content);
     }
 
+    /// <summary>
+    /// T-A2c (A1 Slice 4a). Mutation: the dispatch context carries a static
+    /// shared correlation (equal CorrelationIds).
+    /// </summary>
+    [Fact]
+    public async Task GenerateReplyAsync_ResolvedCustomer_TwoTurns_DispatchContextCarriesDistinctReplyCorrelations()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithResolvedCustomerAsync(
+            db, "Test Customer", "test.customer@marker-test.invalid", "Where is my order?");
+
+        var fakeDispatch = new FakeToolDispatchService();
+        var service = NewService(db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService());
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+        var first = fakeDispatch.LastContext!.ReplyCorrelation;
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+        var second = fakeDispatch.LastContext!.ReplyCorrelation;
+
+        Assert.Equal(2, fakeDispatch.CallCount);
+        Assert.NotNull(first);
+        Assert.NotNull(second);
+        Assert.NotEqual(first.CorrelationId, second.CorrelationId);
+    }
+
     [Fact]
     public async Task GenerateReplyAsync_ResolvedCustomer_AttachesRegisteredToolToRealDispatchServicesClaudeCall()
     {
@@ -684,9 +847,9 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         // and FakeMessageService standing in for the real Anthropic client —
         // no live network call, but the real Tools-array-construction logic
         // (ToolDispatchService.RunAsync) genuinely runs.
-        var realDispatch = new ToolDispatchService([new GetCustomerTool(db)], fake, NullLogger<ToolDispatchService>.Instance);
+        var realDispatch = NewToolDispatch([new GetCustomerTool(db)], fake);
 
-        var service = new ClaudeReplyService(db, fake, new FakeKnowledgeRetrievalService(), realDispatch, new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(db, fake, new FakeKnowledgeRetrievalService(), realDispatch, new NoOpConversationClassificationService());
         await service.GenerateReplyAsync(business.Id, conversation.Id);
 
         Assert.Equal(1, fake.CallCount);
@@ -716,8 +879,8 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             cancelOrderToolEnabled: false);
 
         var fakeDispatch = new FakeToolDispatchService();
-        var service = new ClaudeReplyService(
-            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(
+            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService());
 
         await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -735,8 +898,8 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             cancelOrderToolEnabled: true);
 
         var fakeDispatch = new FakeToolDispatchService();
-        var service = new ClaudeReplyService(
-            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(
+            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService());
 
         await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -765,8 +928,8 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             refundToolEnabled: false);
 
         var fakeDispatch = new FakeToolDispatchService();
-        var service = new ClaudeReplyService(
-            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(
+            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService());
 
         await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -784,8 +947,8 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             refundToolEnabled: true);
 
         var fakeDispatch = new FakeToolDispatchService();
-        var service = new ClaudeReplyService(
-            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(
+            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService());
 
         await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -814,8 +977,8 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             shopifyReadToolsEnabled: false);
 
         var fakeDispatch = new FakeToolDispatchService();
-        var service = new ClaudeReplyService(
-            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(
+            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService());
 
         await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -833,8 +996,8 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             shopifyReadToolsEnabled: true);
 
         var fakeDispatch = new FakeToolDispatchService();
-        var service = new ClaudeReplyService(
-            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(
+            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService());
 
         await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -863,8 +1026,8 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             shopifyReadToolsEnabled: false);
 
         var fakeDispatch = new FakeToolDispatchService();
-        var service = new ClaudeReplyService(
-            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(
+            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService());
 
         await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -884,8 +1047,8 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             shopifyReadToolsEnabled: true);
 
         var fakeDispatch = new FakeToolDispatchService();
-        var service = new ClaudeReplyService(
-            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var service = NewService(
+            db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService());
 
         await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -915,8 +1078,8 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             "What name and email do you have on file for me? Please state them exactly as recorded, nothing else.");
 
         var client = new Anthropic.AnthropicClient { ApiKey = apiKey };
-        var toolDispatch = new ToolDispatchService([new GetCustomerTool(db)], client.Messages, NullLogger<ToolDispatchService>.Instance);
-        var service = new ClaudeReplyService(db, client.Messages, new FakeKnowledgeRetrievalService(), toolDispatch, new NoOpConversationClassificationService(), NullLogger<ClaudeReplyService>.Instance);
+        var toolDispatch = NewToolDispatch([new GetCustomerTool(db)], client.Messages);
+        var service = NewService(db, client.Messages, new FakeKnowledgeRetrievalService(), toolDispatch, new NoOpConversationClassificationService());
 
         var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -949,10 +1112,10 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
 
         var fake = new FakeMessageService { ReplyText = "A plain-branch reply." };
         var classification = new NoOpConversationClassificationService();
-        var service = new ClaudeReplyService(
+        var service = NewService(
             db, fake, new FakeKnowledgeRetrievalService(),
-            new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance),
-            classification, NullLogger<ClaudeReplyService>.Instance);
+            NewToolDispatch([], fake),
+            classification);
 
         await service.GenerateReplyAsync(business.Id, conversation.Id);
 
@@ -977,14 +1140,198 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
 
         var fake = new FakeMessageService { ReplyText = "A tool-dispatch-branch reply." };
         var classification = new NoOpConversationClassificationService();
-        var service = new ClaudeReplyService(
+        var service = NewService(
             db, fake, new FakeKnowledgeRetrievalService(),
-            new ToolDispatchService([], fake, NullLogger<ToolDispatchService>.Instance),
-            classification, NullLogger<ClaudeReplyService>.Instance);
+            NewToolDispatch([], fake),
+            classification);
 
         await service.GenerateReplyAsync(business.Id, conversation.Id);
 
         Assert.Equal(1, classification.CallCount);
+    }
+
+    // ── Step 27 Slice A1, Slice 4a: rule (b)/(c) conversation-business
+    // check (v11 §5; design billing-usage-a1-slice4a-design.md §2, §6.2) ──
+
+    /// <summary>
+    /// Seeds the authenticated business B1, and a second business B2 owning
+    /// conversation X with a resolved B2 customer (so a check placed after
+    /// retrieval would take the tool-dispatch branch). When
+    /// <paramref name="seedB1CustomerMessage"/> is set, also seeds a
+    /// Customer-role Message with BusinessId = B1 and ConversationId = X, so
+    /// GenerateReplyAsync(B1, X) finds history and a query text.
+    /// </summary>
+    private async Task<(Business B1, Conversation X)> SeedForeignConversationAsync(
+        AppDbContext db, bool seedB1CustomerMessage, HandledBy handledBy = HandledBy.Ai)
+    {
+        var b1 = new Business
+        {
+            Id = Guid.NewGuid(),
+            Name = $"Rule B Authenticated {Guid.NewGuid():N}",
+            TimeZone = "Europe/Copenhagen",
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        var b2 = new Business
+        {
+            Id = Guid.NewGuid(),
+            Name = $"Rule B Foreign {Guid.NewGuid():N}",
+            TimeZone = "Europe/Copenhagen",
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        var widget = new Widget
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = b2.Id,
+            Name = "Test Widget",
+            PublicKey = Guid.NewGuid().ToString("N"),
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        var customer = new Customer
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = b2.Id,
+            Name = "Foreign Customer",
+            Email = "foreign.customer@marker-test.invalid",
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        var x = new Conversation
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = b2.Id,
+            WidgetId = widget.Id,
+            CustomerId = customer.Id,
+            VisitorSessionId = Guid.NewGuid().ToString("N"),
+            Channel = "Website",
+            Status = ConversationStatus.Open,
+            HandledBy = handledBy,
+            CreatedAt = DateTimeOffset.UtcNow,
+            UpdatedAt = DateTimeOffset.UtcNow,
+        };
+        db.Businesses.Add(b1);
+        db.Businesses.Add(b2);
+        db.Widgets.Add(widget);
+        db.Customers.Add(customer);
+        db.Conversations.Add(x);
+        if (seedB1CustomerMessage)
+        {
+            db.Messages.Add(new Message
+            {
+                Id = Guid.NewGuid(),
+                BusinessId = b1.Id,
+                ConversationId = x.Id,
+                Role = MessageRole.Customer,
+                Content = "Do you ship to Denmark?",
+                CreatedAt = DateTimeOffset.UtcNow,
+            });
+        }
+        _businessIdsToClean.Add(b1.Id);
+        _businessIdsToClean.Add(b2.Id);
+        await db.SaveChangesAsync();
+
+        return (b1, x);
+    }
+
+    private async Task<List<AuditLog>> AuditRowsForBusinessAsync(Guid businessId)
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        return await db.AuditLogs.IgnoreQueryFilters().Where(a => a.BusinessId == businessId).ToListAsync();
+    }
+
+    // T-B1 (v11 test 13). Mutants: delete the check (no throw); move it below
+    // retrieval (retrieval CallCount 1); throw before the audit write, or
+    // drop the audit write (no audit row).
+    [Fact]
+    public async Task GenerateReplyAsync_ConversationOfAnotherBusiness_WritesAuditRowThenThrows_NoProviderCall()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (b1, x) = await SeedForeignConversationAsync(db, seedB1CustomerMessage: true);
+
+        var fake = new FakeMessageService();
+        var retrieval = new FakeKnowledgeRetrievalService();
+        var fakeDispatch = new FakeToolDispatchService();
+        var service = NewService(db, fake, retrieval, fakeDispatch, new NoOpConversationClassificationService());
+
+        await Assert.ThrowsAsync<ConversationBusinessMismatchException>(
+            () => service.GenerateReplyAsync(b1.Id, x.Id));
+
+        Assert.Equal(0, fake.CallCount);
+        Assert.Equal(0, retrieval.CallCount);
+        Assert.Equal(0, fakeDispatch.CallCount);
+
+        // Read through a fresh scope after the throw (v11 test 13(d)).
+        var row = Assert.Single(await AuditRowsForBusinessAsync(b1.Id));
+        Assert.Equal(AuditEventTypes.UnauthorizedActionBlocked, row.EventType);
+        Assert.Equal(AuditEntityTypes.Business, row.EntityType);
+        Assert.Equal(b1.Id.ToString(), row.EntityId);
+        Assert.Equal(b1.Id, row.BusinessId);
+        Assert.Null(row.ConversationId);
+        Assert.Equal(ActorType.Customer, row.Actor);
+        Assert.Null(row.OldValue);
+        Assert.Equal("ConversationBusinessMismatch", row.NewValue);
+
+        var foreignId = x.Id.ToString();
+        Assert.DoesNotContain(foreignId, row.EntityType);
+        Assert.DoesNotContain(foreignId, row.EntityId);
+        Assert.DoesNotContain(foreignId, row.EventType);
+        Assert.DoesNotContain(foreignId, row.NewValue!);
+        Assert.NotEqual(x.Id, row.CorrelationId);
+        Assert.NotEqual(x.Id, row.ChangedByUserId);
+    }
+
+    // T-B2. Mutant: move the check below the HandledBy return (returns null).
+    [Fact]
+    public async Task GenerateReplyAsync_ConversationOfAnotherBusiness_HandledByHuman_StillThrows()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (b1, x) = await SeedForeignConversationAsync(db, seedB1CustomerMessage: true, handledBy: HandledBy.Human);
+
+        var service = NewService(db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), new FakeToolDispatchService(), new NoOpConversationClassificationService());
+
+        await Assert.ThrowsAsync<ConversationBusinessMismatchException>(
+            () => service.GenerateReplyAsync(b1.Id, x.Id));
+
+        Assert.Single(await AuditRowsForBusinessAsync(b1.Id));
+    }
+
+    // T-B3. Mutant: move the check below the empty-history return (returns null).
+    [Fact]
+    public async Task GenerateReplyAsync_ConversationOfAnotherBusiness_NoHistoryForPair_StillThrows()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (b1, x) = await SeedForeignConversationAsync(db, seedB1CustomerMessage: false);
+
+        var service = NewService(db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), new FakeToolDispatchService(), new NoOpConversationClassificationService());
+
+        await Assert.ThrowsAsync<ConversationBusinessMismatchException>(
+            () => service.GenerateReplyAsync(b1.Id, x.Id));
+
+        Assert.Single(await AuditRowsForBusinessAsync(b1.Id));
+    }
+
+    // T-B4. Mutant: invert the check to == (this and every existing reply
+    // test throws).
+    [Fact]
+    public async Task GenerateReplyAsync_ConversationOfSameBusiness_DoesNotThrow_WritesNoAuditRow()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithOneCustomerMessageAsync(db);
+
+        var fake = new FakeMessageService { ReplyText = "Matched-business reply." };
+        var service = NewService(db, fake, new FakeKnowledgeRetrievalService(), NewToolDispatch([], fake), new NoOpConversationClassificationService());
+
+        var reply = await service.GenerateReplyAsync(business.Id, conversation.Id);
+
+        Assert.Equal("Matched-business reply.", reply?.Content);
+        Assert.Empty(await AuditRowsForBusinessAsync(business.Id));
     }
 
     private class FixedTenantAccessor(Guid? businessId) : ICurrentTenantAccessor

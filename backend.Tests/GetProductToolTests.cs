@@ -118,7 +118,7 @@ public class GetProductToolTests : IAsyncLifetime
         var tool = new GetProductTool(db, lookup);
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid()),
+            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid(), new CustomerReplyCorrelation()),
             Input("gid://shopify/Product/1"), CancellationToken.None);
 
         Assert.False(result.IsError);
@@ -144,7 +144,7 @@ public class GetProductToolTests : IAsyncLifetime
         var tool = new GetProductTool(db, lookup);
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid()),
+            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid(), new CustomerReplyCorrelation()),
             Input("HOODIE-BLU-M"), CancellationToken.None);
 
         Assert.False(result.IsError);
@@ -168,7 +168,7 @@ public class GetProductToolTests : IAsyncLifetime
         var tool = new GetProductTool(db, lookup);
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid()), Input("NO-SUCH-SKU"), CancellationToken.None);
+            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid(), new CustomerReplyCorrelation()), Input("NO-SUCH-SKU"), CancellationToken.None);
 
         Assert.True(result.IsError);
         Assert.Equal("I can't find a product matching that.", result.Content);
@@ -188,7 +188,7 @@ public class GetProductToolTests : IAsyncLifetime
         var tool = new GetProductTool(db, lookup);
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid()), Input("DUP-SKU"), CancellationToken.None);
+            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid(), new CustomerReplyCorrelation()), Input("DUP-SKU"), CancellationToken.None);
 
         Assert.True(result.IsError);
         Assert.Contains("more than one product", result.Content, StringComparison.OrdinalIgnoreCase);
@@ -207,7 +207,7 @@ public class GetProductToolTests : IAsyncLifetime
         var tool = new GetProductTool(db, lookup);
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid()), Input("gid://shopify/Product/1"), CancellationToken.None);
+            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid(), new CustomerReplyCorrelation()), Input("gid://shopify/Product/1"), CancellationToken.None);
 
         Assert.True(result.IsError);
         Assert.Contains("trouble reaching", result.Content, StringComparison.OrdinalIgnoreCase);
@@ -229,7 +229,7 @@ public class GetProductToolTests : IAsyncLifetime
         var tool = new GetProductTool(db, lookup);
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid()), Input("ABC-123"), CancellationToken.None);
+            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid(), new CustomerReplyCorrelation()), Input("ABC-123"), CancellationToken.None);
 
         Assert.True(result.IsError);
         Assert.Contains("trouble reaching", result.Content, StringComparison.OrdinalIgnoreCase);
@@ -248,7 +248,7 @@ public class GetProductToolTests : IAsyncLifetime
         var tool = new GetProductTool(db, new FakeShopifyProductLookupService());
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid()),
+            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid(), new CustomerReplyCorrelation()),
             new Dictionary<string, JsonElement>(), CancellationToken.None);
 
         Assert.True(result.IsError);
@@ -264,7 +264,7 @@ public class GetProductToolTests : IAsyncLifetime
         var tool = new GetProductTool(db, new FakeShopifyProductLookupService());
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid()), Input("   "), CancellationToken.None);
+            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid(), new CustomerReplyCorrelation()), Input("   "), CancellationToken.None);
 
         Assert.True(result.IsError);
     }
@@ -293,7 +293,7 @@ public class GetProductToolTests : IAsyncLifetime
         // arbitrary CustomerId and a null ConversationId must both succeed,
         // unlike GetOrderTool's Group A refusal for the identical inputs.
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), ConversationId: null),
+            new ToolDispatchContext(businessId, Guid.NewGuid(), ConversationId: null, new CustomerReplyCorrelation()),
             Input("gid://shopify/Product/1"), CancellationToken.None);
 
         Assert.False(result.IsError);

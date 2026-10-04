@@ -1,3 +1,4 @@
+using backend.Constants;
 using backend.Data;
 using backend.Enums;
 using backend.Interfaces;
@@ -31,6 +32,7 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
 {
     private ServiceProvider _provider = null!;
     private FakeVoyageEmbeddingClient _fakeVoyage = null!;
+    private readonly ConcurrentCapturingAiInvocationRecorder _capture = new();
     private readonly List<Guid> _businessIdsToClean = [];
 
     public Task InitializeAsync()
@@ -48,7 +50,10 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
                 PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()))
+            .AddLogging()
             .AddSingleton<IVoyageEmbeddingClient>(_fakeVoyage)
+            .AddSingleton<IAiInvocationRecorder>(_capture)
+            .AddScoped<IVoyageEmbeddingInvoker, VoyageEmbeddingInvoker>()
             .AddScoped<IKnowledgeRetrievalService, KnowledgeRetrievalService>()
             .BuildServiceProvider();
 
@@ -166,7 +171,7 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
         var retrieval = scope.ServiceProvider.GetRequiredService<IKnowledgeRetrievalService>();
         var businessId = await CreateBusinessAsync(db);
 
-        await retrieval.RetrieveAsync(businessId, "what is the return policy");
+        await retrieval.RetrieveAsync(businessId, Guid.NewGuid(),"what is the return policy");
 
         Assert.Single(_fakeVoyage.Requests);
         Assert.Equal(VoyageInputType.Query, _fakeVoyage.Requests[0].InputType);
@@ -186,7 +191,7 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
         var documentId = await SeedDocumentAsync(db, businessId, "Return Policy");
         var chunkId = await SeedChunkAsync(db, businessId, documentId, 0, "30-day returns.", VectorAtCosineDistance(queryVector, 0.05));
 
-        var results = await retrieval.RetrieveAsync(businessId, queryText);
+        var results = await retrieval.RetrieveAsync(businessId, Guid.NewGuid(),queryText);
 
         var result = Assert.Single(results);
         Assert.Equal(chunkId, result.KnowledgeChunkId);
@@ -212,7 +217,7 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
         await SeedChunkAsync(db, businessId, documentId, 1, "MARKER_NEAR", VectorAtCosineDistance(queryVector, 0.1));
         await SeedChunkAsync(db, businessId, documentId, 2, "MARKER_FAR_BUT_INCLUDED", VectorAtCosineDistance(queryVector, 0.45));
 
-        var results = await retrieval.RetrieveAsync(businessId, queryText);
+        var results = await retrieval.RetrieveAsync(businessId, Guid.NewGuid(),queryText);
 
         Assert.Equal(["MARKER_NEAR", "MARKER_MID", "MARKER_FAR_BUT_INCLUDED"], results.Select(r => r.Content));
     }
@@ -236,7 +241,7 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
             await SeedChunkAsync(db, businessId, documentId, i, $"CHUNK_{i}", VectorAtCosineDistance(queryVector, distances[i]));
         }
 
-        var results = await retrieval.RetrieveAsync(businessId, queryText);
+        var results = await retrieval.RetrieveAsync(businessId, Guid.NewGuid(),queryText);
 
         Assert.Equal(KnowledgeRetrievalService.TopK, results.Count);
         Assert.Equal(5, results.Count);
@@ -262,7 +267,7 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
         await SeedChunkAsync(db, businessId, documentId, 2, "EXCLUDED_JUST_OVER", VectorAtCosineDistance(queryVector, 0.51));
         await SeedChunkAsync(db, businessId, documentId, 3, "EXCLUDED_FAR", VectorAtCosineDistance(queryVector, 0.7));
 
-        var results = await retrieval.RetrieveAsync(businessId, queryText);
+        var results = await retrieval.RetrieveAsync(businessId, Guid.NewGuid(),queryText);
 
         Assert.Equal(["INCLUDED_NEAR", "INCLUDED_JUST_UNDER"], results.Select(r => r.Content));
     }
@@ -289,7 +294,7 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
         // ranked lower."
         await SeedChunkAsync(db, businessId, inactiveDocId, 0, "FROM_INACTIVE_DOC", VectorAtCosineDistance(queryVector, 0.05));
 
-        var results = await retrieval.RetrieveAsync(businessId, queryText);
+        var results = await retrieval.RetrieveAsync(businessId, Guid.NewGuid(),queryText);
 
         Assert.Equal(["FROM_ACTIVE_DOC"], results.Select(r => r.Content));
     }
@@ -302,7 +307,7 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
         var retrieval = scope.ServiceProvider.GetRequiredService<IKnowledgeRetrievalService>();
         var businessId = await CreateBusinessAsync(db);
 
-        var results = await retrieval.RetrieveAsync(businessId, "anything");
+        var results = await retrieval.RetrieveAsync(businessId, Guid.NewGuid(),"anything");
 
         Assert.Empty(results);
     }
@@ -324,7 +329,7 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
         var documentIdA = await SeedDocumentAsync(db, businessIdA, "Business A Doc");
         await SeedChunkAsync(db, businessIdA, documentIdA, 0, "BUSINESS_A_CONTENT", VectorAtCosineDistance(queryVector, 0.01));
 
-        var resultsForB = await retrieval.RetrieveAsync(businessIdB, queryText);
+        var resultsForB = await retrieval.RetrieveAsync(businessIdB, Guid.NewGuid(), queryText);
 
         Assert.Empty(resultsForB); // never leaks Business A's chunk, even as the only/globally-nearest candidate
     }
@@ -342,7 +347,7 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
         _fakeVoyage.ExceptionToThrow = new VoyageEmbeddingException("simulated Voyage outage");
         try
         {
-            var results = await retrieval.RetrieveAsync(businessId, "anything");
+            var results = await retrieval.RetrieveAsync(businessId, Guid.NewGuid(),"anything");
             Assert.Empty(results);
         }
         finally
@@ -362,7 +367,7 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
         _fakeVoyage.ExceptionToThrow = new VoyageNotConfiguredException();
         try
         {
-            var results = await retrieval.RetrieveAsync(businessId, "anything");
+            var results = await retrieval.RetrieveAsync(businessId, Guid.NewGuid(),"anything");
             Assert.Empty(results);
         }
         finally
@@ -424,7 +429,7 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
             await SeedChunkAsync(db, businessIdB, documentIdB, i, $"B_NOISE_{i}", VectorAtCosineDistance(queryVector, distance));
         }
 
-        var results = await retrieval.RetrieveAsync(businessIdA, queryText);
+        var results = await retrieval.RetrieveAsync(businessIdA, Guid.NewGuid(), queryText);
 
         // Not just "no cross-tenant leakage" (implied — none of Business B's
         // content markers appear) but the stronger, explicitly required
@@ -432,6 +437,75 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
         Assert.Equal(5, results.Count);
         Assert.Equal(expectedChunkIds.OrderBy(id => id), results.Select(r => r.KnowledgeChunkId).OrderBy(id => id));
         Assert.All(results, r => Assert.StartsWith("A_RELEVANT_", r.Content));
+    }
+
+    // ── A1 Slice 4a (design §6.2 V3): invocation capture at V3 ─────────
+
+    // T-V3a. Mutations: wrong Operation; ConversationId omitted; Guid.Empty
+    // as the business; revert to the raw IVoyageEmbeddingClient (0 records).
+    [Fact]
+    public async Task RetrieveAsync_RecordsOneKnowledgeRetrievalQueryRowSeq0_ForBusinessAndConversation()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var retrieval = scope.ServiceProvider.GetRequiredService<IKnowledgeRetrievalService>();
+        var businessId = await CreateBusinessAsync(db);
+        var conversationId = Guid.NewGuid();
+
+        await retrieval.RetrieveAsync(businessId, conversationId, "what is the return policy");
+
+        var record = Assert.Single(_capture.ForBusiness(businessId));
+        Assert.Equal(AiOperations.KnowledgeRetrievalQuery, record.Operation);
+        Assert.Equal(0, record.Sequence);
+        Assert.Equal(businessId, record.BusinessId);
+        Assert.Equal(conversationId, record.ConversationId);
+        Assert.Equal(1, record.InputItemCount);
+        Assert.Equal(AiProviders.Voyage, record.Provider);
+        Assert.Equal(AiOutcomes.Succeeded, record.Outcome);
+    }
+
+    // T-V3b. Mutation: hoist the CorrelationId to a field.
+    [Fact]
+    public async Task RetrieveAsync_TwoCalls_RecordDistinctCorrelationIds()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var retrieval = scope.ServiceProvider.GetRequiredService<IKnowledgeRetrievalService>();
+        var businessId = await CreateBusinessAsync(db);
+        var conversationId = Guid.NewGuid();
+
+        await retrieval.RetrieveAsync(businessId, conversationId, "first question");
+        await retrieval.RetrieveAsync(businessId, conversationId, "second question");
+
+        var records = _capture.ForBusiness(businessId);
+        Assert.Equal(2, records.Count);
+        Assert.NotEqual(records[0].CorrelationId, records[1].CorrelationId);
+    }
+
+    // T-V3d. Mutation: catch-and-swallow the Voyage failure before the
+    // invoker is reached (0 records).
+    [Fact]
+    public async Task RetrieveAsync_VoyageEmbeddingException_StillReturnsEmpty_RecordsOneFailedRow()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var retrieval = scope.ServiceProvider.GetRequiredService<IKnowledgeRetrievalService>();
+        var businessId = await CreateBusinessAsync(db);
+
+        _fakeVoyage.ExceptionToThrow = new VoyageEmbeddingException("simulated Voyage outage");
+        try
+        {
+            var results = await retrieval.RetrieveAsync(businessId, Guid.NewGuid(), "anything");
+            Assert.Empty(results);
+        }
+        finally
+        {
+            _fakeVoyage.ExceptionToThrow = null;
+        }
+
+        var record = Assert.Single(_capture.ForBusiness(businessId));
+        Assert.Equal(AiOperations.KnowledgeRetrievalQuery, record.Operation);
+        Assert.Equal(AiOutcomes.Failed, record.Outcome);
     }
 
     private class FixedTenantAccessor(Guid? businessId) : ICurrentTenantAccessor

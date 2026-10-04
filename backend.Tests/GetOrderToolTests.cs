@@ -160,7 +160,7 @@ public class GetOrderToolTests : IAsyncLifetime
         var tool = new GetOrderTool(db, level2, orderLookup, new FakeOwnershipAuthorizationService(), new FakeAuditLogService());
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, customerId, conversationId), Input("#1001"), CancellationToken.None);
+            new ToolDispatchContext(businessId, customerId, conversationId, new CustomerReplyCorrelation()), Input("#1001"), CancellationToken.None);
 
         Assert.True(result.IsError);
         Assert.Contains("verify", result.Content, StringComparison.OrdinalIgnoreCase);
@@ -181,7 +181,7 @@ public class GetOrderToolTests : IAsyncLifetime
         var tool = new GetOrderTool(db, level2, orderLookup, new FakeOwnershipAuthorizationService(), new FakeAuditLogService());
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, customerId, ConversationId: null), Input("#1001"), CancellationToken.None);
+            new ToolDispatchContext(businessId, customerId, ConversationId: null, new CustomerReplyCorrelation()), Input("#1001"), CancellationToken.None);
 
         Assert.True(result.IsError);
         Assert.Contains("verify", result.Content, StringComparison.OrdinalIgnoreCase);
@@ -203,7 +203,7 @@ public class GetOrderToolTests : IAsyncLifetime
             db, new FakeLevel2VerificationChecker(verified: true), orderLookup, new FakeOwnershipAuthorizationService(), new FakeAuditLogService());
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, customerId, conversationId), Input("#1001"), CancellationToken.None);
+            new ToolDispatchContext(businessId, customerId, conversationId, new CustomerReplyCorrelation()), Input("#1001"), CancellationToken.None);
 
         Assert.True(result.IsError);
         Assert.Contains("trouble reaching", result.Content, StringComparison.OrdinalIgnoreCase);
@@ -227,7 +227,7 @@ public class GetOrderToolTests : IAsyncLifetime
         var tool = new GetOrderTool(db, new FakeLevel2VerificationChecker(verified: true), orderLookup, ownership, audit);
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, customerId, conversationId),
+            new ToolDispatchContext(businessId, customerId, conversationId, new CustomerReplyCorrelation()),
             Input("gid://shopify/Order/1"), CancellationToken.None);
 
         Assert.True(result.IsError);
@@ -272,7 +272,7 @@ public class GetOrderToolTests : IAsyncLifetime
             new FakeOwnershipAuthorizationService(new OwnershipCheckResult(true, OwnershipCheckFailureReason.None)), audit);
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, customerId, conversationId),
+            new ToolDispatchContext(businessId, customerId, conversationId, new CustomerReplyCorrelation()),
             Input("gid://shopify/Order/1"), CancellationToken.None);
 
         Assert.False(result.IsError);
@@ -305,7 +305,7 @@ public class GetOrderToolTests : IAsyncLifetime
             new FakeOwnershipAuthorizationService(new OwnershipCheckResult(true, OwnershipCheckFailureReason.None)), new FakeAuditLogService());
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, customerId, conversationId),
+            new ToolDispatchContext(businessId, customerId, conversationId, new CustomerReplyCorrelation()),
             Input("gid://shopify/Order/42"), CancellationToken.None);
 
         Assert.False(result.IsError);
@@ -328,7 +328,7 @@ public class GetOrderToolTests : IAsyncLifetime
         var tool = new GetOrderTool(db, new FakeLevel2VerificationChecker(verified: true), orderLookup, ownership, new FakeAuditLogService());
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, customerId, conversationId), Input("#9999"), CancellationToken.None);
+            new ToolDispatchContext(businessId, customerId, conversationId, new CustomerReplyCorrelation()), Input("#9999"), CancellationToken.None);
 
         Assert.True(result.IsError);
         Assert.Equal("I can't find an order matching that for your account.", result.Content);
@@ -351,7 +351,7 @@ public class GetOrderToolTests : IAsyncLifetime
             db, new FakeLevel2VerificationChecker(verified: true), orderLookup, new FakeOwnershipAuthorizationService(), new FakeAuditLogService());
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, customerId, conversationId), Input("1001"), CancellationToken.None);
+            new ToolDispatchContext(businessId, customerId, conversationId, new CustomerReplyCorrelation()), Input("1001"), CancellationToken.None);
 
         Assert.True(result.IsError);
         Assert.Contains("more than one order", result.Content, StringComparison.OrdinalIgnoreCase);
@@ -372,7 +372,7 @@ public class GetOrderToolTests : IAsyncLifetime
             db, new FakeLevel2VerificationChecker(verified: true), orderLookup, new FakeOwnershipAuthorizationService(), new FakeAuditLogService());
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, customerId, conversationId),
+            new ToolDispatchContext(businessId, customerId, conversationId, new CustomerReplyCorrelation()),
             Input("gid://shopify/Order/1"), CancellationToken.None);
 
         // Must be the reauthorization-safe Group D text, never the generic
@@ -396,7 +396,7 @@ public class GetOrderToolTests : IAsyncLifetime
             new FakeOwnershipAuthorizationService(), new FakeAuditLogService());
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, customerId, conversationId),
+            new ToolDispatchContext(businessId, customerId, conversationId, new CustomerReplyCorrelation()),
             new Dictionary<string, JsonElement>(), CancellationToken.None);
 
         Assert.True(result.IsError);

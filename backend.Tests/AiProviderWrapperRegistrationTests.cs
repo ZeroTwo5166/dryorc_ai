@@ -13,8 +13,8 @@ namespace backend.Tests;
 /// <summary>
 /// Step 27 Slice A1, Slice 3 — DI registration (decisions addendum OD-8,
 /// registration half): Program.cs registers IAiInvocationRecorder and both
-/// wrappers, and deliberately NOT IUnauthorizedActionAuditWriter (its only
-/// caller is Slice 4). Run against the real Program host via
+/// wrappers, and (since Slice 4a) IUnauthorizedActionAuditWriter for its
+/// only caller, ClaudeReplyService. Run against the real Program host via
 /// NivoraApiFactory, where the fake IMessageService/IVoyageEmbeddingClient
 /// sit UNDER the real wrappers and the real recorder writes to the dev DB.
 /// Not one of the design pass's §7 tests — added because nothing else
@@ -43,10 +43,9 @@ public class AiProviderWrapperRegistrationTests : IAsyncLifetime
         await _factory.DisposeAsync();
     }
 
-    // Mutation: drop any one of the three registrations; register the
-    // rule (c) audit writer.
+    // Mutation: drop any one of the four registrations.
     [Fact]
-    public async Task ProgramHost_ResolvesRecorderAndBothWrappers_DoesNotRegisterAuditWriter()
+    public async Task ProgramHost_ResolvesRecorderAndBothWrappers_RegistersAuditWriter()
     {
         await using var scope = _factory.Services.CreateAsyncScope();
         var services = scope.ServiceProvider;
@@ -54,7 +53,7 @@ public class AiProviderWrapperRegistrationTests : IAsyncLifetime
         Assert.IsType<AiInvocationRecorder>(services.GetRequiredService<IAiInvocationRecorder>());
         Assert.IsType<AnthropicInvoker>(services.GetRequiredService<IAnthropicInvoker>());
         Assert.IsType<VoyageEmbeddingInvoker>(services.GetRequiredService<IVoyageEmbeddingInvoker>());
-        Assert.Null(services.GetService<IUnauthorizedActionAuditWriter>());
+        Assert.IsType<UnauthorizedActionAuditWriter>(services.GetRequiredService<IUnauthorizedActionAuditWriter>());
     }
 
     // The DI-resolved Voyage wrapper over the test host's

@@ -16,13 +16,13 @@ public class FakeKnowledgeRetrievalService : IKnowledgeRetrievalService
     public List<RetrievedKnowledgeChunk> ChunksToReturn { get; set; } = [];
     public Exception? ExceptionToThrow { get; set; }
     public int CallCount { get; private set; }
-    public List<(Guid BusinessId, string QueryText)> Requests { get; } = [];
+    public List<(Guid BusinessId, Guid ConversationId, string QueryText)> Requests { get; } = [];
 
     public Task<IReadOnlyList<RetrievedKnowledgeChunk>> RetrieveAsync(
-        Guid businessId, string queryText, CancellationToken cancellationToken = default)
+        Guid businessId, Guid conversationId, string queryText, CancellationToken cancellationToken = default)
     {
         CallCount++;
-        Requests.Add((businessId, queryText));
+        Requests.Add((businessId, conversationId, queryText));
 
         if (ExceptionToThrow is not null)
         {

@@ -46,9 +46,8 @@ public class UnauthorizedActionAuditWriterTests : IAsyncLifetime
             .BuildServiceProvider();
 
         _logger = new EventCapturingLogger<UnauthorizedActionAuditWriter>();
-        // Not DI-registered: v11 does not assign DI registration to this
-        // slice — registration lands with the writer's first consumer.
-        // Constructed directly here.
+        // Constructed directly here; DI registration is covered by
+        // AiProviderWrapperRegistrationTests.
         _writer = new UnauthorizedActionAuditWriter(_provider.GetRequiredService<IServiceScopeFactory>(), _logger);
 
         return Task.CompletedTask;

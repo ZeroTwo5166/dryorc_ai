@@ -54,7 +54,7 @@ public interface IConversationClassificationService
 /// </summary>
 public class ConversationClassificationService(
     AppDbContext db,
-    IMessageService messageService,
+    IAnthropicInvoker anthropicInvoker,
     IConversationModeService modeService,
     ILogger<ConversationClassificationService> logger) : IConversationClassificationService
 {
@@ -71,9 +71,9 @@ public class ConversationClassificationService(
         Message response;
         try
         {
-            response = await messageService.Create(new MessageCreateParams
+            response = await anthropicInvoker.CreateMessageAsync(new AiCallContext(businessId, AiOperations.ConversationClassification, Guid.NewGuid(), 0, conversationId), new MessageCreateParams
             {
-                Model = "claude-sonnet-5",
+                Model = AnthropicModels.Default,
                 MaxTokens = MaxReplyTokens,
                 System = BuildSystemPrompt(),
                 Messages = messages.ToList(),

@@ -117,7 +117,7 @@ public class SearchProductsToolTests : IAsyncLifetime
         var tool = new SearchProductsTool(db, lookup);
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid()), Input("hoodie"), CancellationToken.None);
+            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid(), new CustomerReplyCorrelation()), Input("hoodie"), CancellationToken.None);
 
         Assert.False(result.IsError);
         Assert.Contains("Blue Hoodie", result.Content);
@@ -141,7 +141,7 @@ public class SearchProductsToolTests : IAsyncLifetime
         var tool = new SearchProductsTool(db, lookup);
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid()), Input("nonexistent"), CancellationToken.None);
+            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid(), new CustomerReplyCorrelation()), Input("nonexistent"), CancellationToken.None);
 
         Assert.False(result.IsError);
         Assert.Equal("No products matched that search.", result.Content);
@@ -160,7 +160,7 @@ public class SearchProductsToolTests : IAsyncLifetime
         var tool = new SearchProductsTool(db, lookup);
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid()), Input("anything"), CancellationToken.None);
+            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid(), new CustomerReplyCorrelation()), Input("anything"), CancellationToken.None);
 
         Assert.True(result.IsError);
         Assert.Contains("trouble reaching", result.Content, StringComparison.OrdinalIgnoreCase);
@@ -181,7 +181,7 @@ public class SearchProductsToolTests : IAsyncLifetime
         var tool = new SearchProductsTool(db, lookup);
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid()), Input("anything"), CancellationToken.None);
+            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid(), new CustomerReplyCorrelation()), Input("anything"), CancellationToken.None);
 
         Assert.True(result.IsError);
         Assert.Contains("trouble reaching", result.Content, StringComparison.OrdinalIgnoreCase);
@@ -200,7 +200,7 @@ public class SearchProductsToolTests : IAsyncLifetime
         var tool = new SearchProductsTool(db, new FakeShopifyProductLookupService());
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid()),
+            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid(), new CustomerReplyCorrelation()),
             new Dictionary<string, JsonElement>(), CancellationToken.None);
 
         Assert.True(result.IsError);
@@ -216,7 +216,7 @@ public class SearchProductsToolTests : IAsyncLifetime
         var tool = new SearchProductsTool(db, new FakeShopifyProductLookupService());
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid()), Input("   "), CancellationToken.None);
+            new ToolDispatchContext(businessId, Guid.NewGuid(), Guid.NewGuid(), new CustomerReplyCorrelation()), Input("   "), CancellationToken.None);
 
         Assert.True(result.IsError);
     }
@@ -237,7 +237,7 @@ public class SearchProductsToolTests : IAsyncLifetime
         var tool = new SearchProductsTool(db, lookup);
 
         var result = await tool.ExecuteAsync(
-            new ToolDispatchContext(businessId, Guid.NewGuid(), ConversationId: null), Input("anything"), CancellationToken.None);
+            new ToolDispatchContext(businessId, Guid.NewGuid(), ConversationId: null, new CustomerReplyCorrelation()), Input("anything"), CancellationToken.None);
 
         Assert.False(result.IsError);
     }

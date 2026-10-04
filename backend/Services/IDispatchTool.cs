@@ -11,8 +11,23 @@ namespace backend.Services;
 /// even if the model happens to include one — see the Step 19 tool-dispatch
 /// design approval's Decision 1/18 rationale for why trusted context must
 /// stay server-side and explicit.
+/// ReplyCorrelation is for the dispatch loop's provider calls only; tools
+/// never read or advance it.
 /// </summary>
-public record ToolDispatchContext(Guid BusinessId, Guid CustomerId, Guid? ConversationId);
+public record ToolDispatchContext(Guid BusinessId, Guid CustomerId, Guid? ConversationId, CustomerReplyCorrelation ReplyCorrelation);
+
+/// <summary>
+/// The one CustomerReply operation of a customer turn (v11 §4:154): created by
+/// ClaudeReplyService.GenerateReplyAsync; the A1 call or each A2 loop
+/// iteration takes the next Sequence value.
+/// Not thread-safe by design: the reply operation's calls are sequential.
+/// </summary>
+public sealed class CustomerReplyCorrelation
+{
+    public Guid CorrelationId { get; } = Guid.NewGuid();
+    private int _nextSequence;
+    public int NextSequence() => _nextSequence++;
+}
 
 /// <summary>
 /// The result of executing one tool call. IsError maps directly onto the

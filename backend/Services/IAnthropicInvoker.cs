@@ -9,9 +9,9 @@ namespace backend.Services;
 /// <see cref="Models.AiProviderInvocation"/> per call that reaches it — after
 /// the call returns or throws, then returns the same response or rethrows the
 /// same exception, with caller behavior otherwise unchanged (v11 §4:153).
-/// Production caller so far: AnalystOrchestrationService (Slice 4b). The
-/// customer-turn call sites still call IMessageService directly until they
-/// migrate in Slice 4a (errata 2 §1).
+/// Production callers: AnalystOrchestrationService (Slice 4b), and the
+/// customer-turn call sites ClaudeReplyService, ToolDispatchService and
+/// ConversationClassificationService (Slice 4a).
 /// </summary>
 public interface IAnthropicInvoker
 {
