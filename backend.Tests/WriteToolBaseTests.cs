@@ -69,7 +69,7 @@ public class HidingWriteTool : FakeWriteTool
 /// </summary>
 public class WriteToolBaseTests
 {
-    private static readonly ToolDispatchContext Context = new(Guid.NewGuid(), Guid.NewGuid(), null);
+    private static readonly ToolDispatchContext Context = new(Guid.NewGuid(), Guid.NewGuid(), null, new CustomerReplyCorrelation());
     private static readonly IReadOnlyDictionary<string, JsonElement> EmptyInput = new Dictionary<string, JsonElement>();
 
     [Fact]

@@ -204,7 +204,7 @@ public class ClaudeReplyService(
         // direct, tool-free Claude call below still runs exactly as it did.
         if (conversation.CustomerId is Guid customerId)
         {
-            var dispatchContext = new ToolDispatchContext(businessId, customerId, conversationId);
+            var dispatchContext = new ToolDispatchContext(businessId, customerId, conversationId, replyCorrelation);
 
             // Only added in this branch — the base prompt's own blanket "no
             // actions" disclaimer was written for a zero-tool world and

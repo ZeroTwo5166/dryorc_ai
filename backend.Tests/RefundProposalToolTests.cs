@@ -128,7 +128,7 @@ public class RefundProposalToolTests : IAsyncLifetime
         var (business, customer, conversation) = await SeedAsync(db, resolveCustomer: true);
 
         var tool = new RefundProposalTool(db);
-        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id);
+        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id, new CustomerReplyCorrelation());
         var input = Args(new { orderId = "gid://shopify/Order/12345", items = OneItem(), refundMethod = "OriginalPaymentMethod" });
 
         var result = await tool.ProposeAsync(context, input, CancellationToken.None);
@@ -163,7 +163,7 @@ public class RefundProposalToolTests : IAsyncLifetime
         // that does NOT match Conversation.CustomerId in the DB (which is
         // null) — proves ProposeAsync re-derives the customer fresh from the
         // Conversation row rather than trusting the context value.
-        var context = new ToolDispatchContext(business.Id, Guid.NewGuid(), conversation.Id);
+        var context = new ToolDispatchContext(business.Id, Guid.NewGuid(), conversation.Id, new CustomerReplyCorrelation());
         var input = Args(new { orderId = "gid://shopify/Order/12345", items = OneItem(), refundMethod = "OriginalPaymentMethod" });
 
         var result = await tool.ProposeAsync(context, input, CancellationToken.None);
@@ -183,7 +183,7 @@ public class RefundProposalToolTests : IAsyncLifetime
         var (business, customer, conversation) = await SeedAsync(db, resolveCustomer: true);
 
         var tool = new RefundProposalTool(db);
-        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id);
+        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id, new CustomerReplyCorrelation());
         var input = Args(new { orderId = "gid://shopify/Order/12345", items = Array.Empty<object>(), refundMethod = "OriginalPaymentMethod" });
 
         var result = await tool.ProposeAsync(context, input, CancellationToken.None);
@@ -205,7 +205,7 @@ public class RefundProposalToolTests : IAsyncLifetime
         var (business, customer, conversation) = await SeedAsync(db, resolveCustomer: true);
 
         var tool = new RefundProposalTool(db);
-        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id);
+        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id, new CustomerReplyCorrelation());
         var input = Args(new { orderId = "gid://shopify/Order/12345", items = OneItem(quantity: quantity), refundMethod = "OriginalPaymentMethod" });
 
         var result = await tool.ProposeAsync(context, input, CancellationToken.None);
@@ -225,7 +225,7 @@ public class RefundProposalToolTests : IAsyncLifetime
         var (business, customer, conversation) = await SeedAsync(db, resolveCustomer: true);
 
         var tool = new RefundProposalTool(db);
-        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id);
+        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id, new CustomerReplyCorrelation());
         var input = Args(new
         {
             orderId = "gid://shopify/Order/12345",
@@ -254,7 +254,7 @@ public class RefundProposalToolTests : IAsyncLifetime
         var (business, customer, conversation) = await SeedAsync(db, resolveCustomer: true);
 
         var tool = new RefundProposalTool(db);
-        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id);
+        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id, new CustomerReplyCorrelation());
         // Mirrors OrderCancelProposalToolTests' own regression coverage for
         // the same Enum.TryParse-without-IsDefined gap (Step 33) — "99" has
         // no corresponding RefundMethod member.
@@ -277,7 +277,7 @@ public class RefundProposalToolTests : IAsyncLifetime
         var (business, customer, conversation) = await SeedAsync(db, resolveCustomer: true);
 
         var tool = new RefundProposalTool(db);
-        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id);
+        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id, new CustomerReplyCorrelation());
         var input = Args(new
         {
             orderId = "gid://shopify/Order/99999",
@@ -313,7 +313,7 @@ public class RefundProposalToolTests : IAsyncLifetime
         var (business, customer, conversation) = await SeedAsync(db, resolveCustomer: true);
 
         var tool = new RefundProposalTool(db);
-        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id);
+        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id, new CustomerReplyCorrelation());
 
         var inOrderInput = Args(new
         {
@@ -354,7 +354,7 @@ public class RefundProposalToolTests : IAsyncLifetime
         var (business, customer, conversation) = await SeedAsync(db, resolveCustomer: true);
 
         var tool = new RefundProposalTool(db);
-        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id);
+        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id, new CustomerReplyCorrelation());
         var input = Args(new { orderId = "gid://shopify/Order/55555", items = OneItem(), refundMethod = "OriginalPaymentMethod" });
 
         var result = await tool.ProposeAsync(context, input, CancellationToken.None);

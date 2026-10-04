@@ -129,7 +129,7 @@ public class OrderCancelProposalToolTests : IAsyncLifetime
         var (business, customer, conversation) = await SeedAsync(db, resolveCustomer: true);
 
         var tool = new OrderCancelProposalTool(db);
-        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id);
+        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id, new CustomerReplyCorrelation());
         var input = Args(new { orderId = "gid://shopify/Order/12345", restock = true, reason = "Customer", refundMethod = "OriginalPaymentMethod" });
 
         var result = await tool.ProposeAsync(context, input, CancellationToken.None);
@@ -161,7 +161,7 @@ public class OrderCancelProposalToolTests : IAsyncLifetime
         // in the DB (which is null) — proves ProposeAsync re-derives the
         // customer fresh from the Conversation row rather than trusting
         // whatever the context happens to carry.
-        var context = new ToolDispatchContext(business.Id, Guid.NewGuid(), conversation.Id);
+        var context = new ToolDispatchContext(business.Id, Guid.NewGuid(), conversation.Id, new CustomerReplyCorrelation());
         var input = Args(new { orderId = "gid://shopify/Order/12345", restock = true, reason = "Customer" });
 
         var result = await tool.ProposeAsync(context, input, CancellationToken.None);
@@ -196,7 +196,7 @@ public class OrderCancelProposalToolTests : IAsyncLifetime
         var (business, customer, conversation) = await SeedAsync(db, resolveCustomer: true);
 
         var tool = new OrderCancelProposalTool(db);
-        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id);
+        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id, new CustomerReplyCorrelation());
         var input = Args(new { orderId = "gid://shopify/Order/12345", restock = true, reason = "99" });
 
         var result = await tool.ProposeAsync(context, input, CancellationToken.None);
@@ -222,7 +222,7 @@ public class OrderCancelProposalToolTests : IAsyncLifetime
         var (business, customer, conversation) = await SeedAsync(db, resolveCustomer: true);
 
         var tool = new OrderCancelProposalTool(db);
-        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id);
+        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id, new CustomerReplyCorrelation());
         var input = Args(new { orderId = "gid://shopify/Order/12345", restock = true, reason = "Customer", refundMethod = "99" });
 
         var result = await tool.ProposeAsync(context, input, CancellationToken.None);
@@ -242,7 +242,7 @@ public class OrderCancelProposalToolTests : IAsyncLifetime
         var (business, customer, conversation) = await SeedAsync(db, resolveCustomer: true);
 
         var tool = new OrderCancelProposalTool(db);
-        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id);
+        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id, new CustomerReplyCorrelation());
         var input = Args(new { orderId = "gid://shopify/Order/99999", restock = false, reason = "Fraud", refundMethod = "StoreCredit" });
 
         var result = await tool.ProposeAsync(context, input, CancellationToken.None);
@@ -268,7 +268,7 @@ public class OrderCancelProposalToolTests : IAsyncLifetime
         var (business, customer, conversation) = await SeedAsync(db, resolveCustomer: true);
 
         var tool = new OrderCancelProposalTool(db);
-        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id);
+        var context = new ToolDispatchContext(business.Id, customer!.Id, conversation.Id, new CustomerReplyCorrelation());
         var input = Args(new { orderId = "gid://shopify/Order/55555", restock = true, reason = "Other" });
 
         var result = await tool.ProposeAsync(context, input, CancellationToken.None);

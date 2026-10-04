@@ -797,6 +797,32 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
         Assert.Equal("Fake dispatch reply.", aiMessage.Content);
     }
 
+    /// <summary>
+    /// T-A2c (A1 Slice 4a). Mutation: the dispatch context carries a static
+    /// shared correlation (equal CorrelationIds).
+    /// </summary>
+    [Fact]
+    public async Task GenerateReplyAsync_ResolvedCustomer_TwoTurns_DispatchContextCarriesDistinctReplyCorrelations()
+    {
+        await using var scope = _provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var (business, conversation) = await SeedConversationWithResolvedCustomerAsync(
+            db, "Test Customer", "test.customer@marker-test.invalid", "Where is my order?");
+
+        var fakeDispatch = new FakeToolDispatchService();
+        var service = NewService(db, new FakeMessageService(), new FakeKnowledgeRetrievalService(), fakeDispatch, new NoOpConversationClassificationService());
+
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+        var first = fakeDispatch.LastContext!.ReplyCorrelation;
+        await service.GenerateReplyAsync(business.Id, conversation.Id);
+        var second = fakeDispatch.LastContext!.ReplyCorrelation;
+
+        Assert.Equal(2, fakeDispatch.CallCount);
+        Assert.NotNull(first);
+        Assert.NotNull(second);
+        Assert.NotEqual(first.CorrelationId, second.CorrelationId);
+    }
+
     [Fact]
     public async Task GenerateReplyAsync_ResolvedCustomer_AttachesRegisteredToolToRealDispatchServicesClaudeCall()
     {
