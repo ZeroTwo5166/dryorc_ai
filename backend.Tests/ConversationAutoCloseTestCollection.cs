@@ -39,7 +39,8 @@ namespace backend.Tests;
 /// not just a flag).
 ///
 /// Membership: ConversationInactivityCloseServiceTests,
-/// DataLifecycleBackgroundServiceTests. If a future test file ever seeds a
+/// DataLifecycleBackgroundServiceTests, GdprLifecycleFinalE2ETests,
+/// Step25Candidate2FinalE2ETests. If a future test file ever seeds a
 /// real, stale Conversation row on an auto-close-enabled Business, it must
 /// join this same collection.
 /// </summary>

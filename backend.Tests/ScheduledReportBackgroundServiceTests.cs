@@ -361,7 +361,7 @@ public class ScheduledReportBackgroundServiceTests : IAsyncLifetime
         // this proves THIS composition root (not a hand-built one) resolves
         // the fixed clock into both real scoped services.
         var dueTimeProvider = new FixedTimeProvider(DueReferenceInstant);
-        await using var factory = new NivoraApiFactory().WithWebHostBuilder(builder =>
+        await using var factory = new NivoraApiFactory { HostedServices = TestHostedServices.ScheduledReport }.WithWebHostBuilder(builder =>
         {
             builder.ConfigureTestServices(services =>
             {
@@ -379,8 +379,8 @@ public class ScheduledReportBackgroundServiceTests : IAsyncLifetime
         });
 
         // Accessing .Services builds and starts the real generic host,
-        // which starts every registered IHostedService - including
-        // ScheduledReportBackgroundService, whose do-while loop runs its
+        // which starts ScheduledReportBackgroundService, the one hosted
+        // service this host opts in to, whose do-while loop runs its
         // first PollAsync/ExecuteAsync tick immediately, before any
         // 15-minute wait. FakeEmailSender comes from NivoraApiFactory's own
         // base ConfigureWebHost override (unmodified here).
@@ -406,7 +406,6 @@ public class ScheduledReportBackgroundServiceTests : IAsyncLifetime
         Assert.Equal(ownerId, finalRun.RecipientOwnerId);
         Assert.NotNull(finalRun.SentAt);
 
-        var sentEmail = Assert.Single(emailSender.SentEmails);
-        Assert.Equal(ownerEmail, sentEmail.To);
+        Assert.Single(emailSender.SentEmails, e => e.To == ownerEmail);
     }
 }

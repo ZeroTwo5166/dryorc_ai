@@ -59,6 +59,13 @@ public class NivoraApiFactory : WebApplicationFactory<Program>
     /// </summary>
     protected virtual bool UsesRealInvocationRecorder => false;
 
+    /// <summary>
+    /// Which of Program.cs's application hosted services this host runs:
+    /// none by default (TestHostedServiceFilter). Read inside the single
+    /// ConfigureTestServices lambda below.
+    /// </summary>
+    public TestHostedServices HostedServices { get; init; } = TestHostedServices.None;
+
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
@@ -92,10 +99,14 @@ public class NivoraApiFactory : WebApplicationFactory<Program>
         // Debug — the two actually useful for reading test output, neither
         // of which touches an OS-level, concurrency-fragile API the way
         // EventLog does. Purely a test-logging-sink change: nobody inspects
-        // the Windows Event Log to read test results, the real
-        // ScheduledReportBackgroundService still runs for real against the
-        // real dev DB exactly as Phase 7 requires, and both xUnit
-        // parallelism and Program.cs are untouched.
+        // the Windows Event Log to read test results, and both xUnit
+        // parallelism and Program.cs are untouched. Which hosted services
+        // run in a host is a separate setting: none by default, opt-in per
+        // service through HostedServices (TestHostedServices.cs). Step 24
+        // Phase 7's test requirement (implementation plan §3 row 7: one
+        // end-to-end tick through the actual ScheduledReportBackgroundService)
+        // is met by the ScheduledReport opt-in hosts in
+        // ScheduledReportBackgroundServiceTests and ScheduledReportsFinalE2ETests.
         builder.ConfigureLogging(logging =>
         {
             logging.ClearProviders();
@@ -135,10 +146,12 @@ public class NivoraApiFactory : WebApplicationFactory<Program>
                 ServiceDescriptor.Singleton<IIntegrationOAuthProvider, FakeIntegrationOAuthProvider>());
 
             // Step 24 Phase 7 diagnosis (second, distinct mechanism from the
-            // EventLog one above): ScheduledReportBackgroundService is now
-            // genuinely live in every one of this factory's hosts, using
-            // Program.cs's own AddSingleton(TimeProvider.System) — the real
-            // wall clock. Its discovery query (design §8.3) is deliberately
+            // EventLog one above): ScheduledReportBackgroundService was,
+            // until hosted services became opt-in, live in every one of this
+            // factory's hosts; it now runs only in hosts that opt in
+            // (HostedServices). The override below still applies to those
+            // hosts. ScheduledReportBackgroundService's discovery query
+            // (design §8.3) is deliberately
             // cross-tenant (IgnoreQueryFilters(), no BusinessId scoping —
             // that is the whole point of Phase 5), so it can and does
             // discover ANY Business.ScheduledReportsEnabled=true row in the
@@ -199,7 +212,8 @@ public class NivoraApiFactory : WebApplicationFactory<Program>
             // A test that DOES want the live scheduler to find something
             // due (this feature's own ScheduledReportBackgroundServiceTests)
             // layers its own further override of these same two
-            // registrations on top via its own WithWebHostBuilder call,
+            // registrations on top via its own WithWebHostBuilder call and
+            // opts in with HostedServices = TestHostedServices.ScheduledReport,
             // mirroring exactly how AnalystApiTests already layers a
             // SequencedFakeMessageService on top of this same factory's own
             // IMessageService default — last registration wins, so that
@@ -216,6 +230,7 @@ public class NivoraApiFactory : WebApplicationFactory<Program>
                 sp.GetRequiredService<IEmailSender>(),
                 frozenNeverDueTimeProvider,
                 sp.GetRequiredService<ILogger<ScheduledReportExecutionService>>()));
+            TestHostedServiceFilter.Apply(services, HostedServices);
         });
     }
 

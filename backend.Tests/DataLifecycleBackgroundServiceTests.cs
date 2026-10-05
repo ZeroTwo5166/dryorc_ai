@@ -622,7 +622,7 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
     [Fact]
     public async Task RealProgramCsHost_SeededAutoCloseEnabledBusiness_ClosesStaleConversation()
     {
-        await using var factory = new NivoraApiFactory();
+        await using var factory = new NivoraApiFactory { HostedServices = TestHostedServices.DataLifecycle };
         var now = DateTimeOffset.UtcNow;
 
         Guid conversationId;
@@ -650,12 +650,12 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         }
 
         // Accessing .Services builds and starts the REAL generic host from
-        // the actual Program.cs — including every IHostedService it
-        // registers, DataLifecycleBackgroundService (and, through it, the
-        // real IConversationInactivityCloseService resolved from the real
-        // container) among them. If that registration were missing or
-        // wrong, this is the only test that would catch it — every other
-        // test in this phase uses a hand-built ServiceCollection instead.
+        // the actual Program.cs — including DataLifecycleBackgroundService,
+        // which this host opts in to (HostedServices); the other two are
+        // removed by the factory. If the IConversationInactivityCloseService
+        // registration were missing or wrong, this is the only test that
+        // would catch it — every other test in this phase uses a hand-built
+        // ServiceCollection instead.
         _ = factory.Services;
 
         var deadline = DateTime.UtcNow.AddSeconds(20);

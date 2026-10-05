@@ -301,7 +301,7 @@ public class ScheduledReportsFinalE2ETests : IAsyncLifetime
     /// this file ever introduces, always at the external delivery boundary).
     /// </summary>
     private static WebApplicationFactory<Program> FactoryWithDueScheduler(IEmailSender? optionalEmailSender = null) =>
-        new NivoraApiFactory().WithWebHostBuilder(builder =>
+        new NivoraApiFactory { HostedServices = TestHostedServices.ScheduledReport }.WithWebHostBuilder(builder =>
         {
             builder.ConfigureTestServices(services =>
             {
@@ -360,8 +360,10 @@ public class ScheduledReportsFinalE2ETests : IAsyncLifetime
         // which host issued them; only the VERIFY factory's own hosted
         // BackgroundService matters for this test. This ordering matters:
         // any HttpClient/Services touch on a WebApplicationFactory starts
-        // its real host immediately, including its BackgroundService's
-        // first (and, within this test's short wait window, only) tick - if
+        // its real host immediately, including the first (and, within this
+        // test's short wait window, only) tick of each hosted service that
+        // factory opts in to (HostedServices; here only the verify factory
+        // opts in, to ScheduledReportBackgroundService) - if
         // registration/enablement happened on the SAME factory being
         // verified, that first tick would race ahead of the business ever
         // being enabled, and (per the production 15-minute interval, never
@@ -391,9 +393,9 @@ public class ScheduledReportsFinalE2ETests : IAsyncLifetime
 
         // NOW start the real verification host, for the first time, only
         // once the business already exists, is enabled, and has real
-        // analytics data behind it - triggering every registered
-        // IHostedService, including ScheduledReportBackgroundService, whose
-        // first tick runs immediately (before any 15-minute wait).
+        // analytics data behind it - starting ScheduledReportBackgroundService
+        // (opted in by FactoryWithDueScheduler), whose first tick runs
+        // immediately (before any 15-minute wait).
         await using var factory = FactoryWithDueScheduler();
         var emailSender = (FakeEmailSender)factory.Services.GetRequiredService<IEmailSender>();
 

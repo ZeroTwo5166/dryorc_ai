@@ -58,7 +58,7 @@ namespace backend.Tests;
 ///
 /// [Collection("ConversationAutoClose")]: this file seeds real,
 /// deliberately-backdated Conversation rows and, in several tests, boots
-/// the real NivoraApiFactory host — starting the real
+/// NivoraApiFactory hosts that opt in to the real
 /// DataLifecycleBackgroundService, whose RetentionEnforcementService job is
 /// unconditionally live (no enabled flag, unlike auto-close) and whose
 /// discovery query is deliberately cross-tenant (IgnoreQueryFilters(), no
@@ -538,7 +538,7 @@ public class GdprLifecycleFinalE2ETests : IAsyncLifetime
         // once every business and conversation already exists — real
         // Program.cs DI registration, real DataLifecycleBackgroundService,
         // whose first tick runs immediately (before any 24h wait).
-        await using var factory = new NivoraApiFactory();
+        await using var factory = new NivoraApiFactory { HostedServices = TestHostedServices.DataLifecycle };
         _ = factory.Services;
 
         var settled = await WaitUntilAsync(async () =>
@@ -614,7 +614,7 @@ public class GdprLifecycleFinalE2ETests : IAsyncLifetime
         // Start the real host — real DataLifecycleBackgroundService, first
         // tick runs immediately, RetentionEnforcementService is
         // unconditionally live (unlike auto-close, no enabled flag).
-        await using var factory = new NivoraApiFactory();
+        await using var factory = new NivoraApiFactory { HostedServices = TestHostedServices.DataLifecycle };
         _ = factory.Services;
 
         // Bounded grace window (Step25's own "prove absence" convention) —

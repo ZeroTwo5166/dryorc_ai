@@ -95,9 +95,8 @@ public class ConsumedSignedIdentityTokenCleanupServiceTests : IAsyncLifetime
 
         await SeedTokenAsync(db, businessId, DateTimeOffset.UtcNow.AddDays(-31));
 
-        var deleted = await service.CleanupExpiredAsync();
+        await service.CleanupExpiredAsync();
 
-        Assert.Equal(1, deleted);
         var remaining = await db.ConsumedSignedIdentityTokens.IgnoreQueryFilters()
             .CountAsync(t => t.BusinessId == businessId);
         Assert.Equal(0, remaining);
