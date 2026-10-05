@@ -58,7 +58,7 @@ namespace backend.Tests;
 ///
 /// [Collection("ConversationAutoClose")]: this file seeds real,
 /// deliberately-backdated Conversation rows and, in several tests, boots
-/// the real NivoraApiFactory host — starting the real
+/// NivoraApiFactory hosts that opt in to the real
 /// DataLifecycleBackgroundService, whose RetentionEnforcementService job is
 /// unconditionally live (no enabled flag, unlike auto-close) and whose
 /// discovery query is deliberately cross-tenant (IgnoreQueryFilters(), no

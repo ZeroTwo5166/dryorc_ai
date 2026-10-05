@@ -379,8 +379,8 @@ public class ScheduledReportBackgroundServiceTests : IAsyncLifetime
         });
 
         // Accessing .Services builds and starts the real generic host,
-        // which starts every registered IHostedService - including
-        // ScheduledReportBackgroundService, whose do-while loop runs its
+        // which starts ScheduledReportBackgroundService, the one hosted
+        // service this host opts in to, whose do-while loop runs its
         // first PollAsync/ExecuteAsync tick immediately, before any
         // 15-minute wait. FakeEmailSender comes from NivoraApiFactory's own
         // base ConfigureWebHost override (unmodified here).

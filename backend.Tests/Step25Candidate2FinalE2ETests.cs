@@ -283,9 +283,9 @@ public class Step25Candidate2FinalE2ETests : IAsyncLifetime
 
         // NOW start the real verification host, for the first time, only
         // once every business already exists, is (or isn't) enabled, and
-        // already has its real conversations seeded — triggering every
-        // registered IHostedService, including DataLifecycleBackgroundService,
-        // whose first tick runs immediately (before any 24h wait).
+        // already has its real conversations seeded — starting
+        // DataLifecycleBackgroundService, the one hosted service this host
+        // opts in to, whose first tick runs immediately (before any 24h wait).
         await using var factory = new NivoraApiFactory { HostedServices = TestHostedServices.DataLifecycle };
         _ = factory.Services;
 
