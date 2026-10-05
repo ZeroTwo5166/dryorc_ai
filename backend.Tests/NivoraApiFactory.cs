@@ -59,6 +59,13 @@ public class NivoraApiFactory : WebApplicationFactory<Program>
     /// </summary>
     protected virtual bool UsesRealInvocationRecorder => false;
 
+    /// <summary>
+    /// Which of Program.cs's application hosted services this host runs:
+    /// none by default (TestHostedServiceFilter). Read inside the single
+    /// ConfigureTestServices lambda below.
+    /// </summary>
+    public TestHostedServices HostedServices { get; init; } = TestHostedServices.None;
+
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
@@ -216,6 +223,7 @@ public class NivoraApiFactory : WebApplicationFactory<Program>
                 sp.GetRequiredService<IEmailSender>(),
                 frozenNeverDueTimeProvider,
                 sp.GetRequiredService<ILogger<ScheduledReportExecutionService>>()));
+            TestHostedServiceFilter.Apply(services, HostedServices);
         });
     }
 

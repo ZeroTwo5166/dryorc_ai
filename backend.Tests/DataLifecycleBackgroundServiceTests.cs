@@ -622,7 +622,7 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
     [Fact]
     public async Task RealProgramCsHost_SeededAutoCloseEnabledBusiness_ClosesStaleConversation()
     {
-        await using var factory = new NivoraApiFactory();
+        await using var factory = new NivoraApiFactory { HostedServices = TestHostedServices.DataLifecycle };
         var now = DateTimeOffset.UtcNow;
 
         Guid conversationId;

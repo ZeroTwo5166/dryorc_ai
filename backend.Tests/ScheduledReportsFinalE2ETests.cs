@@ -301,7 +301,7 @@ public class ScheduledReportsFinalE2ETests : IAsyncLifetime
     /// this file ever introduces, always at the external delivery boundary).
     /// </summary>
     private static WebApplicationFactory<Program> FactoryWithDueScheduler(IEmailSender? optionalEmailSender = null) =>
-        new NivoraApiFactory().WithWebHostBuilder(builder =>
+        new NivoraApiFactory { HostedServices = TestHostedServices.ScheduledReport }.WithWebHostBuilder(builder =>
         {
             builder.ConfigureTestServices(services =>
             {

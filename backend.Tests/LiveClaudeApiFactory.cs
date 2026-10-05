@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 
 namespace backend.Tests;
 
@@ -10,11 +11,13 @@ namespace backend.Tests;
 /// only by tests gated behind [LiveClaudeFact] (see LiveClaudeFactAttribute)
 /// — never by ordinary tests, so a real, billed Anthropic call is only ever
 /// possible when both the explicit opt-in flag and a real key are present.
+/// Like NivoraApiFactory, runs none of Program.cs's three application hosted services (TestHostedServiceFilter).
 /// </summary>
 public class LiveClaudeApiFactory : WebApplicationFactory<Program>
 {
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
+        builder.ConfigureTestServices(services => TestHostedServiceFilter.Apply(services, TestHostedServices.None));
     }
 }

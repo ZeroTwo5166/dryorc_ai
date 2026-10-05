@@ -361,7 +361,7 @@ public class ScheduledReportBackgroundServiceTests : IAsyncLifetime
         // this proves THIS composition root (not a hand-built one) resolves
         // the fixed clock into both real scoped services.
         var dueTimeProvider = new FixedTimeProvider(DueReferenceInstant);
-        await using var factory = new NivoraApiFactory().WithWebHostBuilder(builder =>
+        await using var factory = new NivoraApiFactory { HostedServices = TestHostedServices.ScheduledReport }.WithWebHostBuilder(builder =>
         {
             builder.ConfigureTestServices(services =>
             {

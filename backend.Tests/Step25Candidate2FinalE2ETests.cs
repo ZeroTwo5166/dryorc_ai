@@ -286,7 +286,7 @@ public class Step25Candidate2FinalE2ETests : IAsyncLifetime
         // already has its real conversations seeded — triggering every
         // registered IHostedService, including DataLifecycleBackgroundService,
         // whose first tick runs immediately (before any 24h wait).
-        await using var factory = new NivoraApiFactory();
+        await using var factory = new NivoraApiFactory { HostedServices = TestHostedServices.DataLifecycle };
         _ = factory.Services;
 
         var settled = await WaitUntilAsync(async () =>
@@ -327,7 +327,7 @@ public class Step25Candidate2FinalE2ETests : IAsyncLifetime
         var now = DateTimeOffset.UtcNow;
         var targetId = await SeedConversationAsync(businessId, widgetId, now.AddDays(-90), now.AddDays(-20));
 
-        await using var factory = new NivoraApiFactory();
+        await using var factory = new NivoraApiFactory { HostedServices = TestHostedServices.DataLifecycle };
         _ = factory.Services;
 
         // No positive signal to wait on (nothing should happen) — use a
@@ -357,7 +357,7 @@ public class Step25Candidate2FinalE2ETests : IAsyncLifetime
         var targetId = await SeedConversationAsync(
             businessId, widgetId, now.AddDays(-90), now.AddDays(-20), isAnonymized: true);
 
-        await using var factory = new NivoraApiFactory();
+        await using var factory = new NivoraApiFactory { HostedServices = TestHostedServices.DataLifecycle };
         _ = factory.Services;
 
         await Task.Delay(TimeSpan.FromSeconds(3));
@@ -381,7 +381,7 @@ public class Step25Candidate2FinalE2ETests : IAsyncLifetime
         var targetId = await SeedConversationAsync(
             businessId, widgetId, now.AddDays(-90), now.AddDays(-20), status: ConversationStatus.Closed);
 
-        await using var factory = new NivoraApiFactory();
+        await using var factory = new NivoraApiFactory { HostedServices = TestHostedServices.DataLifecycle };
         _ = factory.Services;
 
         await Task.Delay(TimeSpan.FromSeconds(3));
