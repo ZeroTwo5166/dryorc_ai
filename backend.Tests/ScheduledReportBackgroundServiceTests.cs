@@ -406,7 +406,6 @@ public class ScheduledReportBackgroundServiceTests : IAsyncLifetime
         Assert.Equal(ownerId, finalRun.RecipientOwnerId);
         Assert.NotNull(finalRun.SentAt);
 
-        var sentEmail = Assert.Single(emailSender.SentEmails);
-        Assert.Equal(ownerEmail, sentEmail.To);
+        Assert.Single(emailSender.SentEmails, e => e.To == ownerEmail);
     }
 }

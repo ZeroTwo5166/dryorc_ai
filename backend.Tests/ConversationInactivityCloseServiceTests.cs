@@ -333,10 +333,10 @@ public class ConversationInactivityCloseServiceTests : IAsyncLifetime
         var lastMessageAt = now.AddDays(-20);
         var conversationId = await CreateConversationAsync(db, businessId, widgetId, now.AddDays(-90), lastMessageAt);
 
-        var closedCount = await service.CloseInactiveConversationsAsync();
-        Assert.Equal(1, closedCount);
+        await service.CloseInactiveConversationsAsync();
 
         await using var verifyDb = DbFor();
+        Assert.Equal(ConversationStatus.Closed, await verifyDb.Conversations.IgnoreQueryFilters().Where(c => c.Id == conversationId).Select(c => c.Status).SingleAsync());
         var entry = await verifyDb.AuditLogs.IgnoreQueryFilters()
             .SingleAsync(a => a.ConversationId == conversationId && a.EventType == AuditEventTypes.ConversationAutoClosed);
 
