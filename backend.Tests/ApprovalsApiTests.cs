@@ -52,30 +52,7 @@ public class ApprovalsApiTests : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        if (_businessIdsToClean.Count > 0)
-        {
-            await using var scope = _factory.Services.CreateAsyncScope();
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            var ids = _businessIdsToClean.ToArray();
-
-            // AuditLogs first (Restrict FK to Businesses). Approvals next
-            // (Restrict to Businesses/Customers, Cascade from Conversations —
-            // deleting Conversations below would already remove them, but
-            // deleting explicitly first keeps this ordering self-evident).
-            // Conversations next. Customers/Widgets next. AspNetUserRoles/
-            // AspNetUsers before Businesses, same ordering TicketsApiTests
-            // already established.
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AuditLogs\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Approvals\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Widgets\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Customers\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AspNetUserRoles\" WHERE \"UserId\" IN (SELECT \"Id\" FROM \"AspNetUsers\" WHERE \"BusinessId\" = ANY({ids}))");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AspNetUsers\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = ANY({ids})");
-        }
-
-        await _factory.DisposeAsync();
+        await TestBusinessCleanup.DeleteThenDisposeAsync(_businessIdsToClean, _factory);
     }
 
     private HttpClient NewClient() => _factory.CreateClient(new() { BaseAddress = new Uri("https://localhost") });
