@@ -61,38 +61,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        if (_businessIdsToClean.Count > 0)
-        {
-            await using var scope = _provider.CreateAsyncScope();
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            var ids = _businessIdsToClean.ToArray();
-
-            // Messages first — cascades away any MessageKnowledgeSource rows
-            // referencing them. KnowledgeChunks/KnowledgeDocuments before
-            // Businesses — that FK is Restrict, not Cascade, so deleting the
-            // Business first would fail while either still exists.
-            //
-            // [Step 23M] Customers added: pre-existing gap, latent until now
-            // — no test in this file created a Customer row before
-            // SeedConversationWithResolvedCustomerAsync (23K), and that
-            // helper's only prior caller was always [LiveClaudeFact]-skipped,
-            // so this cleanup path was never actually exercised against a
-            // seeded Customer until this pass's non-live tests. Conversations
-            // (which reference Customers) must be deleted first, same
-            // Restrict-FK reasoning as KnowledgeChunks/Documents above.
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Messages\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"KnowledgeChunks\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"KnowledgeDocuments\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Customers\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Widgets\" WHERE \"BusinessId\" = ANY({ids})");
-            // Rule (c) audit rows: AuditLog.BusinessId is FK Restrict, so
-            // AuditLogs go before Businesses.
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AuditLogs\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = ANY({ids})");
-        }
-
-        await _provider.DisposeAsync();
+        await TestBusinessCleanup.DeleteThenDisposeAsync(_businessIdsToClean, _provider);
     }
 
     // A1 Slice 4a (design §6.1): messages go behind a real AnthropicInvoker

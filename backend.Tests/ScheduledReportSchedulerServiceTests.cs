@@ -36,14 +36,7 @@ public class ScheduledReportSchedulerServiceTests : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        if (_businessIdsToClean.Count > 0)
-        {
-            await using var db = DbFor();
-            var ids = _businessIdsToClean.ToArray();
-
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"ScheduledReportRuns\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = ANY({ids})");
-        }
+        await TestBusinessCleanup.DeleteThenDisposeAsync(_businessIdsToClean, null);
     }
 
     // ── Infra helpers ────────────────────────────────────────────────

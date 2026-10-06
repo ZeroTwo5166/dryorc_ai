@@ -77,28 +77,7 @@ public class GdprLifecycleFinalE2ETests : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        if (_businessIdsToClean.Count == 0)
-        {
-            return;
-        }
-
-        await using var db = DbFor();
-        var ids = _businessIdsToClean.ToArray();
-
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AuditLogs\" WHERE \"BusinessId\" = ANY({ids})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Tickets\" WHERE \"BusinessId\" = ANY({ids})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"MessageKnowledgeSources\" WHERE \"BusinessId\" = ANY({ids})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Messages\" WHERE \"BusinessId\" = ANY({ids})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"VerificationCodes\" WHERE \"BusinessId\" = ANY({ids})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"CustomerExtendedLoggingHistories\" WHERE \"BusinessId\" = ANY({ids})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"FlaggedCustomerActivityLogs\" WHERE \"BusinessId\" = ANY({ids})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"ExternalIdentities\" WHERE \"BusinessId\" = ANY({ids})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({ids})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Customers\" WHERE \"BusinessId\" = ANY({ids})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Widgets\" WHERE \"BusinessId\" = ANY({ids})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AspNetUserRoles\" WHERE \"UserId\" IN (SELECT \"Id\" FROM \"AspNetUsers\" WHERE \"BusinessId\" = ANY({ids}))");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AspNetUsers\" WHERE \"BusinessId\" = ANY({ids})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = ANY({ids})");
+        await TestBusinessCleanup.DeleteThenDisposeAsync(_businessIdsToClean, null);
     }
 
     // ── Infra helpers (mirrors Step25Candidate2FinalE2ETests.cs / CustomersApiTests.cs) ──
