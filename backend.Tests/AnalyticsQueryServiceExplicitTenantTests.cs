@@ -39,18 +39,7 @@ public class AnalyticsQueryServiceExplicitTenantTests : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        if (_businessIdsToClean.Count > 0)
-        {
-            await using var db = DbFor(null);
-            var ids = _businessIdsToClean.ToArray();
-
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"ConversationHandoffs\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Tickets\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Customers\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Widgets\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = ANY({ids})");
-        }
+        await TestBusinessCleanup.DeleteThenDisposeAsync(_businessIdsToClean, null);
     }
 
     // ── Seeding helpers — identical shape to AnalyticsQueryServiceTests.cs ──
