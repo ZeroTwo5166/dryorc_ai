@@ -91,51 +91,7 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        if (_businessIdsToClean.Count > 0)
-        {
-            await using var scope = _provider.CreateAsyncScope();
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            var ids = _businessIdsToClean.ToArray();
-
-            // AuditLogs first — AuditLog.BusinessId's FK is Restrict, not
-            // Cascade/SetNull, so any row this test wrote would otherwise
-            // block the Businesses delete below with a FK violation.
-            // Conversations next — Approval's own ConversationId FK is
-            // Cascade, so any Approval row (including its own
-            // OrderCancellationId reference) is removed automatically when
-            // its Conversation is. OrderCancellations next, only now safe
-            // to delete: Approval.OrderCancellationId's FK is Restrict, so
-            // it must be gone (via the Conversation cascade above) before
-            // any OrderCancellation row it pointed to can be removed; both
-            // OrderCancellation.CustomerId and .BusinessId are themselves
-            // Restrict, so OrderCancellations must in turn be deleted
-            // before Customers/Businesses below (added by step-43's
-            // implementation pass — no test before it ever created an
-            // OrderCancellation row, so this ordering requirement was
-            // never previously exercised). Integrations/Customers/Widgets
-            // before Businesses.
-            // AspNetUsers next — AuditLog.ChangedByUserId now has a real FK
-            // to AspNetUsers (FK_AuditLogs_AspNetUsers_ChangedByUserId),
-            // discovered by this session's identity-threading fix (previously
-            // never exercised, since ChangedByUserId was always null before
-            // step-45). Must run after the AuditLogs delete above and before
-            // Businesses below, same ordering convention as
-            // NotificationDataTests.cs's own DisposeAsync.
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AuditLogs\" WHERE \"BusinessId\" = ANY({ids})");
-            if (_userIdsToClean.Count > 0)
-            {
-                var userIds = _userIdsToClean.ToArray();
-                await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AspNetUsers\" WHERE \"Id\" = ANY({userIds})");
-            }
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"OrderCancellations\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Integrations\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Customers\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Widgets\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = ANY({ids})");
-        }
-
-        await _provider.DisposeAsync();
+        await TestBusinessCleanup.DeleteThenDisposeAsync(_businessIdsToClean, _provider);
     }
 
     /// <summary>

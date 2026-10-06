@@ -77,25 +77,7 @@ public class SignedIdentityTokenServiceTests : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        if (_businessIdsToClean.Count > 0)
-        {
-            await using var scope = _provider.CreateAsyncScope();
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            var ids = _businessIdsToClean.ToArray();
-
-            // AuditLog.BusinessId is Restrict, not Cascade (AppDbContext.cs)
-            // — Phase 5's real-erasure tests write a CustomerErased row, so
-            // it must be deleted before "Businesses" below.
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AuditLogs\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"ConsumedSignedIdentityTokens\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"ExternalIdentities\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Customers\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"BusinessSigningKeys\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AspNetUsers\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = ANY({ids})");
-        }
-
-        await _provider.DisposeAsync();
+        await TestBusinessCleanup.DeleteThenDisposeAsync(_businessIdsToClean, _provider);
     }
 
     private async Task<Guid> CreateBusinessAsync(AppDbContext db)

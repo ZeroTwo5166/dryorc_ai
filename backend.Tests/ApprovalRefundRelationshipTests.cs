@@ -42,22 +42,7 @@ public class ApprovalRefundRelationshipTests : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        if (_businessIdsToClean.Count > 0)
-        {
-            await using var scope = _provider.CreateAsyncScope();
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            var ids = _businessIdsToClean.ToArray();
-
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Approvals\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Refunds\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"OrderCancellations\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Widgets\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Customers\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = ANY({ids})");
-        }
-
-        await _provider.DisposeAsync();
+        await TestBusinessCleanup.DeleteThenDisposeAsync(_businessIdsToClean, _provider);
     }
 
     /// <summary>Minimal Widget/Customer/Conversation graph an Approval's

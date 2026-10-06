@@ -79,45 +79,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        if (_businessIdsToClean.Count > 0)
-        {
-            await using var scope = _provider.CreateAsyncScope();
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            var ids = _businessIdsToClean.ToArray();
-
-            // GDPR Phase 3 — AuditLog.BusinessId is Restrict, not Cascade
-            // (AppDbContext.cs), so any row the new retention-audit tests
-            // write must be deleted before "Businesses" below or that
-            // delete fails with a FK violation. Same precedent
-            // DataLifecycleBackgroundServiceTests.cs's own DisposeAsync
-            // already established.
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AuditLogs\" WHERE \"BusinessId\" = ANY({ids})");
-            // Ticket.BusinessId/CustomerId are both Restrict, and
-            // Ticket.ConversationId is SetNull (not Cascade) — the
-            // "Conversations" delete below would NOT remove a surviving
-            // Ticket row, so it must be deleted explicitly, before both
-            // "Customers" and "Businesses".
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Tickets\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"MessageKnowledgeSources\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Messages\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"VerificationCodes\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"CustomerExtendedLoggingHistories\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"FlaggedCustomerActivityLogs\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"ExternalIdentities\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Customers\" WHERE \"BusinessId\" = ANY({ids})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Widgets\" WHERE \"BusinessId\" = ANY({ids})");
-
-            if (_userIdsToClean.Count > 0)
-            {
-                var userIds = _userIdsToClean.ToArray();
-                await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AspNetUsers\" WHERE \"Id\" = ANY({userIds})");
-            }
-
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = ANY({ids})");
-        }
-
-        await _provider.DisposeAsync();
+        await TestBusinessCleanup.DeleteThenDisposeAsync(_businessIdsToClean, _provider);
     }
 
     // ── Fixture helpers ─────────────────────────────────────────────
