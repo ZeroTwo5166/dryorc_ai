@@ -38,28 +38,7 @@ public class ScheduledReportExecutionServiceTests : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        if (_businessIdsToClean.Count == 0)
-        {
-            return;
-        }
-
-        await using var db = DbFor();
-        var bizIds = _businessIdsToClean.ToArray();
-
-        if (_userIdsToClean.Count > 0)
-        {
-            var userIds = _userIdsToClean.ToArray();
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AspNetUserRoles\" WHERE \"UserId\" = ANY({userIds})");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"AspNetUsers\" WHERE \"Id\" = ANY({userIds})");
-        }
-
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"ScheduledReportRuns\" WHERE \"BusinessId\" = ANY({bizIds})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"ConversationHandoffs\" WHERE \"BusinessId\" = ANY({bizIds})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Tickets\" WHERE \"BusinessId\" = ANY({bizIds})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Conversations\" WHERE \"BusinessId\" = ANY({bizIds})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Customers\" WHERE \"BusinessId\" = ANY({bizIds})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Widgets\" WHERE \"BusinessId\" = ANY({bizIds})");
-        await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = ANY({bizIds})");
+        await TestBusinessCleanup.DeleteThenDisposeAsync(_businessIdsToClean, null);
     }
 
     // ── Infra helpers — same shape as ScheduledReportSchedulerServiceTests.cs
