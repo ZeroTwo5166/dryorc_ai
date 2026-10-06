@@ -88,13 +88,17 @@ public class AppDbContextTenantFilterTests : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        await using (var scope = _provider.CreateAsyncScope())
+        if (_businessId == Guid.Empty)
         {
-            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Customers\" WHERE \"BusinessId\" = {_businessId}");
-            await db.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM \"Businesses\" WHERE \"Id\" = {_businessId}");
+            if (_provider is not null)
+            {
+                await _provider.DisposeAsync();
+            }
         }
-        await _provider.DisposeAsync();
+        else
+        {
+            await TestBusinessCleanup.DeleteThenDisposeAsync([_businessId], _provider);
+        }
     }
 
     [Fact]
