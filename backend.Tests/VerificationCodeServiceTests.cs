@@ -8,7 +8,6 @@ using backend.Interfaces;
 using backend.Models;
 using backend.Services;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -34,26 +33,19 @@ public class VerificationCodeServiceTests : IAsyncLifetime
 
     public Task InitializeAsync()
     {
-        var configuration = new ConfigurationBuilder()
-            .AddUserSecrets<Program>()
-            .Build();
-
-        var connectionUri = configuration.GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
-
         _emailSender = new FakeEmailSender();
         // Step 21 forced-interleaving test needs a raw, independent
         // connection (not routed through the app's own DI-managed
         // AppDbContext) to act as a deterministic advisory-lock barrier —
         // same technique ConversationsApiTests.cs/WidgetConversationServiceTests.cs
         // already established for the notification-concurrency races.
-        _adoConnectionString = PostgresConnectionString.FromUri(connectionUri);
+        _adoConnectionString = TestDatabase.ConnectionString;
 
         _provider = new ServiceCollection()
             .AddLogging()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
-                PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()))
+                TestDatabase.ConnectionString, x => x.UseVector()))
             .AddSingleton<IEmailSender>(_emailSender)
             .AddScoped<IAuditLogService, AuditLogService>()
             .AddSingleton(Options.Create(new VerificationOptions
@@ -295,17 +287,11 @@ public class VerificationCodeServiceTests : IAsyncLifetime
 
     private ServiceProvider BuildProvider(IEmailSender emailSender, ILogger<VerificationCodeService>? logger = null)
     {
-        var configuration = new ConfigurationBuilder()
-            .AddUserSecrets<Program>()
-            .Build();
-        var connectionUri = configuration.GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
-
         var services = new ServiceCollection()
             .AddLogging()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
-                PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()))
+                TestDatabase.ConnectionString, x => x.UseVector()))
             .AddSingleton(emailSender)
             .AddScoped<IAuditLogService, AuditLogService>()
             .AddSingleton(Options.Create(new VerificationOptions

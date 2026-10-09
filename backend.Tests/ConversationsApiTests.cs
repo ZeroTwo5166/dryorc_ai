@@ -9,7 +9,6 @@ using backend.Models;
 using backend.Services;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
 using Xunit;
@@ -42,12 +41,7 @@ public class ConversationsApiTests : IAsyncLifetime
         // deterministic advisory-lock barrier — same technique
         // WidgetConversationServiceTests.cs established for the
         // notification-concurrency fix.
-        var configuration = new ConfigurationBuilder()
-            .AddUserSecrets<Program>()
-            .Build();
-        var connectionUri = configuration.GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
-        _adoConnectionString = PostgresConnectionString.FromUri(connectionUri);
+        _adoConnectionString = TestDatabase.ConnectionString;
 
         return Task.CompletedTask;
     }

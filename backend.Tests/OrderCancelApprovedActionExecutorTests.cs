@@ -6,7 +6,6 @@ using backend.Interfaces;
 using backend.Models;
 using backend.Services;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Xunit;
@@ -71,14 +70,10 @@ public class OrderCancelApprovedActionExecutorTests : IAsyncLifetime
 
     public Task InitializeAsync()
     {
-        var configuration = new ConfigurationBuilder().AddUserSecrets<Program>().Build();
-        var connectionUri = configuration.GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
-
         var services = new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new MutableTenantAccessor())
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
-                PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()))
+                TestDatabase.ConnectionString, x => x.UseVector()))
             .AddScoped<IAuditLogService, AuditLogService>()
             .AddScoped<ILevel2VerificationChecker, Level2VerificationChecker>()
             .AddScoped<IOrderCancellationService, OrderCancellationService>();

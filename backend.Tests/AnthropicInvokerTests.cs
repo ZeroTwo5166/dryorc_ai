@@ -15,7 +15,6 @@ using backend.Models;
 using Message = Anthropic.Models.Messages.Message;
 using backend.Services;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -43,15 +42,9 @@ public class AnthropicInvokerTests : IAsyncLifetime
 
     public Task InitializeAsync()
     {
-        var configuration = new ConfigurationBuilder()
-            .AddUserSecrets<Program>()
-            .Build();
-        var connectionUri = configuration.GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
-
         _provider = new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
-            .AddDbContext<AppDbContext>(o => o.UseNpgsql(PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()))
+            .AddDbContext<AppDbContext>(o => o.UseNpgsql(TestDatabase.ConnectionString, x => x.UseVector()))
             .BuildServiceProvider();
         return Task.CompletedTask;
     }

@@ -10,7 +10,6 @@ using backend.Models;
 using backend.Services;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
 using Xunit;
@@ -41,9 +40,7 @@ public class CustomersApiTests : IAsyncLifetime
         // advisory-lock barrier — same technique
         // CustomerDataLifecycleTests.cs/VerificationCodeServiceTests.cs
         // already established for their own advisory-lock races.
-        var connectionUri = new ConfigurationBuilder().AddUserSecrets<Program>().Build().GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
-        _adoConnectionString = PostgresConnectionString.FromUri(connectionUri);
+        _adoConnectionString = TestDatabase.ConnectionString;
         return Task.CompletedTask;
     }
 

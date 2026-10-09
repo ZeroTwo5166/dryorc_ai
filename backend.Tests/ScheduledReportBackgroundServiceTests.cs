@@ -58,9 +58,7 @@ public class ScheduledReportBackgroundServiceTests : IAsyncLifetime
         new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
-                PostgresConnectionString.FromUri(new ConfigurationBuilder()
-                    .AddUserSecrets<Program>().Build()
-                    .GetConnectionString("DefaultConnection")!), x => x.UseVector()))
+                TestDatabase.ConnectionString, x => x.UseVector()))
             .BuildServiceProvider()
             .GetRequiredService<AppDbContext>();
 

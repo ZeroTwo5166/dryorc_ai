@@ -6,7 +6,6 @@ using backend.Interfaces;
 using backend.Models;
 using backend.Services;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace backend.Tests;
@@ -35,17 +34,10 @@ public class AnalystCapabilitiesTests : IAsyncLifetime
 
     public Task InitializeAsync()
     {
-        var configuration = new ConfigurationBuilder()
-            .AddUserSecrets<Program>()
-            .Build();
-
-        var connectionUri = configuration.GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
-
         var services = new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
-                PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()));
+                TestDatabase.ConnectionString, x => x.UseVector()));
         _provider = services.BuildServiceProvider();
 
         return Task.CompletedTask;
@@ -157,9 +149,7 @@ public class AnalystCapabilitiesTests : IAsyncLifetime
         new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(businessId))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
-                PostgresConnectionString.FromUri(new ConfigurationBuilder()
-                    .AddUserSecrets<Program>().Build()
-                    .GetConnectionString("DefaultConnection")!), x => x.UseVector()))
+                TestDatabase.ConnectionString, x => x.UseVector()))
             .BuildServiceProvider()
             .GetRequiredService<AppDbContext>();
 

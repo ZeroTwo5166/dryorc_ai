@@ -12,10 +12,9 @@ using Microsoft.Extensions.Logging;
 namespace backend.Tests;
 
 /// <summary>
-/// Hosts the real app (real Program.cs wiring, real Neon dev DB via the same
-/// ConnectionStrings:DefaultConnection user-secret the app itself uses —
-/// Development environment triggers ASP.NET Core's automatic user-secrets
-/// loading for the entry assembly, same as running the app normally).
+/// Hosts the real app (real Program.cs wiring, against the separate test
+/// database nivora_test; TestDatabase.ConfigureHost supplies the connection
+/// and registers the connection guard).
 /// Deliberately not swapped to an in-memory/fake DB: the point of this
 /// suite is proving the real EF Core global query filter + real Postgres
 /// unique constraints + real cookie auth actually enforce tenant isolation,
@@ -66,9 +65,10 @@ public class NivoraApiFactory : WebApplicationFactory<Program>
     /// </summary>
     public TestHostedServices HostedServices { get; init; } = TestHostedServices.None;
 
-    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    protected sealed override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
+        TestDatabase.ConfigureHost(builder);
 
         // Step 24 Phase 7 diagnosis: the actual root cause of a suite-wide
         // regression that appeared only once a third real BackgroundService

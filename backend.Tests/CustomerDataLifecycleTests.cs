@@ -5,7 +5,6 @@ using backend.Interfaces;
 using backend.Models;
 using backend.Services;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
 using Xunit;
@@ -38,19 +37,13 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
 
     public Task InitializeAsync()
     {
-        var configuration = new ConfigurationBuilder()
-            .AddUserSecrets<Program>()
-            .Build();
-        var connectionUri = configuration.GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
-
         // Identity-binding/erasure-integrity Phase 3's lock-acquisition test
         // needs a raw, independent connection (not routed through the app's
         // own DI-managed AppDbContext) to act as a deterministic
         // advisory-lock barrier — same technique
         // VerificationCodeServiceTests.cs already established for its own
         // ForVerificationCode concurrency races.
-        _adoConnectionString = PostgresConnectionString.FromUri(connectionUri);
+        _adoConnectionString = TestDatabase.ConnectionString;
 
         // None of the services under test rely on ICurrentTenantAccessor at
         // all (they resolve BusinessId explicitly — see
@@ -59,7 +52,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         _provider = new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
-                PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()))
+                TestDatabase.ConnectionString, x => x.UseVector()))
             .AddScoped<IConversationPurgeService, ConversationPurgeService>()
             .AddScoped<ICustomerErasureService, CustomerErasureService>()
             .AddScoped<IRetentionEnforcementService, RetentionEnforcementService>()

@@ -39,20 +39,13 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
 
     public Task InitializeAsync()
     {
-        var configuration = new ConfigurationBuilder()
-            .AddUserSecrets<Program>()
-            .Build();
-
-        var connectionUri = configuration.GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
-
         // Deliberately no IMessageService/IClaudeReplyService registered
         // here — each test constructs ClaudeReplyService directly with
         // exactly the IMessageService implementation its scenario needs.
         _provider = new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
-                PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()))
+                TestDatabase.ConnectionString, x => x.UseVector()))
             .AddScoped<IAuditLogService, AuditLogService>()
             .BuildServiceProvider();
 

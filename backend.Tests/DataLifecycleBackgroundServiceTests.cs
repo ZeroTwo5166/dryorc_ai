@@ -5,7 +5,6 @@ using backend.Interfaces;
 using backend.Models;
 using backend.Services;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -51,9 +50,7 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
-                PostgresConnectionString.FromUri(new ConfigurationBuilder()
-                    .AddUserSecrets<Program>().Build()
-                    .GetConnectionString("DefaultConnection")!), x => x.UseVector()))
+                TestDatabase.ConnectionString, x => x.UseVector()))
             .BuildServiceProvider()
             .GetRequiredService<AppDbContext>();
 
@@ -521,9 +518,7 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         var provider = new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
-                PostgresConnectionString.FromUri(new ConfigurationBuilder()
-                    .AddUserSecrets<Program>().Build()
-                    .GetConnectionString("DefaultConnection")!), x => x.UseVector()))
+                TestDatabase.ConnectionString, x => x.UseVector()))
             .AddScoped<IConversationPurgeService, ConversationPurgeService>()
             .AddScoped<IPurgeFailurePoint, NoOpPurgeFailurePoint>()
             .AddScoped<IRetentionEnforcementService, RetentionEnforcementService>()

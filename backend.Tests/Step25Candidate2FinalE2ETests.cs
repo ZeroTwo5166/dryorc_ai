@@ -11,7 +11,6 @@ using backend.Services;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -55,9 +54,7 @@ public class Step25Candidate2FinalE2ETests : IAsyncLifetime
         new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
-                PostgresConnectionString.FromUri(new ConfigurationBuilder()
-                    .AddUserSecrets<Program>().Build()
-                    .GetConnectionString("DefaultConnection")!), x => x.UseVector()))
+                TestDatabase.ConnectionString, x => x.UseVector()))
             .BuildServiceProvider()
             .GetRequiredService<AppDbContext>();
 

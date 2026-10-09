@@ -7,7 +7,6 @@ using backend.Interfaces;
 using backend.Models;
 using backend.Services;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Xunit;
@@ -28,17 +27,12 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
     private ServiceProvider _provider = null!;
     private readonly List<Guid> _businessIdsToClean = [];
     private readonly List<Guid> _userIdsToClean = [];
-    private string _connectionUri = null!;
 
     public Task InitializeAsync()
     {
-        var configuration = new ConfigurationBuilder().AddUserSecrets<Program>().Build();
-        _connectionUri = configuration.GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
-
         _provider = new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
-            .AddDbContext<AppDbContext>(o => o.UseNpgsql(PostgresConnectionString.FromUri(_connectionUri), x => x.UseVector()))
+            .AddDbContext<AppDbContext>(o => o.UseNpgsql(TestDatabase.ConnectionString, x => x.UseVector()))
             .AddScoped<IConversationModeService, ConversationModeService>()
             .AddScoped<IAuditLogService, AuditLogService>()
             .AddScoped<IConversationTagCorrectionService, ConversationTagCorrectionService>()
@@ -60,7 +54,7 @@ public class ConversationTagCorrectionServiceTests : IAsyncLifetime
     /// </summary>
     private AppDbContext CreateDbContext(params object[] interceptors) =>
         new(new DbContextOptionsBuilder<AppDbContext>()
-            .UseNpgsql(PostgresConnectionString.FromUri(_connectionUri), x => x.UseVector())
+            .UseNpgsql(TestDatabase.ConnectionString, x => x.UseVector())
             .AddInterceptors(interceptors.Cast<Microsoft.EntityFrameworkCore.Diagnostics.IInterceptor>())
             .Options,
             new FixedTenantAccessor(null));

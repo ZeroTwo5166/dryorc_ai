@@ -1,11 +1,21 @@
+using System.Net.Sockets;
+using backend.Data;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Npgsql;
 using Xunit.Abstractions;
 
 namespace backend.Tests;
 
 /// <summary>
-/// Pure tests of the test-database resolver: in-memory configuration only, no host, no
-/// connection, no file read. Every input is a made-up sentinel value.
+/// Tests of the test-database resolver. The resolver, mismatch and name tests are pure:
+/// in-memory configuration only, no host, no connection, no file read, every input a made-up
+/// sentinel value. The live tests (T4, T5, T6, T8-live) connect to nivora_test only.
 /// </summary>
 public class TestDatabaseTests(ITestOutputHelper output)
 {
@@ -159,5 +169,124 @@ public class TestDatabaseTests(ITestOutputHelper output)
         var ex = Assert.Throws<TestDatabaseConfigurationException>(() => TestDatabase.RequireName(keywordForm));
         var shown = name.Length == 0 ? "(not shown)" : name;
         Assert.Equal($"A connection to database '{shown}' was refused. Test code connects only to nivora_test.", ex.Message);
+    }
+
+    private const string GuardSentinel = "postgresql://guard:probe@127.0.0.1:1/guard_probe_db?sslmode=disable";
+
+    // Walks InnerException and every member of an AggregateException, depth first.
+    private static T? Find<T>(Exception? exception) where T : Exception
+    {
+        if (exception is null)
+        {
+            return null;
+        }
+
+        if (exception is T match)
+        {
+            return match;
+        }
+
+        if (exception is AggregateException aggregate)
+        {
+            foreach (var inner in aggregate.InnerExceptions)
+            {
+                var found = Find<T>(inner);
+                if (found is not null)
+                {
+                    return found;
+                }
+            }
+
+            return null;
+        }
+
+        return Find<T>(exception.InnerException);
+    }
+
+    private static async Task<string> CurrentDatabaseAsync(System.Data.Common.DbConnection connection)
+    {
+        await using (var begin = connection.CreateCommand())
+        {
+            begin.CommandText = "BEGIN TRANSACTION READ ONLY";
+            await begin.ExecuteNonQueryAsync();
+        }
+
+        string name;
+        await using (var select = connection.CreateCommand())
+        {
+            select.CommandText = "SELECT current_database()";
+            name = (string)(await select.ExecuteScalarAsync())!;
+        }
+
+        await using (var rollback = connection.CreateCommand())
+        {
+            rollback.CommandText = "ROLLBACK";
+            await rollback.ExecuteNonQueryAsync();
+        }
+
+        return name;
+    }
+
+    [Fact]
+    public async Task ConnectionString_ConnectsTo_NivoraTest()
+    {
+        await using var connection = new NpgsqlConnection(TestDatabase.ConnectionString);
+        await connection.OpenAsync();
+
+        Assert.Equal(TestDatabase.Name, await CurrentDatabaseAsync(connection));
+    }
+
+    [Theory]
+    [InlineData("NivoraApiFactory")]
+    [InlineData("PersistingInvocationRecorderApiFactory")]
+    [InlineData("WithWebHostBuilder")]
+    [InlineData("LiveClaudeApiFactory")]
+    public async Task Host_ResolvesTo_NivoraTest(string factoryName)
+    {
+        WebApplicationFactory<Program> factory = factoryName switch
+        {
+            "NivoraApiFactory" => new NivoraApiFactory(),
+            "PersistingInvocationRecorderApiFactory" => new PersistingInvocationRecorderApiFactory(),
+            "WithWebHostBuilder" => new NivoraApiFactory().WithWebHostBuilder(b => b.ConfigureTestServices(_ => { })),
+            "LiveClaudeApiFactory" => new LiveClaudeApiFactory(),
+            _ => throw new ArgumentOutOfRangeException(nameof(factoryName)),
+        };
+        using (factory)
+        {
+            using var scope = factory.Services.CreateScope();
+            var options = scope.ServiceProvider.GetRequiredService<DbContextOptions<AppDbContext>>();
+            var extension = options.Extensions.OfType<RelationalOptionsExtension>().Single();
+            Assert.NotNull(extension.ConnectionString);
+            Assert.Equal(TestDatabase.Name, TestDatabase.DatabaseName(extension.ConnectionString!));
+
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            await db.Database.OpenConnectionAsync();
+            Assert.Equal(TestDatabase.Name, await CurrentDatabaseAsync(db.Database.GetDbConnection()));
+        }
+    }
+
+    [Fact]
+    public void Host_GuardRefuses_AnyOtherDatabase()
+    {
+        using var root = new NivoraApiFactory();
+        using var factory = root.WithWebHostBuilder(b => b.UseSetting(TestDatabase.HostConnectionKey, GuardSentinel));
+
+        var thrown = Record.Exception(() => factory.Services);
+
+        Assert.NotNull(thrown);
+        var refusal = Find<TestDatabaseConfigurationException>(thrown);
+        Assert.NotNull(refusal);
+        Assert.Contains("guard_probe_db", refusal.Message, StringComparison.Ordinal);
+        Assert.Null(Find<NpgsqlException>(thrown));
+        Assert.Null(Find<SocketException>(thrown));
+        output.WriteLine($"RV11 shape: {(ReferenceEquals(thrown, refusal) ? "unwrapped" : "wrapped")}");
+    }
+
+    [Fact]
+    public void StalenessCheck_PassesOnNivoraTest()
+    {
+        var elapsed = TestDatabase.CheckSchemaCurrentUncached();
+
+        output.WriteLine($"RV8 staleness check duration: {elapsed.TotalMilliseconds:F0} ms");
     }
 }
