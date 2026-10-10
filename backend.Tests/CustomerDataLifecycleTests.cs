@@ -241,6 +241,22 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         return ticket;
     }
 
+    /// <summary>
+    /// Reads a Conversation as the database holds it: a new scope from the
+    /// test's provider (so a new AppDbContext with nothing tracked) and
+    /// AsNoTracking. A read through the context that created the row
+    /// returns the tracked instance, which does not show a change another
+    /// writer committed — RetentionEnforcementService's sweep is
+    /// cross-tenant, so a sweep started by another test class can purge
+    /// this test's expired row first.
+    /// </summary>
+    private async Task<Conversation> ReadConversationFreshAsync(Guid conversationId)
+    {
+        await using var freshScope = _provider.CreateAsyncScope();
+        var freshDb = freshScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        return await freshDb.Conversations.AsNoTracking().IgnoreQueryFilters().SingleAsync(c => c.Id == conversationId);
+    }
+
     // ── 1. Purge atomicity ──────────────────────────────────────────
 
     [Fact]
@@ -487,7 +503,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
 
         async Task<bool> IsAnonymized(Guid conversationId)
         {
-            var c = await db.Conversations.IgnoreQueryFilters().FirstAsync(x => x.Id == conversationId);
+            var c = await ReadConversationFreshAsync(conversationId);
             return c.IsAnonymized;
         }
 
@@ -954,7 +970,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
 
         Assert.False(claimed);
         Assert.True(await db.Messages.IgnoreQueryFilters().AnyAsync(m => m.ConversationId == conversation.Id));
-        var conversationAfter = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        var conversationAfter = await ReadConversationFreshAsync(conversation.Id);
         Assert.False(conversationAfter.IsAnonymized);
         Assert.Equal(0, await db.AuditLogs.IgnoreQueryFilters()
             .CountAsync(a => a.EntityId == conversation.Id.ToString() && a.EventType == AuditEventTypes.ConversationRetentionPurged));
@@ -1024,7 +1040,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         var claimed = await retentionService.TryPurgeConversationAsync(business.Id, conversation.Id, CancellationToken.None);
 
         Assert.False(claimed);
-        var conversationAfter = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        var conversationAfter = await ReadConversationFreshAsync(conversation.Id);
         Assert.False(conversationAfter.IsAnonymized);
     }
 
@@ -1062,7 +1078,7 @@ public class CustomerDataLifecycleTests : IAsyncLifetime
         var claimed = await retentionService.TryPurgeConversationAsync(business.Id, conversation.Id, CancellationToken.None);
 
         Assert.False(claimed);
-        var conversationAfter = await db.Conversations.IgnoreQueryFilters().SingleAsync(c => c.Id == conversation.Id);
+        var conversationAfter = await ReadConversationFreshAsync(conversation.Id);
         Assert.False(conversationAfter.IsAnonymized);
     }
 
