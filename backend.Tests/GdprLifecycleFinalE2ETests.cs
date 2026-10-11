@@ -10,7 +10,6 @@ using backend.Models;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace backend.Tests;
@@ -86,9 +85,7 @@ public class GdprLifecycleFinalE2ETests : IAsyncLifetime
         new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
-                PostgresConnectionString.FromUri(new ConfigurationBuilder()
-                    .AddUserSecrets<Program>().Build()
-                    .GetConnectionString("DefaultConnection")!), x => x.UseVector()))
+                TestDatabase.ConnectionString, x => x.UseVector()))
             .BuildServiceProvider()
             .GetRequiredService<AppDbContext>();
 

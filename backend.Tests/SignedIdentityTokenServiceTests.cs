@@ -5,7 +5,6 @@ using backend.Interfaces;
 using backend.Models;
 using backend.Services;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -31,26 +30,19 @@ public class SignedIdentityTokenServiceTests : IAsyncLifetime
 
     public Task InitializeAsync()
     {
-        var configuration = new ConfigurationBuilder()
-            .AddUserSecrets<Program>()
-            .Build();
-
-        var connectionUri = configuration.GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
-
         // Identity-binding/erasure-integrity Phase 5's lock-freshness test
         // needs a raw, independent connection (not routed through the app's
         // own DI-managed AppDbContext) to act as a deterministic
         // advisory-lock barrier — same technique
         // CustomerDataLifecycleTests.cs/CustomersApiTests.cs already
         // established for their own ForCustomerErasure races.
-        _adoConnectionString = PostgresConnectionString.FromUri(connectionUri);
+        _adoConnectionString = TestDatabase.ConnectionString;
 
         _provider = new ServiceCollection()
             .AddLogging()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
-                PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()))
+                TestDatabase.ConnectionString, x => x.UseVector()))
             .AddSingleton(Options.Create(new SignedTokenOptions
             {
                 MaxTokenLifetimeMinutes = 5,

@@ -9,7 +9,6 @@ using backend.Interfaces;
 using backend.Models;
 using backend.Services;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Npgsql;
@@ -38,15 +37,9 @@ public class VoyageEmbeddingInvokerTests : IAsyncLifetime
 
     public Task InitializeAsync()
     {
-        var configuration = new ConfigurationBuilder()
-            .AddUserSecrets<Program>()
-            .Build();
-        var connectionUri = configuration.GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
-
         _provider = new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
-            .AddDbContext<AppDbContext>(o => o.UseNpgsql(PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()))
+            .AddDbContext<AppDbContext>(o => o.UseNpgsql(TestDatabase.ConnectionString, x => x.UseVector()))
             .BuildServiceProvider();
         return Task.CompletedTask;
     }

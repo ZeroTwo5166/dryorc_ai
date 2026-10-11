@@ -4,7 +4,6 @@ using System.Data;
 using System.Diagnostics;
 using backend.Data;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Npgsql;
 using NpgsqlTypes;
 
@@ -501,17 +500,12 @@ internal static class TestBusinessCleanup
 
     private static string BuildConnectionString()
     {
-        var uri = new ConfigurationBuilder()
-            .AddUserSecrets<Program>()
-            .Build()
-            .GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
-
-        var builder = new NpgsqlConnectionStringBuilder(PostgresConnectionString.FromUri(uri))
+        var built = new NpgsqlConnectionStringBuilder(TestDatabase.ConnectionString)
         {
             IncludeFailedBatchedCommand = true,
-        };
-        return builder.ConnectionString;
+        }.ConnectionString;
+        TestDatabase.RequireName(built);
+        return built;
     }
 }
 

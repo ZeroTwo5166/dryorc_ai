@@ -1,3 +1,4 @@
+using System.Data.Common;
 using backend.Constants;
 using backend.Data;
 using backend.Enums;
@@ -5,10 +6,11 @@ using backend.Interfaces;
 using backend.Models;
 using backend.Services;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Pgvector;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace backend.Tests;
 
@@ -28,28 +30,25 @@ namespace backend.Tests;
 /// will produce for the query text.
 /// </summary>
 [Collection("KnowledgeChunks collection")]
-public class KnowledgeRetrievalServiceTests : IAsyncLifetime
+public class KnowledgeRetrievalServiceTests(ITestOutputHelper output) : IAsyncLifetime
 {
+    private const string HnswIndexScan = "Index Scan using \"IX_KnowledgeChunks_Embedding\"";
+
     private ServiceProvider _provider = null!;
     private FakeVoyageEmbeddingClient _fakeVoyage = null!;
     private readonly ConcurrentCapturingAiInvocationRecorder _capture = new();
     private readonly List<Guid> _businessIdsToClean = [];
+    private readonly VectorCommandPlanProbe _planProbe = new();
 
     public Task InitializeAsync()
     {
-        var configuration = new ConfigurationBuilder()
-            .AddUserSecrets<Program>()
-            .Build();
-
-        var connectionUri = configuration.GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
-
         _fakeVoyage = new FakeVoyageEmbeddingClient();
 
         _provider = new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(
-                PostgresConnectionString.FromUri(connectionUri), x => x.UseVector()))
+                TestDatabase.ConnectionString, x => x.UseVector())
+                .AddInterceptors(_planProbe))
             .AddLogging()
             .AddSingleton<IVoyageEmbeddingClient>(_fakeVoyage)
             .AddSingleton<IAiInvocationRecorder>(_capture)
@@ -117,6 +116,79 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
         db.KnowledgeChunks.Add(chunk);
         await db.SaveChangesAsync();
         return chunk.Id;
+    }
+
+    /// <summary>
+    /// Test-only, and inactive unless a test arms it. While armed, for the
+    /// command whose text contains the cosine-distance operator, it runs
+    /// EXPLAIN of that same command text with copies of its parameters, on
+    /// the command's own connection and transaction, immediately before the
+    /// command executes, and records the plan together with the two HNSW
+    /// settings in effect at that point. This is how the recall test below
+    /// knows which plan the service's own query ran under — the planner
+    /// prefers an exact sort plan at this fixture's size, and under that
+    /// plan the test cannot observe HNSW recall at all.
+    /// </summary>
+    private sealed class VectorCommandPlanProbe : DbCommandInterceptor
+    {
+        public volatile bool Armed;
+        public List<(string Plan, string? IterativeScan, string? EfSearch)> Captured { get; } = [];
+
+        public override async ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (Armed && command.CommandText.Contains("<=>", StringComparison.Ordinal))
+            {
+                var planLines = new List<string>();
+                await using (var explain = command.Connection!.CreateCommand())
+                {
+                    explain.Transaction = command.Transaction;
+                    explain.CommandText = "EXPLAIN " + command.CommandText;
+                    foreach (DbParameter parameter in command.Parameters)
+                    {
+                        if (parameter is ICloneable cloneable)
+                        {
+                            explain.Parameters.Add((DbParameter)cloneable.Clone());
+                            continue;
+                        }
+
+                        var copy = explain.CreateParameter();
+                        copy.ParameterName = parameter.ParameterName;
+                        copy.DbType = parameter.DbType;
+                        copy.Value = parameter.Value;
+                        explain.Parameters.Add(copy);
+                    }
+
+                    await using var reader = await explain.ExecuteReaderAsync(cancellationToken);
+                    while (await reader.ReadAsync(cancellationToken))
+                    {
+                        planLines.Add(reader.GetString(0));
+                    }
+                }
+
+                // missing_ok: an unknown name reads as null instead of raising,
+                // which inside a transaction would abort it.
+                string? iterativeScan = null;
+                string? efSearch = null;
+                await using (var settings = command.Connection!.CreateCommand())
+                {
+                    settings.Transaction = command.Transaction;
+                    settings.CommandText =
+                        "SELECT current_setting('hnsw.iterative_scan', true), current_setting('hnsw.ef_search', true)";
+                    await using var reader = await settings.ExecuteReaderAsync(cancellationToken);
+                    if (await reader.ReadAsync(cancellationToken))
+                    {
+                        iterativeScan = reader.IsDBNull(0) ? null : reader.GetString(0);
+                        efSearch = reader.IsDBNull(1) ? null : reader.GetString(1);
+                    }
+                }
+
+                Captured.Add((string.Join("\n", planLines), iterativeScan, efSearch));
+            }
+
+            return result;
+        }
     }
 
     /// <summary>
@@ -384,6 +456,15 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
     /// (e.g. after an under-sized ANN candidate set rather than
     /// integrated into the index scan), Business A could plausibly receive
     /// fewer than its true 5 relevant chunks, or the wrong ones.
+    ///
+    /// The HNSW plan is forced, and proven on every run. At this fixture's
+    /// size the planner picks an exact sort plan, under which the result is
+    /// always 5 and nothing about HNSW is tested. So the service is called
+    /// inside this test's own transaction, which disables sequential scans
+    /// and sorts, and _planProbe reads the plan of the service's own
+    /// command. A run whose plan is not the HNSW index scan fails with
+    /// "PLAN NOT FORCED:" before any result is looked at — a failure of the
+    /// test's setup, distinct from a recall failure at the count below.
     /// </summary>
     [Fact]
     public async Task RetrieveAsync_HnswTenantFilterRecall_BusinessAGetsExactlyItsOwnTopFive_DespiteCloserNoiseFromOtherBusinesses()
@@ -418,15 +499,72 @@ public class KnowledgeRetrievalServiceTests : IAsyncLifetime
             await SeedChunkAsync(db, businessIdB, documentIdB, i, $"B_NOISE_{i}", VectorAtCosineDistance(queryVector, distance));
         }
 
-        var results = await retrieval.RetrieveAsync(businessIdA, Guid.NewGuid(), queryText);
+        // The seeds above are committed. The transaction only carries the
+        // planner settings, and the service joins it because it runs on
+        // this same scoped AppDbContext.
+        IReadOnlyList<RetrievedKnowledgeChunk> results;
+        await using (var transaction = await db.Database.BeginTransactionAsync())
+        {
+            await db.Database.ExecuteSqlRawAsync("SET LOCAL enable_seqscan = off");
+            await db.Database.ExecuteSqlRawAsync("SET LOCAL enable_sort = off");
 
-        // Not just "no cross-tenant leakage" (implied — none of Business B's
-        // content markers appear) but the stronger, explicitly required
-        // property: Business A's own top 5 are actually all present.
+            _planProbe.Armed = true;
+            try
+            {
+                results = await retrieval.RetrieveAsync(businessIdA, Guid.NewGuid(), queryText);
+            }
+            finally
+            {
+                _planProbe.Armed = false;
+            }
+
+            await transaction.RollbackAsync();
+        }
+
+        var iterativeScanAfterRollback = await db.Database
+            .SqlQueryRaw<string?>("SELECT current_setting('hnsw.iterative_scan', true) AS \"Value\"")
+            .SingleAsync();
+
+        output.WriteLine($"vector-commands-captured={_planProbe.Captured.Count}");
+        foreach (var seen in _planProbe.Captured)
+        {
+            output.WriteLine($"hnsw.iterative_scan={seen.IterativeScan ?? "(null)"} hnsw.ef_search={seen.EfSearch ?? "(null)"}");
+            output.WriteLine("plan| " + PlanHead(seen.Plan).Replace("\n", "\nplan| "));
+        }
+
+        output.WriteLine($"hnsw.iterative_scan-after-rollback={iterativeScanAfterRollback ?? "(null)"}");
+        output.WriteLine($"returned={results.Count} as-A-index=[{string.Join(",", results.Select(r => expectedChunkIds.IndexOf(r.KnowledgeChunkId)))}]");
+
+        // 1. Plan. Before any count: a run that was not on the HNSW plan
+        // says nothing about recall, whatever it returned.
+        var captured = Assert.Single(_planProbe.Captured);
+        Assert.True(
+            captured.Plan.Contains(HnswIndexScan, StringComparison.Ordinal),
+            "PLAN NOT FORCED: " + PlanHead(captured.Plan));
+
+        // 2. Count. Not just "no cross-tenant leakage" (implied — none of
+        // Business B's content markers appear) but the stronger, explicitly
+        // required property: Business A's own top 5 are actually all present.
         Assert.Equal(5, results.Count);
+
+        // 3. The setting the fix relies on was in effect at the service's
+        // own command. After the count, so that a service without the fix
+        // fails at the count.
+        Assert.Equal("relaxed_order", captured.IterativeScan);
+
+        // 4. A's five, and in distance order (A0 nearest): relaxed_order
+        // does not promise order, the service restores it.
         Assert.Equal(expectedChunkIds.OrderBy(id => id), results.Select(r => r.KnowledgeChunkId).OrderBy(id => id));
+        Assert.Equal(expectedChunkIds, results.Select(r => r.KnowledgeChunkId));
+
+        // 5.
         Assert.All(results, r => Assert.StartsWith("A_RELEVANT_", r.Content));
     }
+
+    // Plan lines carry the 1024-dimension query vector as a literal; cut
+    // them so a plan fits in a message.
+    private static string PlanHead(string plan) =>
+        string.Join("\n", plan.Split('\n').Take(12).Select(line => line.Length > 160 ? line[..160] + " …" : line));
 
     // ── A1 Slice 4a (design §6.2 V3): invocation capture at V3 ─────────
 

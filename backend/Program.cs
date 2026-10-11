@@ -733,6 +733,50 @@ builder.Services.AddOpenApi();
 
 var app = builder.Build();
 
+// pgvector >= 0.8.0 is a hard precondition, checked here and nowhere else:
+// KnowledgeRetrievalService depends on hnsw.iterative_scan, which older
+// versions do not have, and on such a database its SET LOCAL can either
+// fail or silently do nothing. There is deliberately no fallback — the
+// application does not start.
+using (var scope = app.Services.CreateScope())
+{
+    var minimumPgvectorVersion = new Version(0, 8, 0);
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    await db.Database.OpenConnectionAsync();
+    object? extversion;
+    try
+    {
+        await using var command = db.Database.GetDbConnection().CreateCommand();
+        command.CommandText = "SELECT extversion FROM pg_extension WHERE extname = 'vector'";
+        extversion = await command.ExecuteScalarAsync();
+    }
+    finally
+    {
+        await db.Database.CloseConnectionAsync();
+    }
+
+    if (extversion is not string rawPgvectorVersion)
+    {
+        throw new InvalidOperationException(
+            "No 'vector' extension version was found in this database (extversion: missing). " +
+            $"pgvector {minimumPgvectorVersion} or later is required.");
+    }
+
+    if (!Version.TryParse(rawPgvectorVersion, out var installedPgvectorVersion))
+    {
+        throw new InvalidOperationException(
+            $"The 'vector' extension version could not be read (extversion: '{rawPgvectorVersion}'). " +
+            $"pgvector {minimumPgvectorVersion} or later is required.");
+    }
+
+    if (installedPgvectorVersion < minimumPgvectorVersion)
+    {
+        throw new InvalidOperationException(
+            $"pgvector {installedPgvectorVersion} is installed. " +
+            $"pgvector {minimumPgvectorVersion} or later is required.");
+    }
+}
+
 using (var scope = app.Services.CreateScope())
 {
     await RoleSeeder.SeedAsync(scope.ServiceProvider);

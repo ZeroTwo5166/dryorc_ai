@@ -13,11 +13,12 @@ namespace backend.Tests;
 /// possible when both the explicit opt-in flag and a real key are present.
 /// Like NivoraApiFactory, runs none of Program.cs's three application hosted services (TestHostedServiceFilter).
 /// </summary>
-public class LiveClaudeApiFactory : WebApplicationFactory<Program>
+public sealed class LiveClaudeApiFactory : WebApplicationFactory<Program>
 {
-    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    protected sealed override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.UseEnvironment("Development");
+        TestDatabase.ConfigureHost(builder);
         builder.ConfigureTestServices(services => TestHostedServiceFilter.Apply(services, TestHostedServices.None));
     }
 }

@@ -5,7 +5,6 @@ using backend.Interfaces;
 using backend.Models;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
 using Pgvector;
@@ -45,13 +44,7 @@ public class TestBusinessCleanupTests : IAsyncLifetime
 
     public Task InitializeAsync()
     {
-        var connectionUri = new ConfigurationBuilder()
-            .AddUserSecrets<Program>()
-            .Build()
-            .GetConnectionString("DefaultConnection")
-            ?? throw new InvalidOperationException("ConnectionStrings:DefaultConnection not found via user-secrets.");
-
-        _connectionString = PostgresConnectionString.FromUri(connectionUri);
+        _connectionString = TestDatabase.ConnectionString;
         _provider = new ServiceCollection()
             .AddSingleton<ICurrentTenantAccessor>(new FixedTenantAccessor(null))
             .AddDbContext<AppDbContext>(o => o.UseNpgsql(_connectionString, x => x.UseVector()))
