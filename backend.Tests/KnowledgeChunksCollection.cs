@@ -5,12 +5,19 @@ namespace backend.Tests;
 /// <summary>
 /// Step 36 — groups every test class that writes real embedding vectors
 /// into the shared KnowledgeChunks table (and its one HNSW index) so xUnit
-/// runs them sequentially rather than in parallel with each other, removing
-/// concurrent-write noise against that shared index as a source of test
-/// flakiness — see docs/handoffs/step-35-hnsw-recall-test-triage.md for the
-/// full diagnosis (KnowledgeRetrievalServiceTests' own strict-recall
-/// assertion, RetrieveAsync_HnswTenantFilterRecall_..., intermittently
-/// failed under full-suite/concurrent conditions but never in isolation).
+/// runs them sequentially rather than in parallel with each other.
+///
+/// Step 36 added it on the reasoning of
+/// docs/handoffs/step-35-hnsw-recall-test-triage.md: that concurrent writes
+/// against that shared index made KnowledgeRetrievalServiceTests' own
+/// strict-recall test, RetrieveAsync_HnswTenantFilterRecall_..., fail
+/// intermittently. That reason is not the cause. The later diagnosis
+/// reproduced the same failure with nothing running beside it, five times
+/// of ten (docs/handoffs/hnsw-tenant-recall-design-v3.md, "From Part 1.5,
+/// beyond the one test"), and the failure was addressed in
+/// KnowledgeRetrievalService (iterative HNSW scan), not by this collection.
+/// The collection itself is unchanged; whether it is still wanted is a
+/// separate question that has not been decided.
 ///
 /// No shared fixture object is declared (no ICollectionFixture&lt;T&gt;) —
 /// each member class already manages its own ServiceProvider/AppDbContext

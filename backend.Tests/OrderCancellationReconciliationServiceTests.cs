@@ -287,7 +287,7 @@ public class OrderCancellationReconciliationServiceTests : IAsyncLifetime
             .Where(x => x.Id == brokenRowId || x.Id == healthyRowId)
             .ToDictionaryAsync(x => x.Id, x => x.Status);
         Assert.Equal([brokenOrderId, healthyOrderId], seenTargetOrderIds.Order());
-        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Error);
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Error && e.Message.Contains(brokenRowId.ToString()));
         Assert.Equal(OrderCancellationStatus.Pending, rows[brokenRowId]);
         Assert.Equal(OrderCancellationStatus.Confirmed, rows[healthyRowId]);
     }

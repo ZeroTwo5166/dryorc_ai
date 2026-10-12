@@ -755,26 +755,7 @@ using (var scope = app.Services.CreateScope())
         await db.Database.CloseConnectionAsync();
     }
 
-    if (extversion is not string rawPgvectorVersion)
-    {
-        throw new InvalidOperationException(
-            "No 'vector' extension version was found in this database (extversion: missing). " +
-            $"pgvector {minimumPgvectorVersion} or later is required.");
-    }
-
-    if (!Version.TryParse(rawPgvectorVersion, out var installedPgvectorVersion))
-    {
-        throw new InvalidOperationException(
-            $"The 'vector' extension version could not be read (extversion: '{rawPgvectorVersion}'). " +
-            $"pgvector {minimumPgvectorVersion} or later is required.");
-    }
-
-    if (installedPgvectorVersion < minimumPgvectorVersion)
-    {
-        throw new InvalidOperationException(
-            $"pgvector {installedPgvectorVersion} is installed. " +
-            $"pgvector {minimumPgvectorVersion} or later is required.");
-    }
+    EnsureMinimumPgvectorVersion(extversion, minimumPgvectorVersion);
 }
 
 using (var scope = app.Services.CreateScope())
@@ -837,4 +818,31 @@ app.MapHub<TicketHub>("/hubs/tickets");
 
 app.Run();
 
-public partial class Program;
+public partial class Program
+{
+    // The three refusals of the pgvector startup check above, as one method so
+    // backend.Tests can reach them without a database. Throws, or returns.
+    internal static void EnsureMinimumPgvectorVersion(object? extversion, Version minimumPgvectorVersion)
+    {
+        if (extversion is not string rawPgvectorVersion)
+        {
+            throw new InvalidOperationException(
+                "No 'vector' extension version was found in this database (extversion: missing). " +
+                $"pgvector {minimumPgvectorVersion} or later is required.");
+        }
+
+        if (!Version.TryParse(rawPgvectorVersion, out var installedPgvectorVersion))
+        {
+            throw new InvalidOperationException(
+                $"The 'vector' extension version could not be read (extversion: '{rawPgvectorVersion}'). " +
+                $"pgvector {minimumPgvectorVersion} or later is required.");
+        }
+
+        if (installedPgvectorVersion < minimumPgvectorVersion)
+        {
+            throw new InvalidOperationException(
+                $"pgvector {installedPgvectorVersion} is installed. " +
+                $"pgvector {minimumPgvectorVersion} or later is required.");
+        }
+    }
+}
