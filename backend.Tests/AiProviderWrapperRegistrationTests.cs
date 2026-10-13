@@ -1,4 +1,5 @@
 using Anthropic.Models.Messages;
+using Anthropic.Services;
 using backend.Constants;
 using backend.Data;
 using backend.Enums;
@@ -44,6 +45,20 @@ public class AiProviderWrapperRegistrationTests : IAsyncLifetime
         Assert.IsType<AnthropicInvoker>(services.GetRequiredService<IAnthropicInvoker>());
         Assert.IsType<VoyageEmbeddingInvoker>(services.GetRequiredService<IVoyageEmbeddingInvoker>());
         Assert.IsType<UnauthorizedActionAuditWriter>(services.GetRequiredService<IUnauthorizedActionAuditWriter>());
+    }
+
+    // DL-0 (Slice 5): the raw clients stay ordinary registrations, so the only
+    // thing between a test host and Program.cs's own client is the fake
+    // registered by raw service type in NivoraApiFactory. Mutation: remove
+    // either AddSingleton line there.
+    [Fact]
+    public async Task TestHost_ResolvesTheFakeRawClients_NotProgramsOwn()
+    {
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var services = scope.ServiceProvider;
+
+        Assert.IsType<FakeMessageService>(services.GetRequiredService<IMessageService>());
+        Assert.IsType<FakeVoyageEmbeddingClient>(services.GetRequiredService<IVoyageEmbeddingClient>());
     }
 
     // The DI-resolved Voyage wrapper over the test host's
