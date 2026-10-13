@@ -37,7 +37,7 @@ public class Slice4bInvocationPersistenceTests : IAsyncLifetime
 
     // Mutation (design §10.5, same as T-API2): revert V1 in
     // KnowledgeIndexingService.CreateAsync to the raw
-    // IVoyageEmbeddingClient.EmbedAsync path — no row is persisted.
+    // IVoyageEmbeddingClient.EmbedWithUsageAsync path — no row is persisted.
     [Fact]
     public async Task CreateKnowledgeDocument_PersistsOneVoyageKnowledgeIndexingRow()
     {

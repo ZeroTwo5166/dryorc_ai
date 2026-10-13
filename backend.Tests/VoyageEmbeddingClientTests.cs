@@ -30,7 +30,7 @@ public class VoyageEmbeddingClientTests
         new(HttpStatusCode.OK) { Content = JsonContent.Create(body) };
 
     [Fact]
-    public async Task EmbedAsync_MapsEmbeddingsByReturnedIndex_NotResponseArrayPosition()
+    public async Task EmbedWithUsageAsync_MapsEmbeddingsByReturnedIndex_NotResponseArrayPosition()
     {
         var client = BuildClient(_ => JsonResponse(new
         {
@@ -41,14 +41,14 @@ public class VoyageEmbeddingClientTests
             },
         }));
 
-        var result = await client.EmbedAsync(["first", "second"], VoyageInputType.Document);
+        var result = await client.EmbedWithUsageAsync(["first", "second"], VoyageInputType.Document, new VoyageUsageAccumulator());
 
         Assert.Equal(1f, result[0][0]); // texts[0] ("first") maps to index 0's embedding, not array position 0
         Assert.Equal(2f, result[1][0]);
     }
 
     [Fact]
-    public async Task EmbedAsync_DuplicateIndex_ThrowsRatherThanMisassign()
+    public async Task EmbedWithUsageAsync_DuplicateIndex_ThrowsRatherThanMisassign()
     {
         var client = BuildClient(_ => JsonResponse(new
         {
@@ -59,11 +59,11 @@ public class VoyageEmbeddingClientTests
             },
         }));
 
-        await Assert.ThrowsAsync<VoyageEmbeddingException>(() => client.EmbedAsync(["a", "b"], VoyageInputType.Document));
+        await Assert.ThrowsAsync<VoyageEmbeddingException>(() => client.EmbedWithUsageAsync(["a", "b"], VoyageInputType.Document, new VoyageUsageAccumulator()));
     }
 
     [Fact]
-    public async Task EmbedAsync_OutOfRangeIndex_ThrowsRatherThanMisassign()
+    public async Task EmbedWithUsageAsync_OutOfRangeIndex_ThrowsRatherThanMisassign()
     {
         var client = BuildClient(_ => JsonResponse(new
         {
@@ -74,11 +74,11 @@ public class VoyageEmbeddingClientTests
             },
         }));
 
-        await Assert.ThrowsAsync<VoyageEmbeddingException>(() => client.EmbedAsync(["a", "b"], VoyageInputType.Document));
+        await Assert.ThrowsAsync<VoyageEmbeddingException>(() => client.EmbedWithUsageAsync(["a", "b"], VoyageInputType.Document, new VoyageUsageAccumulator()));
     }
 
     [Fact]
-    public async Task EmbedAsync_MissingIndex_ThrowsRatherThanReturnIncompleteResult()
+    public async Task EmbedWithUsageAsync_MissingIndex_ThrowsRatherThanReturnIncompleteResult()
     {
         var client = BuildClient(_ => JsonResponse(new
         {
@@ -89,22 +89,22 @@ public class VoyageEmbeddingClientTests
             },
         }));
 
-        await Assert.ThrowsAsync<VoyageEmbeddingException>(() => client.EmbedAsync(["a", "b"], VoyageInputType.Document));
+        await Assert.ThrowsAsync<VoyageEmbeddingException>(() => client.EmbedWithUsageAsync(["a", "b"], VoyageInputType.Document, new VoyageUsageAccumulator()));
     }
 
     [Fact]
-    public async Task EmbedAsync_NonSuccessStatus_ThrowsVoyageEmbeddingException()
+    public async Task EmbedWithUsageAsync_NonSuccessStatus_ThrowsVoyageEmbeddingException()
     {
         var client = BuildClient(_ => new HttpResponseMessage(HttpStatusCode.TooManyRequests)
         {
             Content = new StringContent("rate limited"),
         });
 
-        await Assert.ThrowsAsync<VoyageEmbeddingException>(() => client.EmbedAsync(["a"], VoyageInputType.Document));
+        await Assert.ThrowsAsync<VoyageEmbeddingException>(() => client.EmbedWithUsageAsync(["a"], VoyageInputType.Document, new VoyageUsageAccumulator()));
     }
 
     [Fact]
-    public async Task EmbedAsync_NeverSendsOutputDimension_SendsModelAndInputType()
+    public async Task EmbedWithUsageAsync_NeverSendsOutputDimension_SendsModelAndInputType()
     {
         string? capturedBody = null;
         var client = BuildClient(request =>
@@ -113,7 +113,7 @@ public class VoyageEmbeddingClientTests
             return JsonResponse(new { data = new[] { new { embedding = new[] { 1f }, index = 0 } } });
         });
 
-        await client.EmbedAsync(["a"], VoyageInputType.Document);
+        await client.EmbedWithUsageAsync(["a"], VoyageInputType.Document, new VoyageUsageAccumulator());
 
         Assert.NotNull(capturedBody);
         Assert.DoesNotContain("output_dimension", capturedBody);
@@ -122,7 +122,7 @@ public class VoyageEmbeddingClientTests
     }
 
     [Fact]
-    public async Task EmbedAsync_QueryInputType_SendsQueryNotDocument()
+    public async Task EmbedWithUsageAsync_QueryInputType_SendsQueryNotDocument()
     {
         string? capturedBody = null;
         var client = BuildClient(request =>
@@ -131,13 +131,13 @@ public class VoyageEmbeddingClientTests
             return JsonResponse(new { data = new[] { new { embedding = new[] { 1f }, index = 0 } } });
         });
 
-        await client.EmbedAsync(["a"], VoyageInputType.Query);
+        await client.EmbedWithUsageAsync(["a"], VoyageInputType.Query, new VoyageUsageAccumulator());
 
         Assert.Contains("\"input_type\":\"query\"", capturedBody);
     }
 
     [Fact]
-    public async Task EmbedAsync_EmptyInput_ReturnsEmptyWithoutCallingVoyage()
+    public async Task EmbedWithUsageAsync_EmptyInput_ReturnsEmptyWithoutCallingVoyage()
     {
         var called = false;
         var client = BuildClient(_ =>
@@ -146,7 +146,7 @@ public class VoyageEmbeddingClientTests
             return JsonResponse(new { data = Array.Empty<object>() });
         });
 
-        var result = await client.EmbedAsync([], VoyageInputType.Document);
+        var result = await client.EmbedWithUsageAsync([], VoyageInputType.Document, new VoyageUsageAccumulator());
 
         Assert.Empty(result);
         Assert.False(called);
@@ -156,8 +156,8 @@ public class VoyageEmbeddingClientTests
     // Design: docs/handoffs/billing-usage-a1-slice3-design-pass.md §7
     // (T-V1..T-V8); locked decisions in
     // docs/handoffs/billing-usage-a1-slice3-decisions-addendum.md. T-V8 is
-    // the 8 tests above, which keep calling the unchanged EmbedAsync (now
-    // delegating to EmbedWithUsageAsync with a discarded accumulator) with
+    // the 8 tests above, which now call EmbedWithUsageAsync with a throwaway
+    // accumulator (the raw EmbedAsync was removed in Slice 5, F18) and
     // usage-less stub JSON — valid under OD-2 option (i).
 
     private class AsyncStubHandler(Func<HttpRequestMessage, int, CancellationToken, Task<HttpResponseMessage>> respond) : HttpMessageHandler
