@@ -16,9 +16,9 @@ jobs:
   backend:
     name: backend (nivora_test)
     runs-on: ubuntu-latest
-    # About 16 times the 1 m 51 s local suite time. Waiting in the
-    # concurrency group does not count against it.
-    timeout-minutes: 30
+    # The suite took over 23 minutes on a hosted runner (1 m 51 s locally).
+    # Waiting in the concurrency group does not count against it.
+    timeout-minutes: 120
     # One shared database: one run at a time, and a run is never cancelled
     # mid-suite (a killed run leaves its rows in nivora_test).
     concurrency:
