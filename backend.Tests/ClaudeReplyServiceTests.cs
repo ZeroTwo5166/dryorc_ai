@@ -72,7 +72,7 @@ public class ClaudeReplyServiceTests : IAsyncLifetime
             db,
             new AnthropicInvoker(messages, recorder ?? new ConcurrentCapturingAiInvocationRecorder(), NullLogger<AnthropicInvoker>.Instance),
             retrieval ?? new FakeKnowledgeRetrievalService(),
-            toolDispatch ?? NewToolDispatch([], messages),
+            toolDispatch ?? NewToolDispatch([], messages, recorder),
             classification ?? new NoOpConversationClassificationService(),
             auditWriter ?? new UnauthorizedActionAuditWriter(
                 _provider.GetRequiredService<IServiceScopeFactory>(), NullLogger<UnauthorizedActionAuditWriter>.Instance),
