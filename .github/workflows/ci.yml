@@ -1,0 +1,451 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - feature/app-pages
+  pull_request:
+    branches:
+      - feature/app-pages
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: backend (nivora_test)
+    runs-on: ubuntu-latest
+    # The suite took over 23 minutes on a hosted runner (1 m 51 s locally).
+    # Waiting in the concurrency group does not count against it.
+    timeout-minutes: 120
+    # One shared database: one run at a time, and a run is never cancelled
+    # mid-suite (a killed run leaves its rows in nivora_test).
+    concurrency:
+      group: nivora-test-db
+      cancel-in-progress: false
+    env:
+      DOTNET_NOLOGO: 'true'
+      DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+      # backend/backend.csproj, UserSecretsId. Not a secret.
+      USER_SECRETS_ID: fd1812ca-9444-4a77-b0b9-082ba45bb173
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up the .NET SDK pinned by global.json
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      - name: Check the SDK in use
+        run: |
+          expected="$(python3 -c 'import json; print(json.load(open("global.json"))["sdk"]["version"])')"
+          version="$(dotnet --version)"
+          echo "global.json: ${expected}; dotnet --version: ${version}"
+          if [ "${version}" != "${expected}" ]; then
+            echo "::error::The SDK in use is ${version}, not the ${expected} that global.json pins."
+            exit 1
+          fi
+
+      - name: Write the TRX helper
+        run: |
+          mkdir -p "${RUNNER_TEMP}/nivora-results"
+          cat > "${RUNNER_TEMP}/trx_tool.py" <<'PY'
+          """TRX checks for the Nivora CI workflow. Prints names, counts and fixed
+          sentences only: never a message, a stack trace or a secret value."""
+          import glob
+          import json
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+          from urllib.parse import quote, unquote, urlsplit
+          from xml.sax.saxutils import escape
+
+          NS = {"t": "http://microsoft.com/schemas/VisualStudio/TeamTest/2010"}
+          RESULTS = os.path.join(os.environ["RUNNER_TEMP"], "nivora-results")
+          # NIVORA_SECRETS_FILE is for the local probe only; the workflow never sets it.
+          SECRETS = os.environ.get("NIVORA_SECRETS_FILE") or os.path.join(
+              os.environ["HOME"], ".microsoft", "usersecrets",
+              os.environ["USER_SECRETS_ID"], "secrets.json")
+
+          TDT = "backend.Tests.TestDatabaseTests"
+          SCANS = "backend.Tests.TestDatabaseUsageTests"
+
+          # design v3, section 11.1a: 31 results in TestDatabaseTests ...
+          INVENTORY = [
+              (TDT, "Resolve_MissingTestConnection_Throws_NoFallback", 1),
+              (TDT, "Resolve_DatabaseName_MustBeExactlyNivoraTest", 7),
+              (TDT, "Resolve_NivoraTest_IsAccepted", 1),
+              (TDT, "Resolve_Messages_NeverContainHostUserPasswordOrValue", 6),
+              (TDT, "ConnectionString_ConnectsTo_NivoraTest", 1),
+              (TDT, "Host_ResolvesTo_NivoraTest", 4),
+              (TDT, "Host_GuardRefuses_AnyOtherDatabase", 1),
+              (TDT, "DescribeMigrationMismatch", 5),
+              (TDT, "StalenessCheck_PassesOnNivoraTest", 1),
+              (TDT, "RequireName_RefusesEverythingButNivoraTest", 4),
+          ]
+          # ... and one passed result per scan prefix in TestDatabaseUsageTests: 41.
+          SCAN_PREFIXES = ["K%d_" % i for i in range(10)]
+
+          NOT_EXECUTED = {
+              "backend.Tests.ClaudeIntegrationTests.PostMessage_ReturnsRealAiReply_PersistedInConversationHistory",
+              "backend.Tests.ClaudeReplyServiceTests.GenerateReplyAsync_RealApiCall_ReturnsReplyAndPersistsAiMessage",
+              "backend.Tests.ClaudeReplyServiceTests.GenerateReplyAsync_ResolvedCustomer_CallsGetCustomerTool_RealResultReachesFinalReply",
+              "backend.Tests.VoyageEmbeddingClientLiveTests.EmbedWithUsageAsync_RealApiCall_ReportsUsableTotalTokens",
+          }
+
+
+          def stop(sentence):
+              print("::error::" + sentence)
+              sys.exit(1)
+
+
+          def results_of(name):
+              """[(class name, method name, outcome)] for every result in the file."""
+              path = os.path.join(RESULTS, name)
+              if not os.path.isfile(path):
+                  stop("The results file %s does not exist." % name)
+              root = ET.parse(path).getroot()
+              methods = {}
+              for unit in root.iterfind("t:TestDefinitions/t:UnitTest", NS):
+                  method = unit.find("t:TestMethod", NS)
+                  if method is None:
+                      continue
+                  cls = method.get("className", "")
+                  raw = method.get("name", "")
+                  if raw.startswith(cls + "."):
+                      raw = raw[len(cls) + 1:]
+                  methods[unit.get("id")] = (cls, raw.split("(", 1)[0])
+              rows = []
+              for result in root.iterfind("t:Results/t:UnitTestResult", NS):
+                  cls, method = methods.get(result.get("testId"), ("", ""))
+                  rows.append((cls, method, result.get("outcome", "")))
+              return rows
+
+
+          def single(name, cls, method):
+              """Exactly one result in the file, the named test, passed."""
+              rows = results_of(name)
+              if rows != [(cls, method, "Passed")]:
+                  stop("%s: expected exactly one passed result of %s.%s; found %d result(s), %d passed."
+                       % (name, cls, method, len(rows), sum(1 for r in rows if r[2] == "Passed")))
+              print("%s: 1 of 1 passed (%s.%s)" % (name, cls, method))
+
+
+          def inventory(name):
+              rows = results_of(name)
+              by_outcome = {}
+              for _, _, outcome in rows:
+                  by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
+              # Recorded, never compared.
+              print("totals (informational): %d results; %s" % (
+                  len(rows), ", ".join("%s %d" % kv for kv in sorted(by_outcome.items()))))
+
+              problems = []
+              matched = 0
+              for cls, method, cases in INVENTORY:
+                  mine = [r for r in rows if r[0] == cls and r[1] == method]
+                  passed = sum(1 for r in mine if r[2] == "Passed")
+                  if len(mine) != cases or passed != cases:
+                      problems.append("%s.%s: expected %d passed, found %d result(s), %d passed"
+                                      % (cls, method, cases, len(mine), passed))
+                  else:
+                      matched += cases
+              for prefix in SCAN_PREFIXES:
+                  mine = [r for r in rows if r[0] == SCANS and r[1].startswith(prefix)]
+                  passed = sum(1 for r in mine if r[2] == "Passed")
+                  if len(mine) != 1 or passed != 1:
+                      problems.append("%s.%s*: expected exactly 1 passed, found %d result(s), %d passed"
+                                      % (SCANS, prefix, len(mine), passed))
+                  else:
+                      matched += 1
+              print("inventory: %d of 41 matched as passed" % matched)
+
+              not_executed = {r[0] + "." + r[1] for r in rows if r[2] == "NotExecuted"}
+              for missing in sorted(NOT_EXECUTED - not_executed):
+                  problems.append("expected NotExecuted, was not: " + missing)
+              for extra in sorted(not_executed - NOT_EXECUTED):
+                  problems.append("NotExecuted but not one of the four gated tests: " + extra)
+              count = sum(1 for r in rows if r[2] == "NotExecuted")
+              if count != len(NOT_EXECUTED):
+                  problems.append("expected exactly 4 NotExecuted results, found %d" % count)
+              print("NotExecuted: %d" % count)
+
+              other = sorted({r[0] + "." + r[1] for r in rows if r[2] not in ("Passed", "NotExecuted")})
+              for test in other:
+                  problems.append("not passed: " + test)
+
+              if problems:
+                  for line in problems:
+                      print("::error::" + line)
+                  sys.exit(1)
+              print("green: 0 failed, the four gated tests NotExecuted, 41 of 41 inventory names passed")
+
+
+          def scan():
+              """Refuses the upload if any secret value is in a results file."""
+              out = os.environ["GITHUB_OUTPUT"]
+              files = sorted(glob.glob(os.path.join(RESULTS, "*.trx")))
+
+              def refuse(sentence):
+                  for path in files:
+                      os.remove(path)
+                  with open(out, "a", encoding="utf-8") as handle:
+                      handle.write("passed=false\n")
+                  stop(sentence + " The results files were deleted and are not uploaded.")
+
+              try:
+                  with open(SECRETS, encoding="utf-8") as handle:
+                      secrets = json.load(handle)
+                  uri = secrets["ConnectionStrings:TestConnection"]
+                  parts = urlsplit(uri)
+                  raw_password = parts.password or ""
+                  password = unquote(raw_password)
+                  host = parts.hostname or ""
+                  needles = {
+                      "the connection URI": uri,
+                      "the database password": password,
+                      "the database password as written in the URI": raw_password,
+                      "WidgetToken:SigningKey": secrets["WidgetToken:SigningKey"],
+                      "IntegrationStateToken:SigningKey": secrets["IntegrationStateToken:SigningKey"],
+                      "Verification:HashingPepper": secrets["Verification:HashingPepper"],
+                  }
+              except Exception:
+                  refuse("The scan could not read the secret values, so it cannot prove they are absent.")
+              if not password or not host or any(not v for v in needles.values()):
+                  refuse("The scan found an empty secret value, so it cannot prove anything.")
+
+              host_count = 0
+              for path in files:
+                  with open(path, "rb") as handle:
+                      data = handle.read()
+                  for label, value in needles.items():
+                      forms = {value, escape(value), escape(value, {'"': "&quot;", "'": "&apos;"}),
+                               quote(value, safe="")}
+                      if any(form.encode("utf-8") in data for form in forms):
+                          refuse("%s holds %s." % (os.path.basename(path), label))
+                  host_count += data.count(host.encode("utf-8"))
+
+              print("scan: %d results file(s); no secret value found" % len(files))
+              print("scan: the database host name occurs %d time(s) (reported, not fatal)" % host_count)
+              with open(out, "a", encoding="utf-8") as handle:
+                  handle.write("passed=true\n")
+
+
+          if __name__ == "__main__":
+              command = sys.argv[1]
+              if command == "single":
+                  single(sys.argv[2], sys.argv[3], sys.argv[4])
+              elif command == "inventory":
+                  inventory(sys.argv[2])
+              elif command == "scan":
+                  scan()
+              else:
+                  stop("unknown command")
+          PY
+
+      # PathHelper (Microsoft.Extensions.Configuration.UserSecrets) takes
+      # APPDATA over HOME when it is set, empty or not, so an empty value
+      # would redirect the secrets root.
+      - name: Check the runner environment
+        run: |
+          if [ "${APPDATA+x}" = "x" ]; then
+            echo "::error::APPDATA is set on this runner (empty or not), so the user-secrets file would not be read from HOME."
+            exit 1
+          fi
+
+      - name: Write the user-secrets file
+        env:
+          NIVORA_CI_TEST_CONNECTION: ${{ secrets.NIVORA_CI_TEST_CONNECTION }}
+          NIVORA_CI_WIDGET_SIGNING_KEY: ${{ secrets.NIVORA_CI_WIDGET_SIGNING_KEY }}
+          NIVORA_CI_INTEGRATION_STATE_SIGNING_KEY: ${{ secrets.NIVORA_CI_INTEGRATION_STATE_SIGNING_KEY }}
+          NIVORA_CI_VERIFICATION_PEPPER: ${{ secrets.NIVORA_CI_VERIFICATION_PEPPER }}
+        run: |
+          umask 077
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import unicodedata
+          from urllib.parse import unquote, urlsplit
+
+
+          def stop(sentence):
+              print("::error::" + sentence)
+              sys.exit(1)
+
+
+          if os.environ.get("APPDATA"):
+              stop("APPDATA is set on this runner, so the user-secrets file would not be read from HOME.")
+
+          names = [
+              "NIVORA_CI_TEST_CONNECTION",
+              "NIVORA_CI_WIDGET_SIGNING_KEY",
+              "NIVORA_CI_INTEGRATION_STATE_SIGNING_KEY",
+              "NIVORA_CI_VERIFICATION_PEPPER",
+          ]
+          values = {}
+          for name in names:
+              value = os.environ.get(name, "")
+              if not value.strip():
+                  stop("The repository secret %s is empty or is not available to this run." % name)
+              values[name] = value
+
+          # Validation. All of it runs before any add-mask line and before the
+          # file is written. A refusal names the check and never shows a value.
+          for name in names:
+              if any(c.isspace() or unicodedata.category(c) == "Cc" for c in values[name]):
+                  stop("%s: refused. It must be one line with no line break, space, U+0000 or other control character." % name)
+
+          uri = values["NIVORA_CI_TEST_CONNECTION"]
+          if re.search(r"%(?:[01][0-9a-f]|7f)", uri, re.IGNORECASE):
+              stop("NIVORA_CI_TEST_CONNECTION: refused. It holds a percent-encoded control character (such as an encoded U+0000, line feed or carriage return).")
+          if not uri.startswith("postgresql://"):
+              stop("NIVORA_CI_TEST_CONNECTION: refused. It does not begin with postgresql://.")
+          try:
+              parts = urlsplit(uri)
+              raw_password = parts.password or ""
+              password = unquote(raw_password)
+              host = parts.hostname or ""
+              user = parts.username or ""
+              database = parts.path
+          except ValueError:
+              stop("NIVORA_CI_TEST_CONNECTION is not a connection URI. The value is not shown.")
+          if not host:
+              stop("NIVORA_CI_TEST_CONNECTION: refused. It has no host.")
+          if user != "nivora_ci":
+              stop("NIVORA_CI_TEST_CONNECTION does not name the role nivora_ci. CI connects as nivora_ci only.")
+          if database != "/nivora_test":
+              stop("NIVORA_CI_TEST_CONNECTION does not name the database nivora_test.")
+          if not re.fullmatch(r"[0-9a-f]{64}", password):
+              stop("NIVORA_CI_TEST_CONNECTION: refused. The password is not exactly 64 lower-case hexadecimal characters.")
+          for name in names[1:]:
+              if not re.fullmatch(r"[A-Za-z0-9+/]{32,}={0,2}", values[name]):
+                  stop("%s: refused. It is not 32 or more characters of the base64 alphabet." % name)
+
+          # Masking follows validation. Values derived from a secret are not
+          # masked automatically.
+          print("::add-mask::" + password)
+          if raw_password != password:
+              print("::add-mask::" + raw_password)
+          print("::add-mask::" + host)
+
+          secrets = {
+              "ConnectionStrings:TestConnection": values["NIVORA_CI_TEST_CONNECTION"],
+              "WidgetToken:SigningKey": values["NIVORA_CI_WIDGET_SIGNING_KEY"],
+              "IntegrationStateToken:SigningKey": values["NIVORA_CI_INTEGRATION_STATE_SIGNING_KEY"],
+              "Verification:HashingPepper": values["NIVORA_CI_VERIFICATION_PEPPER"],
+              "Shopify:ClientId": "ci-sentinel-client-id",
+              "Shopify:ClientSecret": "ci-sentinel-client-secret",
+              "Shopify:RedirectUri": "https://ci.invalid/api/integrations/shopify/callback",
+              "Shopify:AdminApiVersion": "2026-07",
+              "Resend:ApiKey": "ci-sentinel-not-a-key",
+          }
+          directory = os.path.join(
+              os.environ["HOME"], ".microsoft", "usersecrets", os.environ["USER_SECRETS_ID"])
+          os.makedirs(directory, mode=0o700, exist_ok=True)
+          path = os.path.join(directory, "secrets.json")
+          descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+              json.dump(secrets, handle)
+          print("user-secrets file written: %d keys, mode 600" % len(secrets))
+          PY
+
+      # Debug: the configuration of every recorded local run (plain
+      # `dotnet test backend.Tests`).
+      - name: Build
+        run: dotnet build backend.Tests/backend.Tests.csproj --configuration Debug
+
+      # CI never provisions and never migrates. This runs the suite's own
+      # read-only staleness check and nothing else.
+      - name: Assert the migration head of nivora_test
+        run: |
+          if ! dotnet test backend.Tests/backend.Tests.csproj --no-build --configuration Debug \
+              --filter "FullyQualifiedName=backend.Tests.TestDatabaseTests.StalenessCheck_PassesOnNivoraTest" \
+              --logger "trx;LogFileName=head.trx" --results-directory "${RUNNER_TEMP}/nivora-results" \
+              --logger "console;verbosity=minimal"; then
+            echo "::error::nivora_test is not at this commit's migration head, or the role nivora_ci cannot read it. Rebuild nivora_test (dotnet run --project tools/TestDatabase -- rebuild), then run the grant script (tools/TestDatabase/grant-ci-role.sql). CI never provisions and never migrates."
+            exit 1
+          fi
+          python3 "${RUNNER_TEMP}/trx_tool.py" single head.trx backend.Tests.TestDatabaseTests StalenessCheck_PassesOnNivoraTest
+
+      - name: Host guard test alone (T6)
+        run: |
+          dotnet test backend.Tests/backend.Tests.csproj --no-build --configuration Debug \
+            --filter "FullyQualifiedName=backend.Tests.TestDatabaseTests.Host_GuardRefuses_AnyOtherDatabase" \
+            --logger "trx;LogFileName=t6.trx" --results-directory "${RUNNER_TEMP}/nivora-results" \
+            --logger "console;verbosity=minimal"
+          python3 "${RUNNER_TEMP}/trx_tool.py" single t6.trx backend.Tests.TestDatabaseTests Host_GuardRefuses_AnyOtherDatabase
+
+      - name: Full suite
+        id: suite
+        run: |
+          dotnet test backend.Tests/backend.Tests.csproj --no-build --configuration Debug \
+            --logger "trx;LogFileName=suite.trx" --results-directory "${RUNNER_TEMP}/nivora-results" \
+            --logger "console;verbosity=minimal"
+
+      - name: Inventory (41 names passed, the four gated tests NotExecuted)
+        if: ${{ !cancelled() && steps.suite.conclusion != 'skipped' }}
+        run: python3 "${RUNNER_TEMP}/trx_tool.py" inventory suite.trx
+
+      - name: Scan the results files for secret values
+        id: scan
+        if: ${{ always() }}
+        run: python3 "${RUNNER_TEMP}/trx_tool.py" scan
+
+      - name: Upload the results files
+        if: ${{ always() && steps.scan.outputs.passed == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nivora-trx-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nivora-results/*.trx
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Delete the user-secrets file
+        if: ${{ always() }}
+        run: rm -f "${HOME}/.microsoft/usersecrets/${USER_SECRETS_ID}/secrets.json"
+
+  js:
+    name: frontend and widget-client
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 26
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26'
+          package-manager-cache: false
+
+      - name: frontend - install
+        working-directory: frontend
+        run: npm ci
+
+      - name: frontend - eslint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: frontend - vitest
+        working-directory: frontend
+        run: npm test
+
+      - name: widget-client - install
+        working-directory: widget-client
+        run: npm ci
+
+      - name: widget-client - tsc --noEmit
+        working-directory: widget-client
+        run: npm run typecheck
+
+      - name: widget-client - vitest
+        working-directory: widget-client
+        run: npm test
