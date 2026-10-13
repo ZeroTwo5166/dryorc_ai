@@ -22,9 +22,10 @@ public interface IVoyageEmbeddingClient
     /// <paramref name="usage"/> as each batch completes, so the running total
     /// survives a later throw (A1 design v11 §2:97; Slice 3 decisions
     /// addendum Q1). The interface's only member, and for
-    /// <see cref="IVoyageEmbeddingInvoker"/> only. <paramref name="usage"/>
-    /// is required and deliberately has no default interface body (addendum
-    /// OD-8): every implementer supplies its own accumulator handling.
+    /// <see cref="IVoyageEmbeddingInvoker"/> only — enforced by
+    /// ProviderBypassSourceScanTests. <paramref name="usage"/> is required
+    /// and deliberately has no default interface body (addendum OD-8): every
+    /// implementer supplies its own accumulator handling.
     /// </summary>
     Task<IReadOnlyList<float[]>> EmbedWithUsageAsync(
         IReadOnlyList<string> texts, VoyageInputType inputType, VoyageUsageAccumulator usage,
