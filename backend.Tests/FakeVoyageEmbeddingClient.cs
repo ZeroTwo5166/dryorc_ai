@@ -39,10 +39,6 @@ public class FakeVoyageEmbeddingClient : IVoyageEmbeddingClient
     public int CallCount { get; private set; }
     public List<(IReadOnlyList<string> Texts, VoyageInputType InputType)> Requests { get; } = [];
 
-    public Task<IReadOnlyList<float[]>> EmbedAsync(
-        IReadOnlyList<string> texts, VoyageInputType inputType, CancellationToken cancellationToken = default) =>
-        EmbedWithUsageAsync(texts, inputType, new VoyageUsageAccumulator(), cancellationToken);
-
     public Task<IReadOnlyList<float[]>> EmbedWithUsageAsync(
         IReadOnlyList<string> texts, VoyageInputType inputType, VoyageUsageAccumulator usage,
         CancellationToken cancellationToken = default)

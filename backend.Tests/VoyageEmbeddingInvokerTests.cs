@@ -298,10 +298,6 @@ public class VoyageEmbeddingInvokerTests : IAsyncLifetime
 
     private sealed class FixedResultVoyageClient(IReadOnlyList<float[]> result) : IVoyageEmbeddingClient
     {
-        public Task<IReadOnlyList<float[]>> EmbedAsync(
-            IReadOnlyList<string> texts, VoyageInputType inputType, CancellationToken cancellationToken = default) =>
-            throw new NotSupportedException();
-
         public Task<IReadOnlyList<float[]>> EmbedWithUsageAsync(
             IReadOnlyList<string> texts, VoyageInputType inputType, VoyageUsageAccumulator usage,
             CancellationToken cancellationToken = default)

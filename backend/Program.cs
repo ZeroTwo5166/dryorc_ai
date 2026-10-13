@@ -257,7 +257,9 @@ builder.Services.AddScoped<IKnowledgeRetrievalService, KnowledgeRetrievalService
 // Production callers are the Slice 4b call sites
 // (AnalystOrchestrationService, KnowledgeIndexingService) and the Slice 4a
 // customer-turn call sites. The raw
-// clients stay registered as they are (DI lockdown is Slice 5). The rule (c)
+// clients stay ordinary registrations: Slice 5 declined a container lockdown
+// (DL-0) and enforces the rule by test (ProviderBypassArchitectureTests,
+// ProviderBypassSourceScanTests). The rule (c)
 // IUnauthorizedActionAuditWriter lands with its only caller,
 // ClaudeReplyService (Slice 4a, rule (b)/(c)).
 builder.Services.AddScoped<IAiInvocationRecorder, AiInvocationRecorder>();

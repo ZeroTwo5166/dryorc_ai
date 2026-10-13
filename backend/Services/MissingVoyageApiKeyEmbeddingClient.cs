@@ -27,10 +27,6 @@ public class VoyageNotConfiguredException()
 /// </summary>
 public class MissingVoyageApiKeyEmbeddingClient : IVoyageEmbeddingClient
 {
-    public Task<IReadOnlyList<float[]>> EmbedAsync(
-        IReadOnlyList<string> texts, VoyageInputType inputType, CancellationToken cancellationToken = default) =>
-        throw new VoyageNotConfiguredException();
-
     public Task<IReadOnlyList<float[]>> EmbedWithUsageAsync(
         IReadOnlyList<string> texts, VoyageInputType inputType, VoyageUsageAccumulator usage,
         CancellationToken cancellationToken = default) =>

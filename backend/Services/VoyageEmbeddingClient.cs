@@ -16,12 +16,6 @@ namespace backend.Services;
 /// </summary>
 public class VoyageEmbeddingClient(HttpClient httpClient) : IVoyageEmbeddingClient
 {
-    public Task<IReadOnlyList<float[]>> EmbedAsync(
-        IReadOnlyList<string> texts, VoyageInputType inputType, CancellationToken cancellationToken = default) =>
-        // Unchanged caller-visible behavior: the usage total is simply
-        // discarded on this path (A1 Slice 3 decisions addendum Q1).
-        EmbedWithUsageAsync(texts, inputType, new VoyageUsageAccumulator(), cancellationToken);
-
     public async Task<IReadOnlyList<float[]>> EmbedWithUsageAsync(
         IReadOnlyList<string> texts, VoyageInputType inputType, VoyageUsageAccumulator usage,
         CancellationToken cancellationToken = default)

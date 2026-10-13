@@ -18,20 +18,14 @@ public interface IVoyageEmbeddingClient
     /// callers never need to reason about Voyage's own response
     /// ordering/index semantics: the implementation re-maps by Voyage's
     /// returned index and throws VoyageEmbeddingException rather than risk
-    /// silently pairing an embedding with the wrong text.
-    /// </summary>
-    Task<IReadOnlyList<float[]>> EmbedAsync(
-        IReadOnlyList<string> texts, VoyageInputType inputType, CancellationToken cancellationToken = default);
-
-    /// <summary>
-    /// Same behavior as <see cref="EmbedAsync"/>, additionally reporting
-    /// usage into <paramref name="usage"/> as each batch completes, so the
-    /// running total survives a later throw (A1 design v11 §2:97; Slice 3
-    /// decisions addendum Q1). Intended for <see cref="IVoyageEmbeddingInvoker"/>
-    /// only — a naming/code-review convention until the Slice 5 architecture
-    /// test enforces it. <paramref name="usage"/> is required and deliberately
-    /// has no default interface body (addendum OD-8): every implementer
-    /// supplies its own accumulator handling.
+    /// silently pairing an embedding with the wrong text. Reports usage into
+    /// <paramref name="usage"/> as each batch completes, so the running total
+    /// survives a later throw (A1 design v11 §2:97; Slice 3 decisions
+    /// addendum Q1). The interface's only member, and for
+    /// <see cref="IVoyageEmbeddingInvoker"/> only — enforced by
+    /// ProviderBypassSourceScanTests. <paramref name="usage"/> is required
+    /// and deliberately has no default interface body (addendum OD-8): every
+    /// implementer supplies its own accumulator handling.
     /// </summary>
     Task<IReadOnlyList<float[]>> EmbedWithUsageAsync(
         IReadOnlyList<string> texts, VoyageInputType inputType, VoyageUsageAccumulator usage,

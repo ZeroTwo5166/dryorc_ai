@@ -126,7 +126,7 @@ public class KnowledgeDocumentsApiTests : IAsyncLifetime
 
     // ── T-API2 (A1 Slice 4b design §10.4): invocation capture over HTTP ─
     // Mutation: revert V1 in KnowledgeIndexingService to the raw
-    // IVoyageEmbeddingClient.EmbedAsync path — no row is captured.
+    // IVoyageEmbeddingClient.EmbedWithUsageAsync path — no row is captured.
 
     [Fact]
     public async Task Create_CapturesOneKnowledgeIndexingRowForTheBusiness()

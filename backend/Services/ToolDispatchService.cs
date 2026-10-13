@@ -1,6 +1,5 @@
 using Anthropic.Exceptions;
 using Anthropic.Models.Messages;
-using Anthropic.Services;
 using backend.Constants;
 using Microsoft.Extensions.Logging;
 
