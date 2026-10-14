@@ -15,6 +15,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace backend.Tests;
@@ -608,6 +609,11 @@ public class TicketHubTests : IAsyncLifetime
             var user = await userManager.FindByIdAsync(ownerId.ToString());
             Assert.NotNull(user);
             var principal = await principalFactory.CreateAsync(user!);
+
+            // Evidence marker for CI log analysis: logged through the host's
+            // console logger so it is ordered with the host's EF command lines.
+            scope.ServiceProvider.GetRequiredService<ILogger<TicketHubTests>>()
+                .LogInformation("SessionExpiry evidence window start.");
 
             // IssuedUtc set the way a real sign-in sets it. Without it,
             // SecurityStampValidator re-validates the stamp and rebuilds the
