@@ -112,6 +112,9 @@ public class NivoraApiFactory : WebApplicationFactory<Program>
             logging.ClearProviders();
             logging.AddConsole();
             logging.AddDebug();
+            // Evidence anchor for CI log analysis, test hosts only: TicketHub's
+            // Debug lines (connection id, auth outcome, seconds remaining).
+            logging.AddFilter(typeof(backend.Hubs.TicketHub).FullName, LogLevel.Debug);
         });
 
         builder.ConfigureTestServices(services =>

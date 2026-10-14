@@ -28,7 +28,7 @@ public record TicketEvent(Guid TicketId, string EventType);
 /// have read from HttpContext.User for an ordinary request.
 /// </summary>
 [Authorize(Policy = NivoraPolicies.AnyStaff)]
-public class TicketHub(IHubContext<TicketHub> hubContext) : Hub
+public class TicketHub(IHubContext<TicketHub> hubContext, ILogger<TicketHub> logger) : Hub
 {
     public static string GroupName(Guid businessId) => $"business:{businessId}";
 
@@ -58,6 +58,7 @@ public class TicketHub(IHubContext<TicketHub> hubContext) : Hub
         if (httpContext is not null)
         {
             var authResult = await httpContext.AuthenticateAsync(IdentityConstants.ApplicationScheme);
+            LogSessionExpiryAuthOutcome(authResult);
             if (authResult.Properties?.ExpiresUtc is { } expiresUtc)
             {
                 _ = MonitorSessionExpiryAsync(expiresUtc, Context.ConnectionId, Context.ConnectionAborted);
@@ -94,13 +95,51 @@ public class TicketHub(IHubContext<TicketHub> hubContext) : Hub
             return; // connection already ended naturally before its cookie would have expired
         }
 
+        logger.LogDebug(
+            "TicketHub connection {ConnectionId}: sending SessionExpiring, {SecondsRemaining:F1} s remaining.",
+            connectionId, (expiresUtc - DateTimeOffset.UtcNow).TotalSeconds);
         try
         {
             await hubContext.Clients.Client(connectionId).SendAsync("SessionExpiring", cancellationToken: connectionAborted);
+            logger.LogDebug("TicketHub connection {ConnectionId}: SessionExpiring send returned.", connectionId);
         }
         catch (OperationCanceledException)
         {
             // connection ended in the window between the delay elapsing and this send
         }
     }
+
+    // Diagnostic only: one line per connection. Never the cookie, the
+    // claims, the ticket or the raw failure message, only the closed set
+    // of categories below.
+    private void LogSessionExpiryAuthOutcome(AuthenticateResult authResult)
+    {
+        if (authResult.Properties?.ExpiresUtc is { } expiresUtc)
+        {
+            if (authResult.Succeeded)
+            {
+                logger.LogDebug(
+                    "TicketHub connection {ConnectionId}: authenticated {Succeeded}, session-expiry monitor starting, {SecondsRemaining:F1} s remaining.",
+                    Context.ConnectionId, authResult.Succeeded, (expiresUtc - DateTimeOffset.UtcNow).TotalSeconds);
+                return;
+            }
+
+            logger.LogWarning(
+                "TicketHub connection {ConnectionId}: authenticated {Succeeded}, session-expiry monitor starting ({FailureCategory}).",
+                Context.ConnectionId, authResult.Succeeded, SessionExpiryFailureCategory(authResult));
+            return;
+        }
+
+        logger.LogWarning(
+            "TicketHub connection {ConnectionId}: authenticated {Succeeded}, no session-expiry monitor started ({FailureCategory}).",
+            Context.ConnectionId, authResult.Succeeded, SessionExpiryFailureCategory(authResult));
+    }
+
+    private static string SessionExpiryFailureCategory(AuthenticateResult authResult) => authResult switch
+    {
+        { Succeeded: true } => "NoExpiresUtc",
+        { None: true } => "NoResult",
+        { Failure.Message: "Ticket expired" } => "ExpiredAtAuth",
+        _ => "AuthenticationFailed",
+    };
 }
