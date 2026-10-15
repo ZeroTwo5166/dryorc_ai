@@ -40,9 +40,16 @@ namespace backend.Tests;
 ///
 /// Membership: ConversationInactivityCloseServiceTests,
 /// DataLifecycleBackgroundServiceTests, GdprLifecycleFinalE2ETests,
-/// Step25Candidate2FinalE2ETests. If a future test file ever seeds a
-/// real, stale Conversation row on an auto-close-enabled Business, it must
-/// join this same collection.
+/// Step25Candidate2FinalE2ETests, AiProviderInvocationRetentionServiceTests.
+/// If a future test file ever seeds a real, stale Conversation row on an
+/// auto-close-enabled Business, it must join this same collection.
+///
+/// AiProviderInvocationRetentionServiceTests (Step 27 A1 Slice 6) joins for
+/// a related reason: every test host that runs the real
+/// DataLifecycleBackgroundService is in this collection, and that host's
+/// first tick runs the same global AiProviderInvocation retention delete —
+/// which, run concurrently, could delete that test's deliberately-old
+/// seeded rows before the test itself does.
 /// </summary>
 [CollectionDefinition("ConversationAutoClose")]
 public class ConversationAutoCloseTestCollection;
