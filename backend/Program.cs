@@ -137,6 +137,10 @@ builder.Services.AddScoped<IVerificationCodeCleanupService, VerificationCodeClea
 // opt-in later" pattern every other kill switch in this file already
 // used (CancelOrderToolEnabled/AiBusinessAnalystEnabled/ScheduledReportsEnabled).
 builder.Services.AddScoped<IConversationInactivityCloseService, ConversationInactivityCloseService>();
+// Step 27 A1 Slice 6 — AiProviderInvocation retention, the fifth job
+// DataLifecycleBackgroundService runs each tick: a fixed 90-day global
+// window (A1 v11 §7 Decision 4; docs/handoffs/billing-usage-a1-slice6-design.md).
+builder.Services.AddScoped<IAiProviderInvocationRetentionService, AiProviderInvocationRetentionService>();
 builder.Services.AddHostedService<DataLifecycleBackgroundService>();
 
 // Notification system — no live caller yet, registered as ready-to-call

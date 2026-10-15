@@ -37,6 +37,12 @@ namespace backend.Services;
 /// for every business, so this job is a correct no-op everywhere until an
 /// Owner explicitly opts in (Phase 1's endpoint).
 ///
+/// Step 27 A1 Slice 6 — the fifth job, AiProviderInvocation retention
+/// (AiProviderInvocationRetentionService: a fixed 90-day global window,
+/// A1 v11 §7 Decision 4), added through the same RunJobAsync boundary,
+/// unchanged — no bespoke handling. See
+/// docs/handoffs/billing-usage-a1-slice6-design.md.
+///
 /// AppDbContext is Scoped, so a fresh DI scope is created per tick rather
 /// than resolving the two services once at startup.
 /// </summary>
@@ -68,6 +74,10 @@ public class DataLifecycleBackgroundService(
 
             await RunJobAsync(scope.ServiceProvider, "ConversationInactivityClose",
                 sp => sp.GetRequiredService<IConversationInactivityCloseService>().CloseInactiveConversationsAsync(stoppingToken),
+                stoppingToken);
+
+            await RunJobAsync(scope.ServiceProvider, "AiProviderInvocationRetention",
+                sp => sp.GetRequiredService<IAiProviderInvocationRetentionService>().DeleteExpiredAsync(stoppingToken),
                 stoppingToken);
         } while (await timer.WaitForNextTickAsync(stoppingToken));
     }
