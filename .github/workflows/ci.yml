@@ -53,6 +53,15 @@ jobs:
             exit 1
           fi
 
+      # Diagnostic only. It prints the SDK that global.json selected and every
+      # runtime installed on the runner. Installed is not used: the test host
+      # picks its runtime at start-up, and nothing here proves which one.
+      - name: Diagnostic - SDK and installed runtimes
+        run: |
+          dotnet --version
+          dotnet --list-sdks
+          dotnet --list-runtimes
+
       - name: Write the TRX helper
         run: |
           mkdir -p "${RUNNER_TEMP}/nivora-results"
