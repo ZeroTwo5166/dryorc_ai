@@ -386,12 +386,63 @@ jobs:
           python3 "${RUNNER_TEMP}/trx_tool.py" single head.trx backend.Tests.TestDatabaseTests StalenessCheck_PassesOnNivoraTest
 
       - name: Host guard test alone (T6)
+        env:
+          DOTNET_HOST_TRACE: '1'
+          DOTNET_HOST_TRACEFILE: ${{ runner.temp }}/host-trace
         run: |
+          mkdir -p "${RUNNER_TEMP}/host-trace"
           dotnet test backend.Tests/backend.Tests.csproj --no-build --configuration Debug \
             --filter "FullyQualifiedName=backend.Tests.TestDatabaseTests.Host_GuardRefuses_AnyOtherDatabase" \
             --logger "trx;LogFileName=t6.trx" --results-directory "${RUNNER_TEMP}/nivora-results" \
             --logger "console;verbosity=minimal"
           python3 "${RUNNER_TEMP}/trx_tool.py" single t6.trx backend.Tests.TestDatabaseTests Host_GuardRefuses_AnyOtherDatabase
+          python3 - "${RUNNER_TEMP}/host-trace" <<'PY'
+          import os
+          import re
+          import sys
+
+          MGD = re.compile(r"^-- arguments_t: .*mgd_app='[^']*[\\/]testhost\.dll'$")
+          LH = re.compile(r"^Launch host: .*[\\/]testhost(\.exe)?, app: ")
+          FW = re.compile(r"^\s*framework:'Microsoft\.(NETCore|AspNetCore)\.App', lowest requested version='")
+
+
+          def fail(reason):
+              print("::error::T6 host trace: " + reason)
+              sys.exit(1)
+
+
+          directory = sys.argv[1]
+          try:
+              names = sorted(os.listdir(directory))
+          except OSError as error:
+              fail("cannot list the trace directory (%s)." % type(error).__name__)
+          logs = [name for name in names if name.endswith(".log")]
+          if not logs:
+              fail("no .log file in the trace directory.")
+          hosts = []
+          for name in logs:
+              path = os.path.join(directory, name)
+              if os.path.islink(path) or not os.path.isfile(path):
+                  fail("%s is not a regular file." % name)
+              try:
+                  with open(path, "rb") as handle:
+                      data = handle.read()
+              except OSError as error:
+                  fail("cannot read %s (%s)." % (name, type(error).__name__))
+              lines = [line[:-1] if line.endswith("\r") else line
+                       for line in data.decode("utf-8", "replace").split("\n")]
+              if any(MGD.match(line) or LH.match(line) for line in lines):
+                  hosts.append((name, lines))
+          if len(hosts) != 1:
+              fail("expected exactly one testhost trace file, found %d among %d .log files." % (len(hosts), len(logs)))
+          name, lines = hosts[0]
+          matched = [line for line in lines if FW.match(line)]
+          kinds = sorted(FW.match(line).group(1) for line in matched)
+          if kinds != ["AspNetCore", "NETCore"]:
+              fail("expected one NETCore.App and one AspNetCore.App summary line in the testhost trace, found %d matching lines." % len(matched))
+          for line in matched:
+              print(line)
+          PY
 
       - name: Full suite
         id: suite
