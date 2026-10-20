@@ -32,21 +32,17 @@ namespace backend.Auth;
 /// method invoked before authentication completed — not <c>FindByEmailAsync</c>
 /// (this app signs in by username, and registration sets
 /// <c>UserName == Email</c>, so a separate email-lookup override was never
-/// exercised), and not <c>FindByIdAsync</c> (that one's only caller,
-/// <c>SecurityStampValidator</c>'s periodic re-validation on later requests,
-/// runs after the BusinessId claim is already present on the incoming request's
-/// <c>HttpContext.User</c> from the auth cookie itself — so the normal filtered
-/// store already has a tenant to scope to by the time it runs, and needs no
-/// bypass).
+/// exercised), and not <c>FindByIdAsync</c>. <c>FindByIdAsync</c> is also
+/// overridden below, for the anonymous ConfirmEmail and ResetPassword flows;
+/// see its own doc comment.
 /// </para>
 ///
 /// <para>
 /// <b>Do not extend this pattern elsewhere without the same kind of empirical
 /// proof.</b> This override exists solely to solve the pre-authentication
 /// chicken-and-egg problem — "look the user up to learn which tenant they
-/// belong to" — nothing more. Every other method on this store (including
-/// writes, and all other reads) behaves exactly as the base EF Core store does:
-/// fully tenant-filtered.
+/// belong to" — nothing more. Every method except FindByNameAsync and
+/// FindByIdAsync is the base EF Core store; its reads are tenant-filtered.
 /// </para>
 /// </summary>
 public class TenantAwareUserStore(AppDbContext context, IdentityErrorDescriber? describer = null)

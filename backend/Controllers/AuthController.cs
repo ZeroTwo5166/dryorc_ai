@@ -288,8 +288,8 @@ public class AuthController(
     /// <summary>
     /// Cookie sign-in. Goes through SignInManager.PasswordSignInAsync, which
     /// resolves the user via UserManager.FindByNameAsync — routed to
-    /// TenantAwareUserStore.FindByNameAsync, the one deliberate
-    /// IgnoreQueryFilters() exception in this codebase (see that class for
+    /// TenantAwareUserStore.FindByNameAsync, one of this codebase's
+    /// deliberate, documented IgnoreQueryFilters() sites (see that class for
     /// why). On success, NivoraClaimsPrincipalFactory embeds BusinessId into
     /// the auth cookie so ICurrentTenantAccessor can resolve the tenant on
     /// every later request without a DB hit.
@@ -366,8 +366,8 @@ public class AuthController(
     /// Returns the currently signed-in staff user, for the dashboard to
     /// confirm session state on load (e.g. the post-login home page) without
     /// guessing from cookie presence alone. Tenant-scoped like everything
-    /// else: the Business lookup goes through the global query filter, so it
-    /// can only ever resolve the caller's own business.
+    /// else: Business has no query filter; the lookup is keyed by the
+    /// signed-in user's own BusinessId.
     /// </summary>
     [HttpGet("me")]
     [Authorize(Policy = NivoraPolicies.AnyStaff)]
