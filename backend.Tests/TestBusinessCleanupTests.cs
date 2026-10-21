@@ -22,7 +22,7 @@ public class TestBusinessCleanupTests : IAsyncLifetime
 {
     private static readonly TimeSpan BlockingDeadline = TimeSpan.FromSeconds(10);
 
-    // The 29 tables with BusinessId -> Businesses, and the 4 Identity child tables; listed
+    // The 30 tables with BusinessId -> Businesses, and the 4 Identity child tables; listed
     // here independently of the helper's statement list.
     private static readonly string[] BusinessIdTables =
     [
@@ -32,7 +32,7 @@ public class TestBusinessCleanupTests : IAsyncLifetime
         "FlaggedCustomerActivityLogs", "CustomerExtendedLoggingHistories", "ExternalIdentities",
         "AiProviderInvocations", "AuditLogs", "ScheduledReportRuns", "BusinessSigningKeys",
         "Conversations", "Customers", "Widgets", "Integrations", "ConsumedSignedIdentityTokens",
-        "SlaTargets", "TagModeMappings", "AspNetUsers",
+        "SlaTargets", "TagModeMappings", "StaffInvitations", "AspNetUsers",
     ];
 
     private static readonly string[] IdentityChildTables =
@@ -344,6 +344,7 @@ public class TestBusinessCleanupTests : IAsyncLifetime
         Assert.True(ownerRoleId.HasValue, $"The Owner role (normalized name {ownerRoleName}) is missing from AspNetRoles; H4 does not create roles.");
 
         var userName = $"cleanup-helper-{Guid.NewGuid():N}@example.test";
+        var invitationEmail = $"cleanup-invite-{Guid.NewGuid():N}@example.test";
         var user = new ApplicationUser
         {
             Id = Guid.NewGuid(), BusinessId = businessId, UserName = userName, NormalizedUserName = userName.ToUpperInvariant(),
@@ -469,7 +470,13 @@ public class TestBusinessCleanupTests : IAsyncLifetime
             },
             new ConsumedSignedIdentityToken { Id = Guid.NewGuid(), BusinessId = businessId, Jti = Guid.NewGuid().ToString(), ConsumedAt = now },
             new SlaTarget { Id = Guid.NewGuid(), BusinessId = businessId, Priority = TicketPriority.Low, TargetMinutes = 60, CreatedAt = now, UpdatedAt = now },
-            new TagModeMapping { Id = Guid.NewGuid(), BusinessId = businessId, Tag = "cleanup", Mode = ConversationMode.Auto, CreatedAt = now, UpdatedAt = now });
+            new TagModeMapping { Id = Guid.NewGuid(), BusinessId = businessId, Tag = "cleanup", Mode = ConversationMode.Auto, CreatedAt = now, UpdatedAt = now },
+            new StaffInvitation
+            {
+                Id = Guid.NewGuid(), BusinessId = businessId, Email = invitationEmail, NormalizedKey = invitationEmail.ToUpperInvariant(),
+                Role = RoleNames.Agent, TokenHash = System.Security.Cryptography.RandomNumberGenerator.GetBytes(32),
+                InvitedByUserId = user.Id, CreatedAt = now, ExpiresAt = now.AddDays(7), LastSentAt = now,
+            });
         await db.SaveChangesAsync();
 
         return businessId;
