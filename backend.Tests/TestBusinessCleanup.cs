@@ -17,7 +17,7 @@ namespace backend.Tests;
 ///
 /// Sequence per call (design section 6.1): validate before connecting; round trip 1
 /// (SET LOCAL timeouts, lock the listed Businesses rows, creation-time check,
-/// cross-owner check); round trip 2 (the 34 statements as one batch); commit.
+/// cross-owner check); round trip 2 (the 35 statements as one batch); commit.
 /// Any refusal or failure rolls back and throws; nothing is retried or swallowed.
 /// </summary>
 internal static class TestBusinessCleanup
@@ -30,7 +30,7 @@ internal static class TestBusinessCleanup
         Guid.Parse("50903e70-54bd-471a-ba7c-bd2344c6a5c3"),
     }.ToFrozenSet();
 
-    // The 34 statements, in order, each with the one uuid[] parameter @ids.
+    // The 35 statements, in order, each with the one uuid[] parameter @ids.
     internal static readonly ImmutableArray<CleanupStatement> Statements =
     [
         new(1, "MessageKnowledgeSources", """DELETE FROM "MessageKnowledgeSources" WHERE "BusinessId" = ANY(@ids)"""),
@@ -61,12 +61,13 @@ internal static class TestBusinessCleanup
         new(26, "ConsumedSignedIdentityTokens", """DELETE FROM "ConsumedSignedIdentityTokens" WHERE "BusinessId" = ANY(@ids)"""),
         new(27, "SlaTargets", """DELETE FROM "SlaTargets" WHERE "BusinessId" = ANY(@ids)"""),
         new(28, "TagModeMappings", """DELETE FROM "TagModeMappings" WHERE "BusinessId" = ANY(@ids)"""),
-        new(29, "AspNetUserClaims", """DELETE FROM "AspNetUserClaims" WHERE "UserId" IN (SELECT "Id" FROM "AspNetUsers" WHERE "BusinessId" = ANY(@ids))"""),
-        new(30, "AspNetUserLogins", """DELETE FROM "AspNetUserLogins" WHERE "UserId" IN (SELECT "Id" FROM "AspNetUsers" WHERE "BusinessId" = ANY(@ids))"""),
-        new(31, "AspNetUserTokens", """DELETE FROM "AspNetUserTokens" WHERE "UserId" IN (SELECT "Id" FROM "AspNetUsers" WHERE "BusinessId" = ANY(@ids))"""),
-        new(32, "AspNetUserRoles", """DELETE FROM "AspNetUserRoles" WHERE "UserId" IN (SELECT "Id" FROM "AspNetUsers" WHERE "BusinessId" = ANY(@ids))"""),
-        new(33, "AspNetUsers", """DELETE FROM "AspNetUsers" WHERE "BusinessId" = ANY(@ids)"""),
-        new(34, "Businesses", """DELETE FROM "Businesses" WHERE "Id" = ANY(@ids)"""),
+        new(29, "StaffInvitations", """DELETE FROM "StaffInvitations" WHERE "BusinessId" = ANY(@ids)"""),
+        new(30, "AspNetUserClaims", """DELETE FROM "AspNetUserClaims" WHERE "UserId" IN (SELECT "Id" FROM "AspNetUsers" WHERE "BusinessId" = ANY(@ids))"""),
+        new(31, "AspNetUserLogins", """DELETE FROM "AspNetUserLogins" WHERE "UserId" IN (SELECT "Id" FROM "AspNetUsers" WHERE "BusinessId" = ANY(@ids))"""),
+        new(32, "AspNetUserTokens", """DELETE FROM "AspNetUserTokens" WHERE "UserId" IN (SELECT "Id" FROM "AspNetUsers" WHERE "BusinessId" = ANY(@ids))"""),
+        new(33, "AspNetUserRoles", """DELETE FROM "AspNetUserRoles" WHERE "UserId" IN (SELECT "Id" FROM "AspNetUsers" WHERE "BusinessId" = ANY(@ids))"""),
+        new(34, "AspNetUsers", """DELETE FROM "AspNetUsers" WHERE "BusinessId" = ANY(@ids)"""),
+        new(35, "Businesses", """DELETE FROM "Businesses" WHERE "Id" = ANY(@ids)"""),
     ];
 
     internal static readonly ImmutableArray<string> UntouchedTables =
@@ -152,6 +153,8 @@ internal static class TestBusinessCleanup
         new("ScheduledReportRuns", "BusinessId", "Businesses", DeleteBehavior.Restrict),
         new("ScheduledReportRuns", "RecipientOwnerId", "AspNetUsers", DeleteBehavior.SetNull),
         new("SlaTargets", "BusinessId", "Businesses", DeleteBehavior.Restrict),
+        new("StaffInvitations", "BusinessId", "Businesses", DeleteBehavior.Restrict),
+        new("StaffInvitations", "InvitedByUserId", "AspNetUsers", DeleteBehavior.Restrict),
         new("TagModeMappings", "BusinessId", "Businesses", DeleteBehavior.Restrict),
         new("Tickets", "BusinessId", "Businesses", DeleteBehavior.Restrict),
         new("Tickets", "ClaimedByUserId", "AspNetUsers", DeleteBehavior.SetNull),
@@ -291,7 +294,7 @@ internal static class TestBusinessCleanup
     }
 
     // Test seam, used only by the helper's own tests. Runs every refusal of the overload above;
-    // no parameter skips one. omitSteps: step numbers of Statements to leave out, 1-34 only.
+    // no parameter skips one. omitSteps: step numbers of Statements to leave out, 1-35 only.
     // afterLock: invoked after round trip 1 while the Business rows are locked. referenceTime:
     // replaces the process start time in the creation-time check; must be later than it.
     internal static async Task DeleteOwnedRowsAsync(
@@ -308,11 +311,11 @@ internal static class TestBusinessCleanup
 
         var validIds = ValidateIds(idCopy);
 
-        var outOfRange = omitCopy.Where(step => step is < 1 or > 34).Order().ToArray();
+        var outOfRange = omitCopy.Where(step => step is < 1 or > 35).Order().ToArray();
         if (outOfRange.Length > 0)
         {
             throw new ArgumentException(
-                $"omitSteps accepts step numbers 1-34 only; got {string.Join(", ", outOfRange)}.", nameof(omitSteps));
+                $"omitSteps accepts step numbers 1-35 only; got {string.Join(", ", outOfRange)}.", nameof(omitSteps));
         }
 
         var statements = Statements.Where(s => !omitCopy.Contains(s.Step)).ToImmutableArray();

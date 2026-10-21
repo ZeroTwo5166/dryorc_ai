@@ -1,4 +1,5 @@
 ﻿using System.Reflection;
+using backend.Auth;
 using backend.Constants;
 using backend.Interfaces;
 using backend.Models;
@@ -67,6 +68,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
     public DbSet<Approval> Approvals => Set<Approval>();
     public DbSet<ScheduledReportRun> ScheduledReportRuns => Set<ScheduledReportRun>();
     public DbSet<AiProviderInvocation> AiProviderInvocations => Set<AiProviderInvocation>();
+    public DbSet<StaffInvitation> StaffInvitations => Set<StaffInvitation>();
 
     // Step 18: the ASP.NET Core Data Protection key ring, persisted here
     // (Postgres) instead of the framework's filesystem default — see
@@ -1135,6 +1137,54 @@ public class AppDbContext(DbContextOptions<AppDbContext> options, ICurrentTenant
             a.HasOne<Conversation>().WithMany()
                 .HasForeignKey(x => x.ConversationId)
                 .OnDelete(DeleteBehavior.SetNull);
+        });
+
+        // ─────────────────────────────────────────────────────────────
+        // Staff invite: pending staff invitations (staff-invite design
+        // Section 2). Accept and revoke delete the row; only the token's
+        // SHA-256 hash is stored. The tenant filter comes from the
+        // ITenantOwned loop below.
+        // ─────────────────────────────────────────────────────────────
+        builder.Entity<StaffInvitation>(s =>
+        {
+            s.Property(x => x.Email).HasMaxLength(256);
+            s.Property(x => x.NormalizedKey).HasMaxLength(256);
+            s.Property(x => x.Role).HasMaxLength(16);
+
+            s.HasIndex(x => x.TokenHash).IsUnique();
+            s.HasIndex(x => new { x.BusinessId, x.NormalizedKey }).IsUnique();
+
+            // The cleanup job's expiry predicate is global, not per
+            // business, so it needs ExpiresAt as a leading column (same
+            // reason as AiProviderInvocation's standalone CreatedAt index).
+            s.HasIndex(x => x.ExpiresAt);
+
+            s.ToTable(t =>
+            {
+                t.HasCheckConstraint(
+                    "CK_StaffInvitations_Role",
+                    $"\"Role\" IN ('{RoleNames.Admin}', '{RoleNames.Agent}')");
+
+                t.HasCheckConstraint(
+                    "CK_StaffInvitations_ExpiresAfterCreated",
+                    "\"ExpiresAt\" > \"CreatedAt\"");
+
+                t.HasCheckConstraint(
+                    "CK_StaffInvitations_LastSentAt_Range",
+                    "\"LastSentAt\" >= \"CreatedAt\"");
+
+                t.HasCheckConstraint(
+                    "CK_StaffInvitations_TokenHash_Length",
+                    "octet_length(\"TokenHash\") = 32");
+            });
+
+            s.HasOne<Business>().WithMany()
+                .HasForeignKey(x => x.BusinessId)
+                .OnDelete(DeleteBehavior.Restrict);
+
+            s.HasOne<ApplicationUser>().WithMany()
+                .HasForeignKey(x => x.InvitedByUserId)
+                .OnDelete(DeleteBehavior.Restrict);
         });
 
         // ─────────────────────────────────────────────────────────────
