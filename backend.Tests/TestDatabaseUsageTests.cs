@@ -202,7 +202,8 @@ public class TestDatabaseUsageTests
             ("TestDatabaseTests.cs", Exactly(1)),
             ("NivoraApiFactory.cs", Exactly(1, StaffInvitesKey)),
             ("StaffInviteSwitchAndOptionsTests.cs", Exactly(2, StaffInvitesKey)),
-            ("StaffInvitationsApiTests.cs", Exactly(1, FrontendBaseUrlEmpty))));
+            ("StaffInvitationsApiTests.cs", Exactly(1, FrontendBaseUrlEmpty)),
+            ("StaffInvitationSwitchOffTests.cs", Exactly(1, StaffInvitesKey))));
         Check("K7e", @"\bConfigure[A]ppConfiguration\b|\bConfigure[H]ostConfiguration\b");
         Check("K7f1", @"\bAddIn[M]emoryCollection\b", Only(("TestDatabaseTests.cs", Exactly(1))));
         Check("K7f2", @"\bAddEnvironment[V]ariables\b|\bAdd[J]sonFile\b|\bAddCommand[L]ine\b|\bAddIni[F]ile\b|\bAddXml[F]ile\b|\bAddKeyPer[F]ile\b");

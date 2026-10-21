@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using backend.Auth;
 using backend.Constants;
+using backend.Controllers;
 using backend.Data;
 using backend.Email;
 using backend.Enums;
@@ -24,9 +25,10 @@ namespace backend.Tests;
 /// <summary>
 /// Staff invite slice 5b, service level: preview and the accept transaction
 /// (docs/handoffs/staff-invite-design.md Section 7; Section T rows T-I1a,
-/// T-I1b, T-I1c, T-D3b, T-D5 (also covers T-NE-F11), T-D6, T-D18). There is no
-/// controller yet, so every test calls IStaffInvitationService from a scope
-/// of the test host. The tenant comes from a private AsyncLocal accessor:
+/// T-I1b, T-I1c, T-D3b, T-D5 (also covers T-NE-F11), T-D6, T-D18); slice 5c
+/// adds T-D12's anonymous limit over HTTP. The service-level tests call
+/// IStaffInvitationService from a scope of _host. The tenant comes from a
+/// private AsyncLocal accessor:
 /// staff calls set it to the caller's business, preview and accept leave it
 /// null, which is the "no tenant" state of an anonymous request (design V8).
 /// Tokens are read from the link in the host's FakeEmailSender (D8).
@@ -249,6 +251,26 @@ public class StaffInvitationAcceptTests : IAsyncLifetime
         Assert.DoesNotContain(newMember!.Id, recipients);
         Assert.DoesNotContain(inactiveAgent.UserId, recipients);
         Assert.DoesNotContain(otherBusinessOwner.UserId, recipients);
+    }
+
+    // T-D12 (slice 5c, over HTTP): the 11th preview from one client within a
+    // minute is refused. The root factory host is used, so the request runs
+    // with no tenant, as in production.
+    [Fact]
+    public async Task AnonymousLimit_11thIn1Min_429()
+    {
+        using var client = _factory.CreateClient(new() { BaseAddress = new Uri("https://localhost") });
+
+        var statuses = new List<HttpStatusCode>();
+        for (var i = 0; i < 11; i++)
+        {
+            var (unknownToken, _) = NewTokenAndHash();
+            var response = await client.PostAsJsonAsync("/api/staff-invitations/preview", new PreviewStaffInvitationRequest(unknownToken));
+            statuses.Add(response.StatusCode);
+        }
+
+        Assert.All(statuses.Take(10), s => Assert.Equal(HttpStatusCode.NotFound, s));
+        Assert.Equal(HttpStatusCode.TooManyRequests, statuses[10]);
     }
 
     // ── Harness (private, per-file doubles; CustomersApiTests.cs convention) ──

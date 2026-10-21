@@ -1,17 +1,21 @@
 using System.Buffers.Text;
+using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Http.Json;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using backend.Auth;
 using backend.Constants;
+using backend.Controllers;
 using backend.Data;
 using backend.Email;
 using backend.Enums;
 using backend.Interfaces;
 using backend.Models;
 using backend.Services;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -20,20 +24,24 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Primitives;
 using Xunit;
 
 namespace backend.Tests;
 
 /// <summary>
-/// Staff invite slice 5b, service level: create, resend and revoke
-/// (docs/handoffs/staff-invite-design.md Sections 4-6 and 11; Section T rows
-/// T-I2b, T-I8a, T-R1, T-D3a, T-D8, T-D9, T-D10, T-D11, T-D19b, T-D19c).
-/// There is no controller yet, so every test calls IStaffInvitationService
-/// from a scope of the test host; slice 5c adds the HTTP tests to this class.
-/// The tenant comes from a private AsyncLocal accessor: staff calls set it to
-/// the caller's business, accept leaves it null (design V8). Tokens are read
-/// from the link in the host's FakeEmailSender (D8).
+/// Staff invite slices 5b and 5c: create, resend and revoke
+/// (docs/handoffs/staff-invite-design.md Sections 4-6, 8, 9 and 11; Section T
+/// rows T-I2b, T-I8a, T-R1, T-D3a, T-D8, T-D9, T-D10, T-D11, T-D19b, T-D19c
+/// at service level, and T-I3, T-I4, T-I4b, T-I6, T-D12 over HTTP).
+/// The service-level tests call IStaffInvitationService from a scope of
+/// _host, where the tenant comes from a private AsyncLocal accessor: staff
+/// calls set it to the caller's business, accept leaves it null (design V8).
+/// The HTTP tests use the root factory (or a host derived from it without
+/// that accessor), so the tenant comes from the signed-in cookie as in
+/// production. Tokens are read from the link in the host's FakeEmailSender
+/// (D8).
 ///
 /// T-D19b: the seven-case Theory checks StaffInvitationLinkBuilder directly
 /// through a private IConfiguration double and a private IHostEnvironment
@@ -408,6 +416,220 @@ public class StaffInvitationsApiTests : IAsyncLifetime
         Assert.DoesNotContain("?", link, StringComparison.Ordinal);
     }
 
+    // T-I3 (DES :619; implementation design G-4): every token the invitee
+    // was emailed, by the create and by the resend, is absent from the
+    // database, the audit and notification rows, every response body and
+    // the captured log output.
+    [Fact]
+    public async Task Token_NeverPersistedLoggedAuditedOrReturned()
+    {
+        var logs = new CapturingLoggerProvider();
+        var host = _factory.WithWebHostBuilder(b => b.ConfigureLogging(l =>
+        {
+            l.AddProvider(logs);
+            l.AddFilter<CapturingLoggerProvider>(null, LogLevel.Trace);
+        }));
+        var (businessId, owner) = await SeedBusinessWithLoggedInOwnerAsync(host);
+        var email = NewEmail();
+        var bodies = new List<string>();
+        var rowSnapshots = new List<string>();
+
+        var created = await SendAsync(host, HttpMethod.Post, "/api/staff-invitations", owner.Cookie,
+            new CreateStaffInvitationRequest(email, RoleNames.Agent));
+        Assert.Equal(HttpStatusCode.Created, created.Status);
+        bodies.Add(created.Body);
+        var invitationId = ReadInvitation(created.Body).Id;
+        rowSnapshots.Add(await InvitationColumnsAsync(invitationId, host));
+
+        await MoveBackAsync(invitationId, TimeSpan.FromSeconds(61), host);
+        var resent = await SendAsync(host, HttpMethod.Post, $"/api/staff-invitations/{invitationId}/resend", owner.Cookie);
+        Assert.Equal(HttpStatusCode.OK, resent.Status);
+        bodies.Add(resent.Body);
+        rowSnapshots.Add(await InvitationColumnsAsync(invitationId, host));
+
+        // Every token in every email to the invitee: the create's and the resend's.
+        var tokens = EmailsTo(email, host)
+            .SelectMany(e => Regex.Matches(e.HtmlBody, "#token=([A-Za-z0-9_-]{43})").Select(m => m.Groups[1].Value))
+            .Distinct()
+            .ToList();
+        Assert.Equal(2, tokens.Count);
+        var resendToken = tokens[1];
+
+        var preview = await SendAsync(host, HttpMethod.Post, "/api/staff-invitations/preview", null,
+            new PreviewStaffInvitationRequest(resendToken));
+        Assert.Equal(HttpStatusCode.OK, preview.Status);
+        bodies.Add(preview.Body);
+        var accept = await SendAsync(host, HttpMethod.Post, "/api/staff-invitations/accept", null,
+            new AcceptStaffInvitationRequest(resendToken, Password));
+        Assert.Equal(HttpStatusCode.OK, accept.Status);
+        bodies.Add(accept.Body);
+
+        string auditValues;
+        string notifications;
+        await using (var scope = host.Services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var entityId = invitationId.ToString();
+            var audits = await db.AuditLogs.IgnoreQueryFilters().AsNoTracking()
+                .Where(a => a.EntityType == AuditEntityTypes.StaffInvitation && a.EntityId == entityId)
+                .Select(a => new { a.OldValue, a.NewValue })
+                .ToListAsync();
+            Assert.Equal(3, audits.Count);
+            auditValues = JsonSerializer.Serialize(audits);
+            notifications = JsonSerializer.Serialize(await db.Notifications.IgnoreQueryFilters().AsNoTracking()
+                .Where(n => n.BusinessId == businessId)
+                .ToListAsync());
+        }
+
+        // Positive control: the provider sees an Information line of the
+        // service's own category, so a missed capture cannot pass as "no leak".
+        var marker = Guid.NewGuid().ToString("N");
+        host.Services.GetRequiredService<ILogger<StaffInvitationService>>().LogInformation("T-I3 positive control {Marker}", marker);
+        var captured = logs.Entries;
+        Assert.Single(captured, e =>
+            e.Category == typeof(StaffInvitationService).FullName
+            && e.Level == LogLevel.Information
+            && e.Message == $"T-I3 positive control {marker}");
+
+        foreach (var token in tokens)
+        {
+            Assert.All(rowSnapshots, row => Assert.DoesNotContain(token, row, StringComparison.Ordinal));
+            Assert.DoesNotContain(token, auditValues, StringComparison.Ordinal);
+            Assert.DoesNotContain(token, notifications, StringComparison.Ordinal);
+            Assert.All(bodies, body => Assert.DoesNotContain(token, body, StringComparison.Ordinal));
+            Assert.All(captured, e =>
+            {
+                Assert.DoesNotContain(token, e.Message, StringComparison.Ordinal);
+                Assert.DoesNotContain(token, e.Exception ?? "", StringComparison.Ordinal);
+            });
+        }
+    }
+
+    // T-I4: every 403 cell of design Section 9; nothing changes.
+    [Theory]
+    [InlineData(RoleNames.Owner, "create", RoleNames.Owner)]
+    [InlineData(RoleNames.Admin, "create", RoleNames.Admin)]
+    [InlineData(RoleNames.Admin, "create", RoleNames.Owner)]
+    [InlineData(RoleNames.Admin, "resend", RoleNames.Admin)]
+    [InlineData(RoleNames.Admin, "revoke", RoleNames.Admin)]
+    [InlineData(RoleNames.Agent, "create", RoleNames.Admin)]
+    [InlineData(RoleNames.Agent, "create", RoleNames.Agent)]
+    [InlineData(RoleNames.Agent, "create", RoleNames.Owner)]
+    [InlineData(RoleNames.Agent, "resend", RoleNames.Admin)]
+    [InlineData(RoleNames.Agent, "resend", RoleNames.Agent)]
+    [InlineData(RoleNames.Agent, "revoke", RoleNames.Admin)]
+    [InlineData(RoleNames.Agent, "revoke", RoleNames.Agent)]
+    [InlineData(RoleNames.Agent, "list", null)]
+    public async Task RoleMatrix_ForbiddenCombination(string callerRole, string operation, string? targetRole)
+    {
+        var cell = await RunMatrixCellAsync(callerRole, operation, targetRole);
+
+        Assert.Equal(HttpStatusCode.Forbidden, cell.Status);
+        Assert.Equal(cell.InvitationsBefore, await CountBusinessInvitationsAsync(cell.BusinessId));
+        Assert.Equal(cell.AuditsBefore, await CountBusinessAuditsAsync(cell.BusinessId));
+        if (cell.Target is not null)
+        {
+            AssertUnchanged(cell.Target, await LoadInvitationAsync(cell.Target.Id, _factory));
+        }
+    }
+
+    // T-I4b: the allowed cells of design Section 9.
+    [Theory]
+    [InlineData(RoleNames.Owner, "create", RoleNames.Admin)]
+    [InlineData(RoleNames.Owner, "create", RoleNames.Agent)]
+    [InlineData(RoleNames.Owner, "resend", RoleNames.Admin)]
+    [InlineData(RoleNames.Owner, "resend", RoleNames.Agent)]
+    [InlineData(RoleNames.Owner, "revoke", RoleNames.Admin)]
+    [InlineData(RoleNames.Owner, "revoke", RoleNames.Agent)]
+    [InlineData(RoleNames.Owner, "list", null)]
+    [InlineData(RoleNames.Admin, "create", RoleNames.Agent)]
+    [InlineData(RoleNames.Admin, "resend", RoleNames.Agent)]
+    [InlineData(RoleNames.Admin, "revoke", RoleNames.Agent)]
+    [InlineData(RoleNames.Admin, "list", null)]
+    public async Task RoleMatrix_AllowedCombination(string callerRole, string operation, string? targetRole)
+    {
+        var cell = await RunMatrixCellAsync(callerRole, operation, targetRole);
+
+        var expected = operation switch
+        {
+            "create" => HttpStatusCode.Created,
+            "revoke" => HttpStatusCode.NoContent,
+            _ => HttpStatusCode.OK,
+        };
+        Assert.Equal(expected, cell.Status);
+    }
+
+    // T-I6: an email that is staff of another business and an unknown email
+    // look the same to the inviter; only the email bodies differ.
+    [Fact]
+    public async Task CrossBusinessAndUnknownEmail_IndistinguishableToInviter()
+    {
+        var (otherBusinessId, _) = await SeedBusinessWithOwnerAsync(_factory);
+        var staffEmail = NewEmail();
+        await SeedStaffAsync(otherBusinessId, RoleNames.Agent, staffEmail, _factory);
+        var unknownEmail = NewEmail();
+        var (_, owner) = await SeedBusinessWithLoggedInOwnerAsync(_factory);
+
+        var staffCreate = await SendAsync(_factory, HttpMethod.Post, "/api/staff-invitations", owner.Cookie,
+            new CreateStaffInvitationRequest(staffEmail, RoleNames.Agent));
+        var unknownCreate = await SendAsync(_factory, HttpMethod.Post, "/api/staff-invitations", owner.Cookie,
+            new CreateStaffInvitationRequest(unknownEmail, RoleNames.Agent));
+        Assert.Equal(HttpStatusCode.Created, staffCreate.Status);
+        Assert.Equal(HttpStatusCode.Created, unknownCreate.Status);
+
+        var list = await SendAsync(_factory, HttpMethod.Get, "/api/staff-invitations", owner.Cookie);
+        Assert.Equal(HttpStatusCode.OK, list.Status);
+
+        using var staffCreateJson = JsonDocument.Parse(staffCreate.Body);
+        using var unknownCreateJson = JsonDocument.Parse(unknownCreate.Body);
+        using var listJson = JsonDocument.Parse(list.Body);
+        var entries = listJson.RootElement.EnumerateArray().ToList();
+        var staffEntry = Assert.Single(entries, e => e.GetProperty("email").GetString() == staffEmail);
+        var unknownEntry = Assert.Single(entries, e => e.GetProperty("email").GetString() == unknownEmail);
+
+        // The shape check: the same property names everywhere.
+        var shapes = new[] { staffCreateJson.RootElement, unknownCreateJson.RootElement, staffEntry, unknownEntry }
+            .Select(e => e.EnumerateObject().Select(p => p.Name).Order(StringComparer.Ordinal).ToArray())
+            .ToList();
+        Assert.All(shapes, shape => Assert.Equal(shapes[0], shape));
+
+        // The value check: every property except the per-invitation ones is
+        // equal, so any added property is compared as well.
+        string[] perInvitation = ["id", "email", "createdAt", "expiresAt", "lastSentAt"];
+        var compared = shapes[0].Except(perInvitation).ToList();
+        Assert.Contains("role", compared);
+        Assert.Contains("status", compared);
+        foreach (var name in compared)
+        {
+            Assert.Equal(staffCreateJson.RootElement.GetProperty(name).GetRawText(), unknownCreateJson.RootElement.GetProperty(name).GetRawText());
+            Assert.Equal(staffEntry.GetProperty(name).GetRawText(), unknownEntry.GetProperty(name).GetRawText());
+        }
+
+        var staffMail = Assert.Single(EmailsTo(staffEmail, _factory));
+        Assert.Equal("Your Nivora invitation", staffMail.Subject);
+        Assert.DoesNotContain("#token=", staffMail.HtmlBody, StringComparison.Ordinal);
+        var unknownMail = Assert.Single(EmailsTo(unknownEmail, _factory));
+        Assert.Contains("/accept-invite#token=", unknownMail.HtmlBody, StringComparison.Ordinal);
+    }
+
+    // T-D12: the 21st create by one user within a minute is refused.
+    [Fact]
+    public async Task SendLimit_21stCreateIn1Min_429()
+    {
+        var (_, owner) = await SeedBusinessWithLoggedInOwnerAsync(_factory);
+
+        var statuses = new List<HttpStatusCode>();
+        for (var i = 0; i < 21; i++)
+        {
+            var response = await SendAsync(_factory, HttpMethod.Post, "/api/staff-invitations", owner.Cookie,
+                new CreateStaffInvitationRequest(NewEmail(), RoleNames.Agent));
+            statuses.Add(response.Status);
+        }
+
+        Assert.All(statuses.Take(20), s => Assert.Equal(HttpStatusCode.Created, s));
+        Assert.Equal(HttpStatusCode.TooManyRequests, statuses[20]);
+    }
+
     // ── Harness (private, per-file doubles; CustomersApiTests.cs convention) ──
 
     /// <summary>Reads the static AsyncLocal, so a test sets the tenant per flow (design V8 "no tenant" = null).</summary>
@@ -486,6 +708,12 @@ public class StaffInvitationsApiTests : IAsyncLifetime
 
     private async Task<(Guid BusinessId, StaffCaller Owner)> SeedBusinessWithOwnerAsync(WebApplicationFactory<Program>? host = null)
     {
+        var businessId = await SeedBusinessAsync(host);
+        return (businessId, await SeedStaffAsync(businessId, RoleNames.Owner, host: host));
+    }
+
+    private async Task<Guid> SeedBusinessAsync(WebApplicationFactory<Program>? host = null)
+    {
         var businessId = Guid.NewGuid();
         await using (var scope = (host ?? _host).Services.CreateAsyncScope())
         {
@@ -502,7 +730,7 @@ public class StaffInvitationsApiTests : IAsyncLifetime
         }
 
         _businessIdsToClean.Add(businessId);
-        return (businessId, await SeedStaffAsync(businessId, RoleNames.Owner, host: host));
+        return businessId;
     }
 
     /// <summary>BusinessApiTests.SeedStaffIntoBusinessAsync shape; returns the caller with its principal (G-1).</summary>
@@ -545,8 +773,8 @@ public class StaffInvitationsApiTests : IAsyncLifetime
         return result.Invitation!;
     }
 
-    private List<(string To, string Subject, string HtmlBody)> EmailsTo(string email) =>
-        ((FakeEmailSender)_host.Services.GetRequiredService<IEmailSender>()).SentEmails.Where(e => e.To == email).ToList();
+    private List<(string To, string Subject, string HtmlBody)> EmailsTo(string email, WebApplicationFactory<Program>? host = null) =>
+        ((FakeEmailSender)(host ?? _host).Services.GetRequiredService<IEmailSender>()).SentEmails.Where(e => e.To == email).ToList();
 
     private string TokenFromLastEmailTo(string email)
     {
@@ -560,9 +788,9 @@ public class StaffInvitationsApiTests : IAsyncLifetime
     /// Moves CreatedAt and LastSentAt back together, so the resend cooldown
     /// has passed and CK_StaffInvitations_LastSentAt_Range still holds.
     /// </summary>
-    private async Task MoveBackAsync(Guid id, TimeSpan by)
+    private async Task MoveBackAsync(Guid id, TimeSpan by, WebApplicationFactory<Program>? host = null)
     {
-        await using var scope = _host.Services.CreateAsyncScope();
+        await using var scope = (host ?? _host).Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var updated = await db.StaffInvitations.IgnoreQueryFilters()
             .Where(i => i.Id == id)
@@ -572,16 +800,16 @@ public class StaffInvitationsApiTests : IAsyncLifetime
         Assert.Equal(1, updated);
     }
 
-    private async Task<StaffInvitation> LoadInvitationAsync(Guid id)
+    private async Task<StaffInvitation> LoadInvitationAsync(Guid id, WebApplicationFactory<Program>? host = null)
     {
-        await using var scope = _host.Services.CreateAsyncScope();
+        await using var scope = (host ?? _host).Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         return await db.StaffInvitations.IgnoreQueryFilters().AsNoTracking().SingleAsync(i => i.Id == id);
     }
 
-    private async Task<int> CountInvitationsAsync(Guid businessId, string email)
+    private async Task<int> CountInvitationsAsync(Guid businessId, string email, WebApplicationFactory<Program>? host = null)
     {
-        await using var scope = _host.Services.CreateAsyncScope();
+        await using var scope = (host ?? _host).Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         return await db.StaffInvitations.IgnoreQueryFilters().CountAsync(i => i.BusinessId == businessId && i.Email == email);
     }
@@ -615,4 +843,170 @@ public class StaffInvitationsApiTests : IAsyncLifetime
     /// </summary>
     private static DateTimeOffset TruncateToMicroseconds(DateTimeOffset value) =>
         new(value.Ticks - (value.Ticks % 10), value.Offset);
+
+    // ── HTTP harness (slice 5c; BusinessApiTests.cs:41-125 shapes) ──
+
+    private sealed record StaffLogin(StaffCaller Caller, string Email, string Cookie);
+
+    private sealed record HttpResult(HttpStatusCode Status, string Body);
+
+    private sealed record MatrixCell(HttpStatusCode Status, Guid BusinessId, int InvitationsBefore, int AuditsBefore, StaffInvitation? Target);
+
+    private sealed record CapturedLog(string Category, LogLevel Level, string Message, string? Exception);
+
+    /// <summary>
+    /// T-I3: records every log line of the host it is added to, with its
+    /// category, level and formatted message.
+    /// </summary>
+    private sealed class CapturingLoggerProvider : ILoggerProvider
+    {
+        private readonly ConcurrentQueue<CapturedLog> _entries = new();
+
+        public IReadOnlyList<CapturedLog> Entries => _entries.ToArray();
+
+        public ILogger CreateLogger(string categoryName) => new CapturingLogger(categoryName, _entries);
+
+        public void Dispose()
+        {
+        }
+
+        private sealed class CapturingLogger(string category, ConcurrentQueue<CapturedLog> entries) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) =>
+                entries.Enqueue(new CapturedLog(category, logLevel, formatter(state, exception), exception?.ToString()));
+        }
+    }
+
+    private static HttpClient NewClient(WebApplicationFactory<Program> host) =>
+        host.CreateClient(new() { BaseAddress = new Uri("https://localhost") });
+
+    private static async Task<HttpResult> SendAsync(
+        WebApplicationFactory<Program> host, HttpMethod method, string url, string? cookie, object? body = null)
+    {
+        using var client = NewClient(host);
+        using var request = new HttpRequestMessage(method, url);
+        if (cookie is not null)
+        {
+            request.Headers.Add("Cookie", cookie);
+        }
+
+        if (body is not null)
+        {
+            request.Content = JsonContent.Create(body, body.GetType());
+        }
+
+        using var response = await client.SendAsync(request);
+        return new HttpResult(response.StatusCode, await response.Content.ReadAsStringAsync());
+    }
+
+    private static async Task<string> LoginCookieAsync(WebApplicationFactory<Program> host, string email)
+    {
+        using var client = NewClient(host);
+        var response = await client.PostAsJsonAsync("/api/auth/login", new LoginRequest(email, Password));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        return response.Headers.GetValues("Set-Cookie").First().Split(';')[0];
+    }
+
+    private async Task<StaffLogin> SeedLoggedInStaffAsync(WebApplicationFactory<Program> host, Guid businessId, string role)
+    {
+        var email = NewEmail();
+        var caller = await SeedStaffAsync(businessId, role, email, host);
+        return new StaffLogin(caller, email, await LoginCookieAsync(host, email));
+    }
+
+    private async Task<(Guid BusinessId, StaffLogin Owner)> SeedBusinessWithLoggedInOwnerAsync(WebApplicationFactory<Program> host)
+    {
+        var businessId = await SeedBusinessAsync(host);
+        return (businessId, await SeedLoggedInStaffAsync(host, businessId, RoleNames.Owner));
+    }
+
+    private static StaffInvitationResponse ReadInvitation(string body) =>
+        JsonSerializer.Deserialize<StaffInvitationResponse>(body, JsonSerializerOptions.Web)!;
+
+    /// <summary>T-I3: every column of the row as text, the hash in three encodings.</summary>
+    private static async Task<string> InvitationColumnsAsync(Guid id, WebApplicationFactory<Program> host)
+    {
+        await using var scope = host.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var row = await db.StaffInvitations.IgnoreQueryFilters().AsNoTracking().SingleAsync(i => i.Id == id);
+        return string.Join("|",
+            row.Id, row.BusinessId, row.Email, row.NormalizedKey, row.Role,
+            Convert.ToBase64String(row.TokenHash), Base64Url.EncodeToString(row.TokenHash), Convert.ToHexString(row.TokenHash),
+            row.InvitedByUserId, row.CreatedAt.ToString("O"), row.ExpiresAt.ToString("O"), row.LastSentAt.ToString("O"));
+    }
+
+    /// <summary>
+    /// One cell of the design Section 9 matrix over HTTP: a business with a
+    /// signed-in Owner, the caller in the given role, and for resend and
+    /// revoke an invitation of the target role whose cooldown has passed, so
+    /// the role rule is the only possible refusal.
+    /// </summary>
+    private async Task<MatrixCell> RunMatrixCellAsync(string callerRole, string operation, string? targetRole)
+    {
+        var (businessId, owner) = await SeedBusinessWithLoggedInOwnerAsync(_factory);
+        var caller = callerRole == RoleNames.Owner ? owner : await SeedLoggedInStaffAsync(_factory, businessId, callerRole);
+        StaffInvitation? target = null;
+        if (operation is "resend" or "revoke")
+        {
+            target = await LoadInvitationAsync(await SeedInvitationRowAsync(businessId, owner.Caller.UserId, targetRole!), _factory);
+        }
+
+        var invitationsBefore = await CountBusinessInvitationsAsync(businessId);
+        var auditsBefore = await CountBusinessAuditsAsync(businessId);
+        var response = operation switch
+        {
+            "create" => await SendAsync(_factory, HttpMethod.Post, "/api/staff-invitations", caller.Cookie,
+                new CreateStaffInvitationRequest(NewEmail(), targetRole!)),
+            "list" => await SendAsync(_factory, HttpMethod.Get, "/api/staff-invitations", caller.Cookie),
+            "resend" => await SendAsync(_factory, HttpMethod.Post, $"/api/staff-invitations/{target!.Id}/resend", caller.Cookie),
+            "revoke" => await SendAsync(_factory, HttpMethod.Delete, $"/api/staff-invitations/{target!.Id}", caller.Cookie),
+            _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, null),
+        };
+
+        return new MatrixCell(response.Status, businessId, invitationsBefore, auditsBefore, target);
+    }
+
+    /// <summary>A pending row sent two minutes ago; every slice 2 CHECK holds.</summary>
+    private async Task<Guid> SeedInvitationRowAsync(Guid businessId, Guid invitedBy, string role)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var email = NewEmail();
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var userManager = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+        var row = new StaffInvitation
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            Email = email,
+            NormalizedKey = userManager.NormalizeName(email),
+            Role = role,
+            TokenHash = SHA256.HashData(RandomNumberGenerator.GetBytes(32)),
+            InvitedByUserId = invitedBy,
+            CreatedAt = now.AddMinutes(-2),
+            LastSentAt = now.AddMinutes(-2),
+            ExpiresAt = now.AddDays(7),
+        };
+        db.StaffInvitations.Add(row);
+        await db.SaveChangesAsync();
+        return row.Id;
+    }
+
+    private async Task<int> CountBusinessInvitationsAsync(Guid businessId)
+    {
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        return await db.StaffInvitations.IgnoreQueryFilters().CountAsync(i => i.BusinessId == businessId);
+    }
+
+    private async Task<int> CountBusinessAuditsAsync(Guid businessId)
+    {
+        await using var scope = _factory.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        return await db.AuditLogs.IgnoreQueryFilters().CountAsync(a => a.BusinessId == businessId);
+    }
 }
