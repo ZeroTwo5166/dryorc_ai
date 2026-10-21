@@ -31,4 +31,8 @@ public static class AuditEntityTypes
     /// Failed audit row. Mirrors Refund above; distinct from Order and
     /// Approval for the same reasons.</summary>
     public const string OrderCancellation = "OrderCancellation";
+
+    /// <summary>Staff invitations (DEC D11) — the StaffInvitation row, for
+    /// its created, resent, revoked and accepted audit rows.</summary>
+    public const string StaffInvitation = "StaffInvitation";
 }

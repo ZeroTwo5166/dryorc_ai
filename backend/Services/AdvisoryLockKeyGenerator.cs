@@ -131,6 +131,15 @@ public static class AdvisoryLockKeyGenerator
     public static long ForCustomerErasure(Guid businessId, Guid customerId) =>
         PackToLong($"{businessId:D}:customer-erasure:{customerId:D}");
 
+    /// <summary>
+    /// Staff invitations (DEC D12) — scopes a lock to one business's
+    /// invitation cap, so StaffInvitationService.CreateAsync's cap check and
+    /// its insert run serialized per business and two concurrent creates
+    /// cannot both pass the check.
+    /// </summary>
+    public static long ForStaffInvitationCap(Guid businessId) =>
+        PackToLong($"{businessId:D}:staff-invitation-cap");
+
     private static long PackToLong(string canonical)
     {
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(canonical));

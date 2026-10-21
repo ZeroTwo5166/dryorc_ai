@@ -119,6 +119,12 @@ public static class AuditEventTypes
     public const string IntegrationDisconnected = "IntegrationDisconnected";
     public const string TagModeMappingChanged = "TagModeMappingChanged";
 
+    // Staff invitations
+    public const string StaffInvitationCreated = "StaffInvitationCreated";
+    public const string StaffInvitationResent = "StaffInvitationResent";
+    public const string StaffInvitationRevoked = "StaffInvitationRevoked";
+    public const string StaffInvitationAccepted = "StaffInvitationAccepted";
+
     // Conversation / ticket
     public const string ConversationModeOverridden = "ConversationModeOverridden";
 

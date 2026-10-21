@@ -1,4 +1,5 @@
 using System.Net.Http.Headers;
+using System.Security.Claims;
 using System.Text;
 using System.Threading.RateLimiting;
 using Anthropic;
@@ -612,6 +613,51 @@ builder.Services.AddRateLimiter(options =>
             PermitLimit = 20,
             Window = TimeSpan.FromMinutes(1),
         }));
+
+    // Staff invitations (DEC D12). While the release switch is off, both
+    // policies use a no-limit partition, so the StaffInvitesEnabledFilter's
+    // 404 is what callers see, never a 429. The switch state is part of the
+    // partition key because the framework caches one limiter per key: a key
+    // without it would keep using the limiter created under the other state.
+    // The permit limits are placeholders read from StaffInviteOptions.
+    // Anonymous preview and accept: partitioned by client IP, the same
+    // expression as WidgetInit above.
+    options.AddPolicy("StaffInviteAnonymous", httpContext =>
+    {
+        if (!httpContext.RequestServices.GetRequiredService<IStaffInviteSwitch>().IsEnabled)
+        {
+            return RateLimitPartition.GetNoLimiter("disabled");
+        }
+
+        var limit = httpContext.RequestServices.GetRequiredService<IOptionsMonitor<StaffInviteOptions>>()
+            .CurrentValue.AnonymousPermitLimitPerMinute;
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: "on:" + (httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown"),
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = limit,
+                Window = TimeSpan.FromMinutes(1),
+            });
+    });
+
+    // Create and resend: partitioned by the signed-in user's id.
+    options.AddPolicy("StaffInviteSend", httpContext =>
+    {
+        if (!httpContext.RequestServices.GetRequiredService<IStaffInviteSwitch>().IsEnabled)
+        {
+            return RateLimitPartition.GetNoLimiter("disabled");
+        }
+
+        var limit = httpContext.RequestServices.GetRequiredService<IOptionsMonitor<StaffInviteOptions>>()
+            .CurrentValue.SendPermitLimitPerMinute;
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: "on:" + (httpContext.User.FindFirstValue(ClaimTypes.NameIdentifier) ?? "unauthenticated"),
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = limit,
+                Window = TimeSpan.FromMinutes(1),
+            });
+    });
 });
 
 // Resend (https://resend.com) — transactional email for the account
@@ -663,6 +709,21 @@ builder.Services.AddScoped<ILevel2VerificationChecker, Level2VerificationChecker
 builder.Services.Configure<SignedTokenOptions>(builder.Configuration.GetSection(SignedTokenOptions.SectionName));
 builder.Services.AddScoped<ISignedIdentityTokenService, SignedIdentityTokenService>();
 builder.Services.AddScoped<IConsumedSignedIdentityTokenCleanupService, ConsumedSignedIdentityTokenCleanupService>();
+
+// Staff invitations (DEC D7, D12). Enabled is the release switch: its code
+// default is false and it is never changed in code, only turned on through
+// configuration. The four numbers are validated at start-up.
+builder.Services.AddOptions<StaffInviteOptions>()
+    .Bind(builder.Configuration.GetSection(StaffInviteOptions.SectionName))
+    .Validate(
+        o => o.ResendCooldownSeconds > 0
+            && o.MaxRetainedPerBusiness > 0
+            && o.AnonymousPermitLimitPerMinute > 0
+            && o.SendPermitLimitPerMinute > 0,
+        "StaffInvites: every number must be greater than zero.")
+    .ValidateOnStart();
+builder.Services.AddSingleton<IStaffInviteSwitch, OptionsStaffInviteSwitch>();
+builder.Services.AddScoped<StaffInvitesEnabledFilter>();
 
 builder.Services.ConfigureApplicationCookie(options =>
 {
