@@ -124,6 +124,14 @@ builder.Services.AddScoped<IPurgeFailurePoint, NoOpPurgeFailurePoint>();
 // IPurgeFailurePoint above, but for pausing CustomerErasureService's Phase 0
 // mid-flight rather than failing it — see ICustomerErasureCheckpoint.cs.
 builder.Services.AddScoped<ICustomerErasureCheckpoint, NoOpCustomerErasureCheckpoint>();
+// Staff invitations (staff-invite design Sections 6-7). The two seams are the
+// same test-seam idiom as the two above: no-op singletons in production
+// (design ED-35); tests substitute a fake that throws after the accepted
+// user is created (IStaffInvitationAcceptFailurePoint) or pauses an
+// operation while it holds its row lock (IStaffInvitationLockCheckpoint).
+builder.Services.AddSingleton<IStaffInvitationAcceptFailurePoint, NoOpStaffInvitationAcceptFailurePoint>();
+builder.Services.AddSingleton<IStaffInvitationLockCheckpoint, NoOpStaffInvitationLockCheckpoint>();
+builder.Services.AddScoped<IStaffInvitationService, StaffInvitationService>();
 builder.Services.AddScoped<IConversationPurgeService, ConversationPurgeService>();
 builder.Services.AddScoped<ICustomerErasureService, CustomerErasureService>();
 builder.Services.AddScoped<IRetentionEnforcementService, RetentionEnforcementService>();
