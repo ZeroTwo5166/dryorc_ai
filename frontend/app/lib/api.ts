@@ -7,11 +7,16 @@ const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:5293";
 
 export class ApiError extends Error {
   status: number;
+  // The parsed response body, kept even when `message` is replaced by a
+  // fixed text (the 409 below). Staff-invite /team shows the server's own
+  // 409 text from here (ED-33); every other caller keeps using `message`.
+  serverMessage?: string;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, serverMessage?: string) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.serverMessage = serverMessage;
   }
 }
 
@@ -73,11 +78,12 @@ async function apiFetch(path: string, init?: RequestInit) {
     // 401 means something different on each: "wrong password" on login,
     // but "your session died" everywhere else. Login's own 401 message is
     // set in login() below, where that distinction is actually knowable.
+    const serverMessage = parseErrorBody(await res.text().catch(() => ""));
     const message =
       res.status === 409
         ? "An account with this email already exists."
-        : parseErrorBody(await res.text().catch(() => "")) || `Request failed (${res.status}).`;
-    throw new ApiError(res.status, message);
+        : serverMessage || `Request failed (${res.status}).`;
+    throw new ApiError(res.status, message, serverMessage || undefined);
   }
 
   if (res.status === 204) return null;
@@ -191,6 +197,9 @@ export type MeResponse = {
   // gates both the Sidebar nav entry and the page itself (design §4: "the
   // client hides/removes the entry point entirely").
   aiBusinessAnalystEnabled: boolean;
+  // Staff invite D7 — the StaffInvites:Enabled release switch. When false,
+  // /team shows only the member list and makes no invitation request at all.
+  staffInvitesEnabled: boolean;
 };
 
 export function register(body: RegisterRequest): Promise<RegisterResponse> {
@@ -768,4 +777,72 @@ export type SetCancelOrderToolEnabledResponse = {
 // client-supplied value (see BusinessController.SetCancelOrderToolEnabled).
 export function setCancelOrderToolEnabled(enabled: boolean): Promise<SetCancelOrderToolEnabledResponse> {
   return api.put("/api/business/cancel-order-tool", { enabled });
+}
+
+// Talks to backend/Controllers/TeamController.cs and
+// StaffInvitationsController.cs (staff invite).
+
+export type TeamMember = {
+  userId: string;
+  email: string;
+  role: string;
+  joinedAt: string;
+};
+
+export type StaffInvitationRole = "Admin" | "Agent";
+
+export type StaffInvitation = {
+  id: string;
+  email: string;
+  role: string;
+  status: "Pending" | "Expired";
+  createdAt: string;
+  expiresAt: string;
+  lastSentAt: string;
+};
+
+export type PreviewStaffInvitationResponse = {
+  businessName: string;
+  email: string;
+  role: string;
+};
+
+export type AcceptStaffInvitationResponse = {
+  email: string;
+};
+
+export function listTeamMembers(): Promise<TeamMember[]> {
+  return api.get("/api/team/members");
+}
+
+export function listStaffInvitations(): Promise<StaffInvitation[]> {
+  return api.get("/api/staff-invitations");
+}
+
+export function createStaffInvitation(email: string, role: StaffInvitationRole): Promise<StaffInvitation> {
+  return api.post("/api/staff-invitations", { email, role });
+}
+
+export function resendStaffInvitation(id: string): Promise<StaffInvitation> {
+  return api.post(`/api/staff-invitations/${id}/resend`);
+}
+
+export function revokeStaffInvitation(id: string): Promise<null> {
+  return api.delete(`/api/staff-invitations/${id}`);
+}
+
+// Anonymous, like register: the invitee has no session. The token goes only
+// in the JSON body of a POST, never in a URL (D19).
+export function previewStaffInvitation(token: string): Promise<PreviewStaffInvitationResponse> {
+  return apiFetch("/api/staff-invitations/preview", {
+    method: "POST",
+    body: JSON.stringify({ token }),
+  });
+}
+
+export function acceptStaffInvitation(token: string, password: string): Promise<AcceptStaffInvitationResponse> {
+  return apiFetch("/api/staff-invitations/accept", {
+    method: "POST",
+    body: JSON.stringify({ token, password }),
+  });
 }

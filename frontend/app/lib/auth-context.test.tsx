@@ -37,6 +37,7 @@ const sampleUser: MeResponse = {
   expiresAtUtc: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
   cancelOrderToolEnabled: false,
   aiBusinessAnalystEnabled: false,
+  staffInvitesEnabled: false,
 };
 
 function Probe({ onReady }: { onReady: (ctx: ReturnType<typeof useAuth>) => void }) {

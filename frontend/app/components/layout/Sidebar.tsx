@@ -142,7 +142,7 @@ export function Sidebar() {
     {
       label: "Manage",
       items: [
-        { label: "Team", icon: IconShieldCheck, soon: true },
+        { label: "Team", icon: IconShieldCheck, href: "/team" },
         { label: "Integrations", icon: IconSend, soon: true },
         { label: "Analytics", icon: IconRadar, href: "/analytics" },
         ...(user.aiBusinessAnalystEnabled
