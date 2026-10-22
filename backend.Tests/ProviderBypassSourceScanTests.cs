@@ -123,7 +123,7 @@ public class ProviderBypassSourceScanTests
     // else, every string literal included, is left as it is. The end state is
     // reported, not thrown: a file that does not end in the code state has
     // desynchronised the lexer and fails the guard fact by name.
-    private sealed class Lexer
+    internal sealed class Lexer
     {
         private readonly string _text;
         private readonly char[] _kept;

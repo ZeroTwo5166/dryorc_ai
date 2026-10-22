@@ -91,14 +91,16 @@ describe("Sidebar — Analyst nav item gating", () => {
       ["Customers", "/customers"],
       ["Knowledge base", "/knowledge"],
       ["Tickets", "/tickets"],
+      ["Team", "/team"],
       ["Analytics", "/analytics"],
       ["Settings", "/settings/integrations"],
     ] as const) {
       expect(screen.getByRole("link", { name: label })).toHaveAttribute("href", href);
     }
-    // Team/Integrations are still the "Soon" disabled placeholders, not links.
+    // Integrations is still the "Soon" disabled placeholder, not a link;
+    // Team is a real link for every staff user (staff invite, ED-38).
     expect(screen.getByText("Team")).toBeInTheDocument();
     expect(screen.getByText("Integrations")).toBeInTheDocument();
-    expect(screen.getAllByText("Soon")).toHaveLength(2);
+    expect(screen.getAllByText("Soon")).toHaveLength(1);
   });
 });

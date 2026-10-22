@@ -25,7 +25,8 @@ public record MeResponse(
     DateTimeOffset ExpiresAtUtc,
     bool CancelOrderToolEnabled,
     bool AiBusinessAnalystEnabled,
-    bool ScheduledReportsEnabled);
+    bool ScheduledReportsEnabled,
+    bool StaffInvitesEnabled);
 
 public record ConfirmEmailRequest(Guid UserId, string Token);
 

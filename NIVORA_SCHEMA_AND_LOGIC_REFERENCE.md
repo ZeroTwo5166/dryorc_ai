@@ -130,6 +130,15 @@ Idempotency-tracked record of a Shopify `refundCreate` call, supporting full/par
 ### ConversationHandoff
 Append-only log of AI↔human handoff events. Reuses `AuditLog`'s `ActorType` enum. `ConversationId` is nullable/`SetNull` (survives conversation retention deliberately, unlike most conversation-derived data — kept for future escalation analytics).
 
+### StaffInvitation
+A pending or expired invitation for a staff member (Admin or Agent) to join an existing business (`ITenantOwned`). Source: `docs/handoffs/staff-invite-design.md` Section 2 (DEC D4, D5, D9), table added by migration `AddStaffInvitationTable` in C2 `895ee94`.
+
+Fields: `Id` (uuid, PK); `BusinessId` (uuid, the inviting business); `Email` (varchar(256), as entered and trimmed; becomes the user's UserName and Email at acceptance); `NormalizedKey` (varchar(256), `userManager.NormalizeName(Email)`); `Role` (varchar(16), `"Admin"` or `"Agent"`); `TokenHash` (bytea, SHA-256 over the 32 raw token bytes; the token itself is never stored); `InvitedByUserId` (uuid, the creating staff user); `CreatedAt`; `ExpiresAt` (CreatedAt or last resend + 7 days); `LastSentAt` (last create/resend send time, the resend cooldown clock). All non-null.
+
+Constraints: FKs `BusinessId` -> Businesses and `InvitedByUserId` -> AspNetUsers, both Restrict. Unique `IX_StaffInvitations_TokenHash` and unique `IX_StaffInvitations_BusinessId_NormalizedKey` (one invitation per email per business); `IX_StaffInvitations_ExpiresAt` for the global cleanup; the default FK index on `InvitedByUserId`. CHECKs: `CK_StaffInvitations_Role` (`Role IN ('Admin','Agent')`, so no invitation can create an Owner), `CK_StaffInvitations_ExpiresAfterCreated`, `CK_StaffInvitations_LastSentAt_Range` (`LastSentAt >= CreatedAt`), `CK_StaffInvitations_TokenHash_Length` (32 bytes).
+
+Lifecycle (DEC D9): a row exists only while pending or expired; there are no Accepted/Revoked columns. Accept deletes the row inside the acceptance transaction, revoke deletes it at once, and `StaffInvitationCleanupService` deletes rows 30 days after their current `ExpiresAt` (C6 `136c10d`). The whole feature is behind `StaffInvites:Enabled` (code default false; DEC D7).
+
 ---
 
 ## 3. Cross-Table Business Logic to Implement as Services
@@ -204,7 +213,7 @@ Tags must be normalized (lowercase/kebab-case recommended) consistently everywhe
 
 ## 4. Known Open Gaps (flag these explicitly to Claude Code, don't silently build around them)
 
-1. **Retention enforcement job does not exist.** `Business.RetentionDays` is a real, validated column with no scheduled process acting on it.
+1. ~~**Retention enforcement job does not exist.** `Business.RetentionDays` is a real, validated column with no scheduled process acting on it.~~ **RESOLVED** — `RetentionEnforcementService` enforces `Business.RetentionDays`, run by `DataLifecycleBackgroundService` (`af73918`; DEC D16 of the staff invite workstream records this lag).
 2. **Customer/order ownership cross-check for write tools is unresolved** — documented hard blocker, must be built before `cancelOrder`/`refundOrder`/`updateCustomer` go live.
 3. **`AuditLog.LogAsync`'s PII allowlist validation** is designed conceptually but not built — currently the PII rule relies on discipline at each call site.
 4. **Retention periods for `AuditLog`, `FlaggedCustomerActivityLog`, `VerificationCode` are not numerically decided** — placeholder/no enforcement yet.

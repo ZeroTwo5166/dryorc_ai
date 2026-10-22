@@ -69,6 +69,8 @@ public class NivoraApiFactory : WebApplicationFactory<Program>
     {
         builder.UseEnvironment("Development");
         TestDatabase.ConfigureHost(builder);
+        // Staff invite release switch on in the test host (DEC D7; design ED-39).
+        builder.UseSetting($"{StaffInviteOptions.SectionName}:Enabled", "true");
 
         // Step 24 Phase 7 diagnosis: the actual root cause of a suite-wide
         // regression that appeared only once a third real BackgroundService

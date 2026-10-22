@@ -5,6 +5,7 @@ using backend.Data;
 using backend.Email;
 using backend.Hubs;
 using backend.Models;
+using backend.Services;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
@@ -24,6 +25,7 @@ public class AuthController(
     IEmailSender emailSender,
     IConfiguration configuration,
     IHubContext<TicketHub> ticketHubContext,
+    IStaffInviteSwitch staffInviteSwitch,
     ILogger<AuthController> logger) : ControllerBase
 {
     /// <summary>
@@ -390,7 +392,7 @@ public class AuthController(
         return Ok(new MeResponse(
             user.Id, user.BusinessId, user.Email!, business.Name, business.PlanTier, roles.ToList(),
             await GetSessionExpiresAtUtcAsync(), business.CancelOrderToolEnabled, business.AiBusinessAnalystEnabled,
-            business.ScheduledReportsEnabled));
+            business.ScheduledReportsEnabled, staffInviteSwitch.IsEnabled));
     }
 
     /// <summary>

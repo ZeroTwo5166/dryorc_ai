@@ -1,4 +1,5 @@
 using System.Net.Http.Headers;
+using System.Security.Claims;
 using System.Text;
 using System.Threading.RateLimiting;
 using Anthropic;
@@ -123,6 +124,14 @@ builder.Services.AddScoped<IPurgeFailurePoint, NoOpPurgeFailurePoint>();
 // IPurgeFailurePoint above, but for pausing CustomerErasureService's Phase 0
 // mid-flight rather than failing it — see ICustomerErasureCheckpoint.cs.
 builder.Services.AddScoped<ICustomerErasureCheckpoint, NoOpCustomerErasureCheckpoint>();
+// Staff invitations (staff-invite design Sections 6-7). The two seams are the
+// same test-seam idiom as the two above: no-op singletons in production
+// (design ED-35); tests substitute a fake that throws after the accepted
+// user is created (IStaffInvitationAcceptFailurePoint) or pauses an
+// operation while it holds its row lock (IStaffInvitationLockCheckpoint).
+builder.Services.AddSingleton<IStaffInvitationAcceptFailurePoint, NoOpStaffInvitationAcceptFailurePoint>();
+builder.Services.AddSingleton<IStaffInvitationLockCheckpoint, NoOpStaffInvitationLockCheckpoint>();
+builder.Services.AddScoped<IStaffInvitationService, StaffInvitationService>();
 builder.Services.AddScoped<IConversationPurgeService, ConversationPurgeService>();
 builder.Services.AddScoped<ICustomerErasureService, CustomerErasureService>();
 builder.Services.AddScoped<IRetentionEnforcementService, RetentionEnforcementService>();
@@ -141,6 +150,10 @@ builder.Services.AddScoped<IConversationInactivityCloseService, ConversationInac
 // DataLifecycleBackgroundService runs each tick: a fixed 90-day global
 // window (A1 v11 §7 Decision 4; docs/handoffs/billing-usage-a1-slice6-design.md).
 builder.Services.AddScoped<IAiProviderInvocationRetentionService, AiProviderInvocationRetentionService>();
+// Staff invite slice 6 — StaffInvitation retention, the sixth job
+// DataLifecycleBackgroundService runs each tick: rows are deleted 30 days
+// after their ExpiresAt (DEC D9; staff-invite design Section 12).
+builder.Services.AddScoped<IStaffInvitationCleanupService, StaffInvitationCleanupService>();
 builder.Services.AddHostedService<DataLifecycleBackgroundService>();
 
 // Notification system — no live caller yet, registered as ready-to-call
@@ -612,6 +625,51 @@ builder.Services.AddRateLimiter(options =>
             PermitLimit = 20,
             Window = TimeSpan.FromMinutes(1),
         }));
+
+    // Staff invitations (DEC D12). While the release switch is off, both
+    // policies use a no-limit partition, so the StaffInvitesEnabledFilter's
+    // 404 is what callers see, never a 429. The switch state is part of the
+    // partition key because the framework caches one limiter per key: a key
+    // without it would keep using the limiter created under the other state.
+    // The permit limits are placeholders read from StaffInviteOptions.
+    // Anonymous preview and accept: partitioned by client IP, the same
+    // expression as WidgetInit above.
+    options.AddPolicy("StaffInviteAnonymous", httpContext =>
+    {
+        if (!httpContext.RequestServices.GetRequiredService<IStaffInviteSwitch>().IsEnabled)
+        {
+            return RateLimitPartition.GetNoLimiter("disabled");
+        }
+
+        var limit = httpContext.RequestServices.GetRequiredService<IOptionsMonitor<StaffInviteOptions>>()
+            .CurrentValue.AnonymousPermitLimitPerMinute;
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: "on:" + (httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown"),
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = limit,
+                Window = TimeSpan.FromMinutes(1),
+            });
+    });
+
+    // Create and resend: partitioned by the signed-in user's id.
+    options.AddPolicy("StaffInviteSend", httpContext =>
+    {
+        if (!httpContext.RequestServices.GetRequiredService<IStaffInviteSwitch>().IsEnabled)
+        {
+            return RateLimitPartition.GetNoLimiter("disabled");
+        }
+
+        var limit = httpContext.RequestServices.GetRequiredService<IOptionsMonitor<StaffInviteOptions>>()
+            .CurrentValue.SendPermitLimitPerMinute;
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: "on:" + (httpContext.User.FindFirstValue(ClaimTypes.NameIdentifier) ?? "unauthenticated"),
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = limit,
+                Window = TimeSpan.FromMinutes(1),
+            });
+    });
 });
 
 // Resend (https://resend.com) — transactional email for the account
@@ -663,6 +721,21 @@ builder.Services.AddScoped<ILevel2VerificationChecker, Level2VerificationChecker
 builder.Services.Configure<SignedTokenOptions>(builder.Configuration.GetSection(SignedTokenOptions.SectionName));
 builder.Services.AddScoped<ISignedIdentityTokenService, SignedIdentityTokenService>();
 builder.Services.AddScoped<IConsumedSignedIdentityTokenCleanupService, ConsumedSignedIdentityTokenCleanupService>();
+
+// Staff invitations (DEC D7, D12). Enabled is the release switch: its code
+// default is false and it is never changed in code, only turned on through
+// configuration. The four numbers are validated at start-up.
+builder.Services.AddOptions<StaffInviteOptions>()
+    .Bind(builder.Configuration.GetSection(StaffInviteOptions.SectionName))
+    .Validate(
+        o => o.ResendCooldownSeconds > 0
+            && o.MaxRetainedPerBusiness > 0
+            && o.AnonymousPermitLimitPerMinute > 0
+            && o.SendPermitLimitPerMinute > 0,
+        "StaffInvites: every number must be greater than zero.")
+    .ValidateOnStart();
+builder.Services.AddSingleton<IStaffInviteSwitch, OptionsStaffInviteSwitch>();
+builder.Services.AddScoped<StaffInvitesEnabledFilter>();
 
 builder.Services.ConfigureApplicationCookie(options =>
 {

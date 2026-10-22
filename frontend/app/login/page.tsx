@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useState, type FormEvent } from "react";
+import { Suspense, useEffect, useState, type FormEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import brand from "@/brand.json";
 import { AuthShell } from "../components/auth/AuthShell";
@@ -8,6 +8,9 @@ import { FormError, FormField, PasswordInput, SubmitButton } from "../components
 import { IconLock } from "../components/landing/icons";
 import { useAuth } from "../lib/auth-context";
 import { ApiError, login, resendVerificationEmail } from "../lib/api";
+
+// Written by accept-invite/page.tsx after a successful accept.
+const LOGIN_PREFILL_EMAIL_KEY = "nivora.loginPrefillEmail";
 
 export default function LoginPage() {
   return (
@@ -30,6 +33,22 @@ function LoginForm() {
   const [error, setError] = useState<string | null>(null);
   const [needsVerification, setNeedsVerification] = useState(false);
   const [resendState, setResendState] = useState<"idle" | "sending" | "sent">("idle");
+
+  useEffect(() => {
+    // Staff invite (ED-32): /accept-invite hands the new account's email over
+    // through sessionStorage, so it never appears in a URL or history. Read
+    // once and removed. After mount, not a lazy initializer: this client
+    // component still SSRs, where sessionStorage does not exist.
+    let prefill: string | null = null;
+    try {
+      prefill = window.sessionStorage.getItem(LOGIN_PREFILL_EMAIL_KEY);
+      window.sessionStorage.removeItem(LOGIN_PREFILL_EMAIL_KEY);
+    } catch {
+      // Storage unavailable: nothing to prefill.
+    }
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (prefill) setEmail(prefill);
+  }, []);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();

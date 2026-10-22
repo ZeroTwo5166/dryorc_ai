@@ -168,6 +168,29 @@ public class TestDatabaseUsageTests
         }
     }
 
+    /// <summary>
+    /// Staff invite K7d exemptions (docs/handoffs/staff-invite-implementation-design-v8-erratum-1.md,
+    /// E1-1): an exempted setting call must name its key through StaffInviteOptions.SectionName and
+    /// one of the five StaffInviteOptions properties, so it can never carry a connection key.
+    /// </summary>
+    private static readonly Regex StaffInvitesKeyCall = new(
+        @"^Use[S]etting\s*\(\s*\$""\{StaffInviteOptions\.SectionName\}:(Enabled|ResendCooldownSeconds|MaxRetainedPerBusiness|AnonymousPermitLimitPerMinute|SendPermitLimitPerMinute)""\s*,",
+        RegexOptions.CultureInvariant);
+
+    private static bool StaffInvitesKey(Hit hit) => StaffInvitesKeyCall.IsMatch(hit.Text.Substring(hit.Index));
+
+    /// <summary>
+    /// Staff invite K7d exemption (docs/handoffs/staff-invite-implementation-design-v8-erratum-2.md,
+    /// E2-1): the one Use[S]etting call of StaffInvitationsApiTests.cs must set exactly the literal key
+    /// "Frontend:BaseUrl" to exactly the literal empty string. An empty value cannot point the host at
+    /// a database.
+    /// </summary>
+    private static readonly Regex FrontendBaseUrlEmptyCall = new(
+        @"^Use[S]etting\s*\(\s*""Frontend:BaseUrl""\s*,\s*""""\s*\)",
+        RegexOptions.CultureInvariant);
+
+    private static bool FrontendBaseUrlEmpty(Hit hit) => FrontendBaseUrlEmptyCall.IsMatch(hit.Text.Substring(hit.Index));
+
     [Fact]
     public void K7_NoOtherHostOrConfigurationRoute()
     {
@@ -176,7 +199,11 @@ public class TestDatabaseUsageTests
         Check("K7c", @"\bnew\s+(HostBuilder|WebHostBuilder|HostApplicationBuilder|WebApplicationBuilder|TestServer)\b|\bWebHost\s*\.\s*Create\w*\s*\(|\bTestServer\s*\(");
         Check("K7d", @"\bUse[S]etting\s*\(", Only(
             ("TestDatabase.cs", Exactly(1)),
-            ("TestDatabaseTests.cs", Exactly(1))));
+            ("TestDatabaseTests.cs", Exactly(1)),
+            ("NivoraApiFactory.cs", Exactly(1, StaffInvitesKey)),
+            ("StaffInviteSwitchAndOptionsTests.cs", Exactly(2, StaffInvitesKey)),
+            ("StaffInvitationsApiTests.cs", Exactly(1, FrontendBaseUrlEmpty)),
+            ("StaffInvitationSwitchOffTests.cs", Exactly(1, StaffInvitesKey))));
         Check("K7e", @"\bConfigure[A]ppConfiguration\b|\bConfigure[H]ostConfiguration\b");
         Check("K7f1", @"\bAddIn[M]emoryCollection\b", Only(("TestDatabaseTests.cs", Exactly(1))));
         Check("K7f2", @"\bAddEnvironment[V]ariables\b|\bAdd[J]sonFile\b|\bAddCommand[L]ine\b|\bAddIni[F]ile\b|\bAddXml[F]ile\b|\bAddKeyPer[F]ile\b");

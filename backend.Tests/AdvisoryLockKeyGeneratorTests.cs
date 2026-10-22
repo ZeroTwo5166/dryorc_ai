@@ -49,4 +49,22 @@ public class AdvisoryLockKeyGeneratorTests
         Assert.NotEqual(customerErasureKey, AdvisoryLockKeyGenerator.ForVerificationCode(BusinessId, Id, Id, "x"));
         Assert.NotEqual(customerErasureKey, AdvisoryLockKeyGenerator.ForConversationTagState(BusinessId, Id));
     }
+
+    /// <summary>
+    /// Staff invite slice 5a (S5a-4): the per-business invitation cap key is
+    /// deterministic, differs between businesses, and differs from
+    /// ForCustomerErasure for the same business.
+    /// </summary>
+    [Fact]
+    public void ForStaffInvitationCap_IsDeterministic_AndScopedPerBusiness()
+    {
+        var otherBusinessId = Guid.Parse("33333333-3333-3333-3333-333333333333");
+
+        var key1 = AdvisoryLockKeyGenerator.ForStaffInvitationCap(BusinessId);
+        var key2 = AdvisoryLockKeyGenerator.ForStaffInvitationCap(BusinessId);
+
+        Assert.Equal(key1, key2);
+        Assert.NotEqual(key1, AdvisoryLockKeyGenerator.ForStaffInvitationCap(otherBusinessId));
+        Assert.NotEqual(key1, AdvisoryLockKeyGenerator.ForCustomerErasure(BusinessId, BusinessId));
+    }
 }
