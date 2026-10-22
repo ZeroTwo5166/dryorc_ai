@@ -150,6 +150,10 @@ builder.Services.AddScoped<IConversationInactivityCloseService, ConversationInac
 // DataLifecycleBackgroundService runs each tick: a fixed 90-day global
 // window (A1 v11 §7 Decision 4; docs/handoffs/billing-usage-a1-slice6-design.md).
 builder.Services.AddScoped<IAiProviderInvocationRetentionService, AiProviderInvocationRetentionService>();
+// Staff invite slice 6 — StaffInvitation retention, the sixth job
+// DataLifecycleBackgroundService runs each tick: rows are deleted 30 days
+// after their ExpiresAt (DEC D9; staff-invite design Section 12).
+builder.Services.AddScoped<IStaffInvitationCleanupService, StaffInvitationCleanupService>();
 builder.Services.AddHostedService<DataLifecycleBackgroundService>();
 
 // Notification system — no live caller yet, registered as ready-to-call

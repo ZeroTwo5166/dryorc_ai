@@ -87,6 +87,11 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         public Task<int> DeleteExpiredAsync(CancellationToken cancellationToken = default) => behavior(cancellationToken);
     }
 
+    private sealed class FakeStaffInvitationCleanupService(Func<CancellationToken, Task<int>> behavior) : IStaffInvitationCleanupService
+    {
+        public Task<int> DeleteExpiredAsync(CancellationToken ct = default) => behavior(ct);
+    }
+
     /// <summary>Signals `reached` the instant it's invoked (before any
     /// throw), then completes normally — lets a test await "this job was
     /// called" deterministically regardless of whether the job succeeds or
@@ -155,23 +160,26 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
             .AddScoped(_ => conversationInactivityClose)
             .BuildServiceProvider();
 
-    /// <summary>Step 27 A1 Slice 6 — same shape as BuildProviderWithAutoClose
-    /// above, extended with the fifth job's fake. Kept as its own overload,
-    /// following the Phase 4 precedent; without the fifth registration,
-    /// resolving it inside RunJobAsync would throw and log an extra Error
-    /// after the job a test waits on.</summary>
-    private static ServiceProvider BuildProviderWithAllFiveJobs(
+    /// <summary>Staff invite slice 6 — same shape as BuildProviderWithAutoClose
+    /// above, extended with the fifth job's fake (Step 27 A1 Slice 6) and the
+    /// sixth job's fake (StaffInvitationCleanup). It replaces the five-job
+    /// overload, which nothing used once the fake-job tests moved here;
+    /// without the sixth registration, resolving it inside RunJobAsync would
+    /// throw and log an extra Error after the job a test waits on.</summary>
+    private static ServiceProvider BuildProviderWithAllSixJobs(
         IRetentionEnforcementService retention,
         IVerificationCodeCleanupService verificationCodeCleanup,
         IConsumedSignedIdentityTokenCleanupService signedTokenCleanup,
         IConversationInactivityCloseService conversationInactivityClose,
-        IAiProviderInvocationRetentionService aiProviderInvocationRetention) =>
+        IAiProviderInvocationRetentionService aiProviderInvocationRetention,
+        IStaffInvitationCleanupService staffInvitationCleanup) =>
         new ServiceCollection()
             .AddScoped(_ => retention)
             .AddScoped(_ => verificationCodeCleanup)
             .AddScoped(_ => signedTokenCleanup)
             .AddScoped(_ => conversationInactivityClose)
             .AddScoped(_ => aiProviderInvocationRetention)
+            .AddScoped(_ => staffInvitationCleanup)
             .BuildServiceProvider();
 
     // ── 1. Retention throws — VerificationCodeCleanup/SignedTokenCleanup
@@ -185,6 +193,7 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         var signedReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var autoCloseReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var invRetentionReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var staffInvCleanupReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var injected = new InvalidOperationException("Simulated retention failure for test.");
 
         var retention = new FakeRetentionService(Throwing(retentionReached, injected));
@@ -192,19 +201,21 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         var signed = new FakeSignedTokenCleanupService(Recording(signedReached));
         var autoClose = new FakeConversationInactivityCloseService(Recording(autoCloseReached));
         var invRetention = new FakeAiProviderInvocationRetentionService(Recording(invRetentionReached));
-        var provider = BuildProviderWithAllFiveJobs(retention, verif, signed, autoClose, invRetention);
+        var staffInvCleanup = new FakeStaffInvitationCleanupService(Recording(staffInvCleanupReached));
+        var provider = BuildProviderWithAllSixJobs(retention, verif, signed, autoClose, invRetention, staffInvCleanup);
         var logger = new CapturingLogger<DataLifecycleBackgroundService>();
         var backgroundService = new DataLifecycleBackgroundService(provider, logger);
 
         using var cts = new CancellationTokenSource();
         await ((IHostedService)backgroundService).StartAsync(cts.Token);
-        await invRetentionReached.Task.WaitAsync(TimeSpan.FromSeconds(5)); // AiProviderInvocationRetention, now the last job in sequence — proves the tick ran to completion
+        await staffInvCleanupReached.Task.WaitAsync(TimeSpan.FromSeconds(5)); // StaffInvitationCleanup, now the last job in sequence — proves the tick ran to completion
         await ((IHostedService)backgroundService).StopAsync(CancellationToken.None);
 
         Assert.True(verifReached.Task.IsCompletedSuccessfully);
         Assert.True(signedReached.Task.IsCompletedSuccessfully);
         Assert.True(autoCloseReached.Task.IsCompletedSuccessfully);
         Assert.True(invRetentionReached.Task.IsCompletedSuccessfully);
+        Assert.True(staffInvCleanupReached.Task.IsCompletedSuccessfully);
 
         var failureEntry = Assert.Single(logger.Entries, e => e.Level == LogLevel.Error);
         Assert.Contains("RetentionEnforcement", failureEntry.Message);
@@ -222,6 +233,7 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         var signedReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var autoCloseReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var invRetentionReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var staffInvCleanupReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var injected = new InvalidOperationException("Simulated verification-code cleanup failure for test.");
 
         var retention = new FakeRetentionService(Recording(retentionReached));
@@ -229,19 +241,21 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         var signed = new FakeSignedTokenCleanupService(Recording(signedReached));
         var autoClose = new FakeConversationInactivityCloseService(Recording(autoCloseReached));
         var invRetention = new FakeAiProviderInvocationRetentionService(Recording(invRetentionReached));
-        var provider = BuildProviderWithAllFiveJobs(retention, verif, signed, autoClose, invRetention);
+        var staffInvCleanup = new FakeStaffInvitationCleanupService(Recording(staffInvCleanupReached));
+        var provider = BuildProviderWithAllSixJobs(retention, verif, signed, autoClose, invRetention, staffInvCleanup);
         var logger = new CapturingLogger<DataLifecycleBackgroundService>();
         var backgroundService = new DataLifecycleBackgroundService(provider, logger);
 
         using var cts = new CancellationTokenSource();
         await ((IHostedService)backgroundService).StartAsync(cts.Token);
-        await invRetentionReached.Task.WaitAsync(TimeSpan.FromSeconds(5)); // AiProviderInvocationRetention, now the last job in sequence — proves the tick ran to completion
+        await staffInvCleanupReached.Task.WaitAsync(TimeSpan.FromSeconds(5)); // StaffInvitationCleanup, now the last job in sequence — proves the tick ran to completion
         await ((IHostedService)backgroundService).StopAsync(CancellationToken.None);
 
         Assert.True(retentionReached.Task.IsCompletedSuccessfully);
         Assert.True(signedReached.Task.IsCompletedSuccessfully);
         Assert.True(autoCloseReached.Task.IsCompletedSuccessfully);
         Assert.True(invRetentionReached.Task.IsCompletedSuccessfully);
+        Assert.True(staffInvCleanupReached.Task.IsCompletedSuccessfully);
 
         var failureEntry = Assert.Single(logger.Entries, e => e.Level == LogLevel.Error);
         Assert.Contains("VerificationCodeCleanup", failureEntry.Message);
@@ -259,6 +273,7 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         var signedReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var autoCloseReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var invRetentionReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var staffInvCleanupReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var injected = new InvalidOperationException("Simulated signed-token cleanup failure for test.");
 
         var retention = new FakeRetentionService(Recording(retentionReached));
@@ -266,19 +281,21 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         var signed = new FakeSignedTokenCleanupService(Throwing(signedReached, injected));
         var autoClose = new FakeConversationInactivityCloseService(Recording(autoCloseReached));
         var invRetention = new FakeAiProviderInvocationRetentionService(Recording(invRetentionReached));
-        var provider = BuildProviderWithAllFiveJobs(retention, verif, signed, autoClose, invRetention);
+        var staffInvCleanup = new FakeStaffInvitationCleanupService(Recording(staffInvCleanupReached));
+        var provider = BuildProviderWithAllSixJobs(retention, verif, signed, autoClose, invRetention, staffInvCleanup);
         var logger = new CapturingLogger<DataLifecycleBackgroundService>();
         var backgroundService = new DataLifecycleBackgroundService(provider, logger);
 
         using var cts = new CancellationTokenSource();
         await ((IHostedService)backgroundService).StartAsync(cts.Token);
-        await invRetentionReached.Task.WaitAsync(TimeSpan.FromSeconds(5)); // AiProviderInvocationRetention, now the last job in sequence — proves the tick ran to completion
+        await staffInvCleanupReached.Task.WaitAsync(TimeSpan.FromSeconds(5)); // StaffInvitationCleanup, now the last job in sequence — proves the tick ran to completion
         await ((IHostedService)backgroundService).StopAsync(CancellationToken.None);
 
         Assert.True(retentionReached.Task.IsCompletedSuccessfully);
         Assert.True(verifReached.Task.IsCompletedSuccessfully);
         Assert.True(autoCloseReached.Task.IsCompletedSuccessfully);
         Assert.True(invRetentionReached.Task.IsCompletedSuccessfully);
+        Assert.True(staffInvCleanupReached.Task.IsCompletedSuccessfully);
 
         var failureEntry = Assert.Single(logger.Entries, e => e.Level == LogLevel.Error);
         Assert.Contains("ConsumedSignedIdentityTokenCleanup", failureEntry.Message);
@@ -297,6 +314,7 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         var signedReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var autoCloseReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var invRetentionReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var staffInvCleanupReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         using var cts = new CancellationTokenSource();
         var retention = new FakeRetentionService(CancelsUpstreamThenThrows(retentionReached, cts));
@@ -304,7 +322,8 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         var signed = new FakeSignedTokenCleanupService(Recording(signedReached));
         var autoClose = new FakeConversationInactivityCloseService(Recording(autoCloseReached));
         var invRetention = new FakeAiProviderInvocationRetentionService(Recording(invRetentionReached));
-        var provider = BuildProviderWithAllFiveJobs(retention, verif, signed, autoClose, invRetention);
+        var staffInvCleanup = new FakeStaffInvitationCleanupService(Recording(staffInvCleanupReached));
+        var provider = BuildProviderWithAllSixJobs(retention, verif, signed, autoClose, invRetention, staffInvCleanup);
         var logger = new CapturingLogger<DataLifecycleBackgroundService>();
         var backgroundService = new DataLifecycleBackgroundService(provider, logger);
 
@@ -322,6 +341,7 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         Assert.False(signedReached.Task.IsCompleted); // never reached
         Assert.False(autoCloseReached.Task.IsCompleted); // never reached
         Assert.False(invRetentionReached.Task.IsCompleted); // never reached
+        Assert.False(staffInvCleanupReached.Task.IsCompleted); // never reached
         Assert.Empty(logger.Entries); // never logged as an ordinary failure
     }
 
@@ -338,25 +358,28 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         var signedReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var autoCloseReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var invRetentionReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var staffInvCleanupReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         var retention = new FakeRetentionService(ThrowsUnrelatedCancellation(retentionReached));
         var verif = new FakeVerificationCodeCleanupService(Recording(verifReached));
         var signed = new FakeSignedTokenCleanupService(Recording(signedReached));
         var autoClose = new FakeConversationInactivityCloseService(Recording(autoCloseReached));
         var invRetention = new FakeAiProviderInvocationRetentionService(Recording(invRetentionReached));
-        var provider = BuildProviderWithAllFiveJobs(retention, verif, signed, autoClose, invRetention);
+        var staffInvCleanup = new FakeStaffInvitationCleanupService(Recording(staffInvCleanupReached));
+        var provider = BuildProviderWithAllSixJobs(retention, verif, signed, autoClose, invRetention, staffInvCleanup);
         var logger = new CapturingLogger<DataLifecycleBackgroundService>();
         var backgroundService = new DataLifecycleBackgroundService(provider, logger);
 
         using var cts = new CancellationTokenSource(); // never cancelled — stoppingToken.IsCancellationRequested stays false throughout
         await ((IHostedService)backgroundService).StartAsync(cts.Token);
-        await invRetentionReached.Task.WaitAsync(TimeSpan.FromSeconds(5)); // AiProviderInvocationRetention, now the last job in sequence — proves the tick ran to completion
+        await staffInvCleanupReached.Task.WaitAsync(TimeSpan.FromSeconds(5)); // StaffInvitationCleanup, now the last job in sequence — proves the tick ran to completion
         await ((IHostedService)backgroundService).StopAsync(CancellationToken.None);
 
         Assert.True(verifReached.Task.IsCompletedSuccessfully);
         Assert.True(signedReached.Task.IsCompletedSuccessfully);
         Assert.True(autoCloseReached.Task.IsCompletedSuccessfully);
         Assert.True(invRetentionReached.Task.IsCompletedSuccessfully);
+        Assert.True(staffInvCleanupReached.Task.IsCompletedSuccessfully);
 
         var failureEntry = Assert.Single(logger.Entries, e => e.Level == LogLevel.Error);
         Assert.Contains("RetentionEnforcement", failureEntry.Message);
@@ -376,6 +399,7 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         var signedReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var autoCloseReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var invRetentionReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var staffInvCleanupReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var injected = new InvalidOperationException("Simulated conversation auto-close failure for test.");
 
         var retention = new FakeRetentionService(Recording(retentionReached));
@@ -383,19 +407,21 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         var signed = new FakeSignedTokenCleanupService(Recording(signedReached));
         var autoClose = new FakeConversationInactivityCloseService(Throwing(autoCloseReached, injected));
         var invRetention = new FakeAiProviderInvocationRetentionService(Recording(invRetentionReached));
-        var provider = BuildProviderWithAllFiveJobs(retention, verif, signed, autoClose, invRetention);
+        var staffInvCleanup = new FakeStaffInvitationCleanupService(Recording(staffInvCleanupReached));
+        var provider = BuildProviderWithAllSixJobs(retention, verif, signed, autoClose, invRetention, staffInvCleanup);
         var logger = new CapturingLogger<DataLifecycleBackgroundService>();
         var backgroundService = new DataLifecycleBackgroundService(provider, logger);
 
         using var cts = new CancellationTokenSource();
         await ((IHostedService)backgroundService).StartAsync(cts.Token);
-        await invRetentionReached.Task.WaitAsync(TimeSpan.FromSeconds(5)); // AiProviderInvocationRetention, now the last job in sequence — proves the tick ran to completion
+        await staffInvCleanupReached.Task.WaitAsync(TimeSpan.FromSeconds(5)); // StaffInvitationCleanup, now the last job in sequence — proves the tick ran to completion
         await ((IHostedService)backgroundService).StopAsync(CancellationToken.None);
 
         Assert.True(retentionReached.Task.IsCompletedSuccessfully);
         Assert.True(verifReached.Task.IsCompletedSuccessfully);
         Assert.True(signedReached.Task.IsCompletedSuccessfully);
         Assert.True(invRetentionReached.Task.IsCompletedSuccessfully); // the job after the failing one still ran
+        Assert.True(staffInvCleanupReached.Task.IsCompletedSuccessfully);
 
         var failureEntry = Assert.Single(logger.Entries, e => e.Level == LogLevel.Error);
         Assert.Contains("ConversationInactivityClose", failureEntry.Message);
@@ -415,6 +441,7 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         var signedReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var autoCloseReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var invRetentionReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var staffInvCleanupReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var injected = new InvalidOperationException("Simulated retention failure for test.");
 
         var retention = new FakeRetentionService(Throwing(retentionReached, injected));
@@ -422,23 +449,106 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
         var signed = new FakeSignedTokenCleanupService(Recording(signedReached));
         var autoClose = new FakeConversationInactivityCloseService(Recording(autoCloseReached));
         var invRetention = new FakeAiProviderInvocationRetentionService(Recording(invRetentionReached));
-        var provider = BuildProviderWithAllFiveJobs(retention, verif, signed, autoClose, invRetention);
+        var staffInvCleanup = new FakeStaffInvitationCleanupService(Recording(staffInvCleanupReached));
+        var provider = BuildProviderWithAllSixJobs(retention, verif, signed, autoClose, invRetention, staffInvCleanup);
         var logger = new CapturingLogger<DataLifecycleBackgroundService>();
         var backgroundService = new DataLifecycleBackgroundService(provider, logger);
 
         using var cts = new CancellationTokenSource();
         await ((IHostedService)backgroundService).StartAsync(cts.Token);
-        await invRetentionReached.Task.WaitAsync(TimeSpan.FromSeconds(5)); // AiProviderInvocationRetention, now the last job in sequence — proves the tick ran to completion
+        await staffInvCleanupReached.Task.WaitAsync(TimeSpan.FromSeconds(5)); // StaffInvitationCleanup, now the last job in sequence — proves the tick ran to completion
         await ((IHostedService)backgroundService).StopAsync(CancellationToken.None);
 
         Assert.True(verifReached.Task.IsCompletedSuccessfully);
         Assert.True(signedReached.Task.IsCompletedSuccessfully);
         Assert.True(autoCloseReached.Task.IsCompletedSuccessfully); // the new job still ran despite retention's failure
         Assert.True(invRetentionReached.Task.IsCompletedSuccessfully);
+        Assert.True(staffInvCleanupReached.Task.IsCompletedSuccessfully);
 
         var failureEntry = Assert.Single(logger.Entries, e => e.Level == LogLevel.Error);
         Assert.Contains("RetentionEnforcement", failureEntry.Message);
         Assert.Same(injected, failureEntry.Exception);
+    }
+
+    // ── 7b. Staff invite slice 6 (T-LC) — StaffInvitationCleanup, the sixth
+    //      and last job, throws: the five jobs before it already ran; the
+    //      failure is logged once, naming it; the host is not torn down. ───
+
+    [Fact]
+    public async Task StaffInvitationCleanupFailure_IsLogged_OtherJobsStillRunThatTick()
+    {
+        var retentionReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var verifReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var signedReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var autoCloseReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var invRetentionReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var staffInvCleanupReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var injected = new InvalidOperationException("Simulated staff invitation cleanup failure for test.");
+
+        var retention = new FakeRetentionService(Recording(retentionReached));
+        var verif = new FakeVerificationCodeCleanupService(Recording(verifReached));
+        var signed = new FakeSignedTokenCleanupService(Recording(signedReached));
+        var autoClose = new FakeConversationInactivityCloseService(Recording(autoCloseReached));
+        var invRetention = new FakeAiProviderInvocationRetentionService(Recording(invRetentionReached));
+        var staffInvCleanup = new FakeStaffInvitationCleanupService(Throwing(staffInvCleanupReached, injected));
+        var provider = BuildProviderWithAllSixJobs(retention, verif, signed, autoClose, invRetention, staffInvCleanup);
+        var logger = new CapturingLogger<DataLifecycleBackgroundService>();
+        var backgroundService = new DataLifecycleBackgroundService(provider, logger);
+
+        using var cts = new CancellationTokenSource();
+        await ((IHostedService)backgroundService).StartAsync(cts.Token);
+        await staffInvCleanupReached.Task.WaitAsync(TimeSpan.FromSeconds(5)); // StaffInvitationCleanup, the last job in sequence
+        await ((IHostedService)backgroundService).StopAsync(CancellationToken.None);
+
+        Assert.True(retentionReached.Task.IsCompletedSuccessfully);
+        Assert.True(verifReached.Task.IsCompletedSuccessfully);
+        Assert.True(signedReached.Task.IsCompletedSuccessfully);
+        Assert.True(autoCloseReached.Task.IsCompletedSuccessfully);
+        Assert.True(invRetentionReached.Task.IsCompletedSuccessfully);
+
+        var failureEntry = Assert.Single(logger.Entries, e => e.Level == LogLevel.Error);
+        Assert.Contains("StaffInvitationCleanup", failureEntry.Message);
+        Assert.Same(injected, failureEntry.Exception);
+    }
+
+    // ── 7c. Staff invite slice 6 (T-LC) — every one of the six jobs runs
+    //      each tick, and nothing is logged. ──────────────────────────────
+
+    [Fact]
+    public async Task AllSixJobs_RunEachTick()
+    {
+        var retentionReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var verifReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var signedReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var autoCloseReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var invRetentionReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var staffInvCleanupReached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var retention = new FakeRetentionService(Recording(retentionReached));
+        var verif = new FakeVerificationCodeCleanupService(Recording(verifReached));
+        var signed = new FakeSignedTokenCleanupService(Recording(signedReached));
+        var autoClose = new FakeConversationInactivityCloseService(Recording(autoCloseReached));
+        var invRetention = new FakeAiProviderInvocationRetentionService(Recording(invRetentionReached));
+        var staffInvCleanup = new FakeStaffInvitationCleanupService(Recording(staffInvCleanupReached));
+        var provider = BuildProviderWithAllSixJobs(retention, verif, signed, autoClose, invRetention, staffInvCleanup);
+        var logger = new CapturingLogger<DataLifecycleBackgroundService>();
+        var backgroundService = new DataLifecycleBackgroundService(provider, logger);
+
+        using var cts = new CancellationTokenSource();
+        await ((IHostedService)backgroundService).StartAsync(cts.Token);
+        await Task.WhenAll(
+                retentionReached.Task, verifReached.Task, signedReached.Task,
+                autoCloseReached.Task, invRetentionReached.Task, staffInvCleanupReached.Task)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+        await ((IHostedService)backgroundService).StopAsync(CancellationToken.None);
+
+        Assert.True(retentionReached.Task.IsCompletedSuccessfully);
+        Assert.True(verifReached.Task.IsCompletedSuccessfully);
+        Assert.True(signedReached.Task.IsCompletedSuccessfully);
+        Assert.True(autoCloseReached.Task.IsCompletedSuccessfully);
+        Assert.True(invRetentionReached.Task.IsCompletedSuccessfully);
+        Assert.True(staffInvCleanupReached.Task.IsCompletedSuccessfully);
+        Assert.Empty(logger.Entries);
     }
 
     // ── 8. Real services, real DB, through the actual refactored
@@ -576,6 +686,7 @@ public class DataLifecycleBackgroundServiceTests : IAsyncLifetime
             .AddScoped<IConversationInactivityCloseService, ConversationInactivityCloseService>()
             .AddSingleton<Microsoft.Extensions.Logging.ILogger<ConversationInactivityCloseService>>(NullLogger<ConversationInactivityCloseService>.Instance)
             .AddScoped<IAiProviderInvocationRetentionService, AiProviderInvocationRetentionService>()
+            .AddScoped<IStaffInvitationCleanupService, StaffInvitationCleanupService>()
             .BuildServiceProvider();
 
         var backgroundService = new DataLifecycleBackgroundService(provider, NullLogger<DataLifecycleBackgroundService>.Instance);

@@ -43,6 +43,12 @@ namespace backend.Services;
 /// unchanged — no bespoke handling. See
 /// docs/handoffs/billing-usage-a1-slice6-design.md.
 ///
+/// Staff invite slice 6 — the sixth job, StaffInvitation retention
+/// (StaffInvitationCleanupService: rows deleted 30 days after their
+/// ExpiresAt, DEC D9), added through the same RunJobAsync boundary,
+/// unchanged — no bespoke handling. See
+/// docs/handoffs/staff-invite-design.md Section 12.
+///
 /// AppDbContext is Scoped, so a fresh DI scope is created per tick rather
 /// than resolving the two services once at startup.
 /// </summary>
@@ -78,6 +84,10 @@ public class DataLifecycleBackgroundService(
 
             await RunJobAsync(scope.ServiceProvider, "AiProviderInvocationRetention",
                 sp => sp.GetRequiredService<IAiProviderInvocationRetentionService>().DeleteExpiredAsync(stoppingToken),
+                stoppingToken);
+
+            await RunJobAsync(scope.ServiceProvider, "StaffInvitationCleanup",
+                sp => sp.GetRequiredService<IStaffInvitationCleanupService>().DeleteExpiredAsync(stoppingToken),
                 stoppingToken);
         } while (await timer.WaitForNextTickAsync(stoppingToken));
     }

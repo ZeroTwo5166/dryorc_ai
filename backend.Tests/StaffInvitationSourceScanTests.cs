@@ -10,7 +10,7 @@ namespace backend.Tests;
 /// literals are kept.
 ///
 /// Slice 5b: T-D5b (D5: the invitation code never calls NormalizeEmail).
-/// Slice 6 adds T-I2.
+/// Slice 6: T-I2 (I2: exactly two IgnoreQueryFilters sites for invitations).
 /// </summary>
 public class StaffInvitationSourceScanTests
 {
@@ -41,6 +41,90 @@ public class StaffInvitationSourceScanTests
 
         var offenders = scope.Where(f => f.Stripped.Contains("NormalizeEmail", StringComparison.Ordinal)).Select(f => f.Path).ToList();
         Assert.True(offenders.Count == 0, "NormalizeEmail in invitation code: " + string.Join(", ", offenders));
+    }
+
+    // T-I2 (DEC I2, D15 as amended by E1; design Section T). All text checks
+    // run on the comment-stripped text, so doc comments that name
+    // IgnoreQueryFilters do not count.
+    [Fact]
+    public void I2_ExactlyTwoIgnoreQueryFiltersSites()
+    {
+        const string ServiceFile = "Services/StaffInvitationService.cs";
+        const string CleanupFile = "Services/StaffInvitationCleanupService.cs";
+        const string Bypass = ".IgnoreQueryFilters(";
+
+        var scope = Scope();
+        Assert.All(scope, f => Assert.True(f.EndState == CodeState, $"{f.Path}: the lexer ended in state {f.EndState}"));
+        var service = Assert.Single(scope, f => f.Path == ServiceFile);
+        var cleanup = Assert.Single(scope, f => f.Path == CleanupFile);
+        Assert.Contains(scope, f => f.Path == "Auth/StaffInvitesEnabledFilter.cs");
+
+        // Site 1: exactly once in the service, inside LoadByTokenHashAsync's body.
+        Assert.Equal(1, Occurrences(service.Stripped, Bypass));
+        var (bodyStart, bodyEnd) = MethodBody(service.Stripped, "LoadByTokenHashAsync(byte[]");
+        var siteIndex = service.Stripped.IndexOf(Bypass, StringComparison.Ordinal);
+        Assert.True(siteIndex > bodyStart && siteIndex < bodyEnd, "the service's IgnoreQueryFilters call is not inside LoadByTokenHashAsync");
+
+        // Site 2: exactly once in the cleanup service.
+        Assert.Equal(1, Occurrences(cleanup.Stripped, Bypass));
+
+        // Nowhere else in scope.
+        var elsewhere = scope
+            .Where(f => f.Path != ServiceFile && f.Path != CleanupFile && f.Stripped.Contains(Bypass, StringComparison.Ordinal))
+            .Select(f => f.Path)
+            .ToList();
+        Assert.True(elsewhere.Count == 0, ".IgnoreQueryFilters( elsewhere in staff-invite scope: " + string.Join(", ", elsewhere));
+
+        // Any backend file that names the StaffInvitations set and bypasses the filter is one of the two.
+        var bypassingInvitationFiles = Tree.Value
+            .Where(f => f.Stripped.Contains("StaffInvitations", StringComparison.Ordinal) && f.Stripped.Contains(Bypass, StringComparison.Ordinal))
+            .Select(f => f.Path)
+            .Where(p => p != ServiceFile && p != CleanupFile)
+            .ToList();
+        Assert.True(bypassingInvitationFiles.Count == 0, "StaffInvitations with .IgnoreQueryFilters( outside the two sites: " + string.Join(", ", bypassingInvitationFiles));
+
+        // The cleanup's shape: one set-based DELETE, the D9 predicate, 30 days, no tenant input.
+        Assert.Equal(1, Occurrences(cleanup.Stripped, "ExecuteDeleteAsync"));
+        Assert.Contains("i.ExpiresAt <= cutoff", cleanup.Stripped, StringComparison.Ordinal);
+        Assert.Contains("RetentionAfterExpiry = TimeSpan.FromDays(30)", cleanup.Stripped, StringComparison.Ordinal);
+        Assert.DoesNotMatch(@"\bBusinessId\b", cleanup.Stripped);
+    }
+
+    private static int Occurrences(string text, string token)
+    {
+        var count = 0;
+        for (var i = text.IndexOf(token, StringComparison.Ordinal); i >= 0; i = text.IndexOf(token, i + token.Length, StringComparison.Ordinal))
+        {
+            count++;
+        }
+
+        return count;
+    }
+
+    /// <summary>The index of the opening and closing brace of the method body
+    /// that follows the single occurrence of <paramref name="signature"/>.
+    /// Brace counting over stripped text: comments are gone, and the braces
+    /// left inside interpolated strings come in pairs.</summary>
+    private static (int Start, int End) MethodBody(string stripped, string signature)
+    {
+        Assert.Equal(1, Occurrences(stripped, signature));
+        var start = stripped.IndexOf('{', stripped.IndexOf(signature, StringComparison.Ordinal));
+        Assert.True(start >= 0, $"no body after {signature}");
+        var depth = 0;
+        for (var i = start; i < stripped.Length; i++)
+        {
+            if (stripped[i] == '{')
+            {
+                depth++;
+            }
+            else if (stripped[i] == '}' && --depth == 0)
+            {
+                return (start, i);
+            }
+        }
+
+        Assert.Fail($"unbalanced braces after {signature}");
+        return default;
     }
 
     private static List<SourceFile> Scope() =>

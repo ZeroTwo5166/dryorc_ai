@@ -21,9 +21,13 @@ namespace backend.Tests;
 /// <summary>
 /// Staff invite slice 5b: race safety of the cap, the resend cooldown, double
 /// accept and the row locks (DEC D10, D12, I5; design Section T rows T-I5a,
-/// T-I5b, T-I5c, T-I5d, T-I5f; T-I5e joins in slice 6). Service level, two
-/// operations in parallel, each in its own scope and so on its own
-/// connection.
+/// T-I5b, T-I5c, T-I5d, T-I5f; slice 6 adds T-I5e, cleanup versus resend,
+/// D9). Service level, two operations in parallel, each in its own scope and
+/// so on its own connection.
+///
+/// In the ConversationAutoClose collection (slice 6) because T-I5e seeds
+/// 31-day-expired rows, which the global StaffInvitationCleanup delete of a
+/// real DataLifecycle host could remove; see that collection's doc comment.
 ///
 /// Waiting is deterministic, never a fixed sleep (implementation design
 /// RY-2): the paused operation's IStaffInvitationLockCheckpoint double reads
@@ -34,6 +38,7 @@ namespace backend.Tests;
 /// TestBusinessCleanupTests.cs). The 50 ms poll interval is only the loop
 /// delay.
 /// </summary>
+[Collection("ConversationAutoClose")]
 public class StaffInvitationConcurrencyTests : IAsyncLifetime
 {
     private const string Password = "Passw0rd!!";
@@ -246,6 +251,56 @@ public class StaffInvitationConcurrencyTests : IAsyncLifetime
         Assert.False(await db.StaffInvitations.IgnoreQueryFilters().AnyAsync(i => i.Id == invitation.Id));
     }
 
+    // T-I5e (D9; design Section 12 "Resend interaction")
+    [Fact]
+    public async Task CleanupVersusResend_ResentRowSurvives()
+    {
+        var gate = new LockGate(StaffInvitationLockOperation.Resend);
+        var host = BuildHost(gate);
+        var (businessId, owner) = await SeedBusinessWithOwnerAsync(host);
+
+        // Order 1: resend holds the row lock; the cleanup DELETE waits for it,
+        // then re-evaluates its WHERE on the resent row and leaves it.
+        var resentId = await SeedExpiredRowAsync(host, businessId, owner.UserId, TimeSpan.FromDays(31));
+        var before = DateTimeOffset.UtcNow;
+        var resend = Task.Run(() => RunAsync(host, businessId, s => s.ResendAsync(owner, resentId, CancellationToken.None)));
+        Task<int> cleanup;
+        bool cleanupCompleted;
+        var blocked = false;
+        try
+        {
+            var resendPid = await gate.FirstPaused.Task.WaitAsync(Bound);
+            cleanup = Task.Run(() => RunCleanupAsync(host));
+
+            await WaitUntilAsync(Bound, async () => cleanup.IsCompleted || (blocked = await AnyBackendBlockedByAsync(resendPid)));
+            cleanupCompleted = cleanup.IsCompleted;
+        }
+        finally
+        {
+            gate.Release.TrySetResult();
+        }
+
+        var resendResult = await resend.WaitAsync(Bound);
+        await cleanup.WaitAsync(Bound);
+        var after = DateTimeOffset.UtcNow;
+
+        Assert.False(cleanupCompleted, "cleanup completed while resend held the row lock");
+        Assert.True(blocked, "cleanup was not seen blocked by resend's row lock");
+        Assert.Equal(StaffInvitationOutcome.Ok, resendResult.Outcome);
+        var survivor = await FindInvitationAsync(host, resentId);
+        Assert.True(survivor is not null, "the cleanup deleted the resent row");
+        Assert.InRange(survivor.ExpiresAt, before.AddDays(7).AddSeconds(-1), after.AddDays(7).AddSeconds(1));
+
+        // Order 2: the cleanup commits first; resend's row lock then finds no
+        // row and answers NotFound. The gate is released, so nothing pauses.
+        var deletedId = await SeedExpiredRowAsync(host, businessId, owner.UserId, TimeSpan.FromDays(31));
+        var deleted = await RunCleanupAsync(host);
+        Assert.True(deleted >= 1, $"the cleanup returned {deleted}, expected at least the seeded expired row");
+        Assert.Null(await FindInvitationAsync(host, deletedId));
+        var lateResend = await RunAsync(host, businessId, s => s.ResendAsync(owner, deletedId, CancellationToken.None));
+        Assert.Equal(StaffInvitationOutcome.NotFound, lateResend.Outcome);
+    }
+
     // ── Harness (private, per-file doubles; CustomersApiTests.cs convention) ──
 
     /// <summary>Reads the static AsyncLocal, so each parallel flow carries its own tenant (design V8 "no tenant" = null).</summary>
@@ -416,6 +471,47 @@ public class StaffInvitationConcurrencyTests : IAsyncLifetime
         await using var scope = host.Services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         return await db.StaffInvitations.IgnoreQueryFilters().AsNoTracking().SingleAsync(i => i.Id == id);
+    }
+
+    private static async Task<StaffInvitation?> FindInvitationAsync(WebApplicationFactory<Program> host, Guid id)
+    {
+        await using var scope = host.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        return await db.StaffInvitations.IgnoreQueryFilters().AsNoTracking().SingleOrDefaultAsync(i => i.Id == id);
+    }
+
+    /// <summary>The real cleanup service (Program.cs registration) in its own scope, so on its own connection; no tenant, as in the background job.</summary>
+    private static async Task<int> RunCleanupAsync(WebApplicationFactory<Program> host)
+    {
+        Tenant.Value = null;
+        await using var scope = host.Services.CreateAsyncScope();
+        return await scope.ServiceProvider.GetRequiredService<IStaffInvitationCleanupService>().DeleteExpiredAsync();
+    }
+
+    /// <summary>Seeds one row whose ExpiresAt is `expiredFor` in the past; CreatedAt = LastSentAt = ExpiresAt - 7 days, so every slice 2 CHECK holds and the resend cooldown has passed.</summary>
+    private static async Task<Guid> SeedExpiredRowAsync(WebApplicationFactory<Program> host, Guid businessId, Guid invitedBy, TimeSpan expiredFor)
+    {
+        await using var scope = host.Services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var userManager = scope.ServiceProvider.GetRequiredService<UserManager<ApplicationUser>>();
+        var email = NewEmail();
+        var expiresAt = DateTimeOffset.UtcNow - expiredFor;
+        var row = new StaffInvitation
+        {
+            Id = Guid.NewGuid(),
+            BusinessId = businessId,
+            Email = email,
+            NormalizedKey = userManager.NormalizeName(email),
+            Role = RoleNames.Agent,
+            TokenHash = SHA256.HashData(RandomNumberGenerator.GetBytes(32)),
+            InvitedByUserId = invitedBy,
+            CreatedAt = expiresAt.AddDays(-7),
+            LastSentAt = expiresAt.AddDays(-7),
+            ExpiresAt = expiresAt,
+        };
+        db.StaffInvitations.Add(row);
+        await db.SaveChangesAsync();
+        return row.Id;
     }
 
     /// <summary>Moves CreatedAt and LastSentAt back together (cooldown passed; CK_StaffInvitations_LastSentAt_Range holds).</summary>
