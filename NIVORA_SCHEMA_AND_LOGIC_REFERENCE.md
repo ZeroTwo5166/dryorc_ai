@@ -22,7 +22,7 @@ These aren't table-specific — they're constraints every service must respect r
 The tenant root. Every other table hangs off `BusinessId`.
 
 Key fields beyond the obvious:
-- `RetentionDays` — how long this business's conversations/messages are retained (30–730 days). **No enforcement job exists yet — this needs to be built** (a scheduled job that finds and anonymizes/deletes expired `Conversation`/`Message` rows).
+- `RetentionDays` — how long this business's conversations/messages are retained (30–730 days). Enforced by `RetentionEnforcementService`, run daily by `DataLifecycleBackgroundService`: expired `Conversation` rows are anonymized and their `Message` rows deleted (Section 3.5).
 - `AgentsCanApproveActions` — governs the AI Action Safety Model's human-approval pipeline eligibility.
 - `AutoRefundLimit` / `AutoRefundLimitCurrency` — the maximum amount Nivora may refund autonomously (`Auto` mode) without human approval. `null` = auto-refund disabled entirely, not "unlimited." Refunds above this trigger a `Ticket` with `PriorityReason = RefundLimitReached`.
 - `CancelOrderRestocksInventory` / `StoreCreditRefundsEnabled` — policy toggles read by the cancellation/refund services; not yet wired into application code (currently hardcoded defaults).
@@ -182,7 +182,7 @@ Common pattern across all three:
 9. Write an `AuditLog` entry (`Actor = Ai`, `ConversationId` set) reflecting the outcome.
 10. Release the lock (transaction commit).
 
-### 3.5 Retention enforcement job (not yet built — high priority gap)
+### 3.5 Retention enforcement job (built: `RetentionEnforcementService`, run daily by `DataLifecycleBackgroundService`)
 
 A scheduled background job, per business:
 1. Find `Conversation` rows where `CreatedAt < now - Business.RetentionDays`.
@@ -216,6 +216,6 @@ Tags must be normalized (lowercase/kebab-case recommended) consistently everywhe
 1. ~~**Retention enforcement job does not exist.** `Business.RetentionDays` is a real, validated column with no scheduled process acting on it.~~ **RESOLVED** — `RetentionEnforcementService` enforces `Business.RetentionDays`, run by `DataLifecycleBackgroundService` (`af73918`; DEC D16 of the staff invite workstream records this lag).
 2. **Customer/order ownership cross-check for write tools is unresolved** — documented hard blocker, must be built before `cancelOrder`/`refundOrder`/`updateCustomer` go live.
 3. **`AuditLog.LogAsync`'s PII allowlist validation** is designed conceptually but not built — currently the PII rule relies on discipline at each call site.
-4. **Retention periods for `AuditLog`, `FlaggedCustomerActivityLog`, `VerificationCode` are not numerically decided** — placeholder/no enforcement yet.
+4. **Retention periods for `AuditLog` and `FlaggedCustomerActivityLog` are not numerically decided** — placeholder/no enforcement yet. VerificationCode rows are deleted 30 days after ExpiresAt by VerificationCodeCleanupService (fixed constant), run daily by DataLifecycleBackgroundService.
 5. **Whether a `Refund` can exist with zero `RefundItem` rows is undecided** — needs a product decision, then service-layer enforcement (can't be a DB constraint).
 6. **`Business.CancelOrderRestocksInventory` and `AutoRefundLimit` exist in the schema but application code doesn't read from them yet** — services currently need to be pointed at these instead of hardcoded defaults.

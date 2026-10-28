@@ -138,7 +138,7 @@ v1 described a single conversation-retention clock. That's now understood to be 
 | 1 | `Conversation`/`Message` (`Business.RetentionDays`) | Column real, business-configurable (30–730 days) — enforced by `RetentionEnforcementService`, run by `DataLifecycleBackgroundService` (`af73918`; DEC D16 of the staff invite workstream records this lag) |
 | 2 | `AuditLog` | Not numerically decided — needs legal input; lower urgency since the table is PII-free by design |
 | 3 | `FlaggedCustomerActivityLog` | Not decided — likely short (30–90 days floated, not locked); holds real customer PII |
-| 4 | `VerificationCode` | Not decided — likely very short (days); no long-term reason to retain |
+| 4 | `VerificationCode` | VerificationCode rows are deleted 30 days after ExpiresAt by VerificationCodeCleanupService (fixed constant), run daily by DataLifecycleBackgroundService |
 | 5 | `OrderCancellation.ExternalOrderId` / `Refund.ExternalRefundId` | Currently kept indefinitely (treated as durable operational fact, not identity pointer) — not yet reviewed against a defined necessity window |
 | 6 | Backup retention | Infrastructure-level, must be documented separately per original Section 10.4 |
 | 7 | `StaffInvitations` | StaffInvitations: deleted 30 days after ExpiresAt; accept and revoke delete at once (`StaffInvitationCleanupService`, a `DataLifecycleBackgroundService` job, C6 `136c10d`; DEC D9) |
