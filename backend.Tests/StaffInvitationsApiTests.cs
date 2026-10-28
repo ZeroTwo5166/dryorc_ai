@@ -1,5 +1,4 @@
 using System.Buffers.Text;
-using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Json;
 using System.Security.Claims;
@@ -424,11 +423,7 @@ public class StaffInvitationsApiTests : IAsyncLifetime
     public async Task Token_NeverPersistedLoggedAuditedOrReturned()
     {
         var logs = new CapturingLoggerProvider();
-        var host = _factory.WithWebHostBuilder(b => b.ConfigureLogging(l =>
-        {
-            l.AddProvider(logs);
-            l.AddFilter<CapturingLoggerProvider>(null, LogLevel.Trace);
-        }));
+        var host = CapturingLoggerProvider.Attach(_factory, logs);
         var (businessId, owner) = await SeedBusinessWithLoggedInOwnerAsync(host);
         var email = NewEmail();
         var bodies = new List<string>();
@@ -497,12 +492,19 @@ public class StaffInvitationsApiTests : IAsyncLifetime
             Assert.DoesNotContain(token, auditValues, StringComparison.Ordinal);
             Assert.DoesNotContain(token, notifications, StringComparison.Ordinal);
             Assert.All(bodies, body => Assert.DoesNotContain(token, body, StringComparison.Ordinal));
-            Assert.All(captured, e =>
-            {
-                Assert.DoesNotContain(token, e.Message, StringComparison.Ordinal);
-                Assert.DoesNotContain(token, e.Exception ?? "", StringComparison.Ordinal);
-            });
         }
+
+        var invokerTraceForPreview = captured.Any(e =>
+            e.Category.Contains("ControllerActionInvoker", StringComparison.Ordinal)
+            && e.Level == LogLevel.Trace
+            && e.Message.Contains("PreviewStaffInvitationRequest", StringComparison.Ordinal));
+        Assert.True(invokerTraceForPreview,
+            "positive control: no ControllerActionInvoker Trace entry holds PreviewStaffInvitationRequest");
+
+        LogCaptureAssert.NoneContain(
+            captured,
+            [.. tokens.Select((value, n) => new DeniedValue($"T-I3 token {n}", value)),
+             new DeniedValue("T-I3 Password constant", Password)]);
     }
 
     // T-I4: every 403 cell of design Section 9; nothing changes.
@@ -851,35 +853,6 @@ public class StaffInvitationsApiTests : IAsyncLifetime
     private sealed record HttpResult(HttpStatusCode Status, string Body);
 
     private sealed record MatrixCell(HttpStatusCode Status, Guid BusinessId, int InvitationsBefore, int AuditsBefore, StaffInvitation? Target);
-
-    private sealed record CapturedLog(string Category, LogLevel Level, string Message, string? Exception);
-
-    /// <summary>
-    /// T-I3: records every log line of the host it is added to, with its
-    /// category, level and formatted message.
-    /// </summary>
-    private sealed class CapturingLoggerProvider : ILoggerProvider
-    {
-        private readonly ConcurrentQueue<CapturedLog> _entries = new();
-
-        public IReadOnlyList<CapturedLog> Entries => _entries.ToArray();
-
-        public ILogger CreateLogger(string categoryName) => new CapturingLogger(categoryName, _entries);
-
-        public void Dispose()
-        {
-        }
-
-        private sealed class CapturingLogger(string category, ConcurrentQueue<CapturedLog> entries) : ILogger
-        {
-            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-
-            public bool IsEnabled(LogLevel logLevel) => true;
-
-            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) =>
-                entries.Enqueue(new CapturedLog(category, logLevel, formatter(state, exception), exception?.ToString()));
-        }
-    }
 
     private static HttpClient NewClient(WebApplicationFactory<Program> host) =>
         host.CreateClient(new() { BaseAddress = new Uri("https://localhost") });

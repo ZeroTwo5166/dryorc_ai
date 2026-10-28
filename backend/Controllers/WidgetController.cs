@@ -1,4 +1,5 @@
 using System.Security.Claims;
+using System.Text;
 using backend.Auth;
 using backend.Data;
 using backend.Enums;
@@ -16,7 +17,19 @@ namespace backend.Controllers;
 /// and additive — an absent or invalid value never fails Init itself, it
 /// only means the resulting session starts without a resolved CustomerId.
 /// See ISignedIdentityTokenService.</summary>
-public record WidgetInitRequest(string PublicKey, string? VisitorSessionId, string? SignedIdentityToken = null);
+public record WidgetInitRequest(string PublicKey, string? VisitorSessionId, string? SignedIdentityToken = null)
+{
+    // ASP.NET Core logs action arguments at Trace level through the record's
+    // ToString, so the visitor session id and the signed identity token print as [redacted].
+    protected virtual bool PrintMembers(StringBuilder builder)
+    {
+        builder.Append("PublicKey = ");
+        builder.Append(PublicKey);
+        builder.Append(", VisitorSessionId = [redacted]");
+        builder.Append(", SignedIdentityToken = [redacted]");
+        return true;
+    }
+}
 
 public record WidgetInitResponse(string VisitorSessionId, string Token);
 
@@ -69,7 +82,20 @@ public record WidgetVerificationRequestResponse(bool Sent);
 
 /// <summary>Email must be re-submitted alongside Code — see
 /// IVerificationCodeService.VerifyCodeAsync's own doc comment for why.</summary>
-public record WidgetVerificationVerifyRequest(Guid ConversationId, string Email, string Code);
+public record WidgetVerificationVerifyRequest(Guid ConversationId, string Email, string Code)
+{
+    // ASP.NET Core logs action arguments at Trace level through the record's
+    // ToString, so the code prints as [redacted].
+    protected virtual bool PrintMembers(StringBuilder builder)
+    {
+        builder.Append("ConversationId = ");
+        builder.Append(ConversationId);
+        builder.Append(", Email = ");
+        builder.Append(Email);
+        builder.Append(", Code = [redacted]");
+        return true;
+    }
+}
 
 /// <summary>Reason is null on success; otherwise the raw
 /// VerificationFailureReason name (never the raw code or raw email).</summary>

@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace backend.Auth;
 
 /// <summary>
@@ -7,11 +9,38 @@ namespace backend.Auth;
 /// authenticated inviter and is out of this step's scope (no such endpoint
 /// exists yet).
 /// </summary>
-public record RegisterRequest(string BusinessName, string TimeZone, string Email, string Password);
+public record RegisterRequest(string BusinessName, string TimeZone, string Email, string Password)
+{
+    // ASP.NET Core logs action arguments at Trace level through the record's
+    // ToString, so the password prints as [redacted].
+    protected virtual bool PrintMembers(StringBuilder builder)
+    {
+        builder.Append("BusinessName = ");
+        builder.Append(BusinessName);
+        builder.Append(", TimeZone = ");
+        builder.Append(TimeZone);
+        builder.Append(", Email = ");
+        builder.Append(Email);
+        builder.Append(", Password = [redacted]");
+        return true;
+    }
+}
 
 public record RegisterResponse(Guid UserId, Guid BusinessId, string Email);
 
-public record LoginRequest(string Email, string Password, bool RememberMe = false);
+public record LoginRequest(string Email, string Password, bool RememberMe = false)
+{
+    // ASP.NET Core logs action arguments at Trace level through the record's
+    // ToString, so the password prints as [redacted].
+    protected virtual bool PrintMembers(StringBuilder builder)
+    {
+        builder.Append("Email = ");
+        builder.Append(Email);
+        builder.Append(", Password = [redacted], RememberMe = ");
+        builder.Append(RememberMe);
+        return true;
+    }
+}
 
 public record LoginResponse(Guid UserId, Guid BusinessId, string Email, IReadOnlyList<string> Roles);
 
@@ -28,13 +57,35 @@ public record MeResponse(
     bool ScheduledReportsEnabled,
     bool StaffInvitesEnabled);
 
-public record ConfirmEmailRequest(Guid UserId, string Token);
+public record ConfirmEmailRequest(Guid UserId, string Token)
+{
+    // ASP.NET Core logs action arguments at Trace level through the record's
+    // ToString, so the token prints as [redacted].
+    protected virtual bool PrintMembers(StringBuilder builder)
+    {
+        builder.Append("UserId = ");
+        builder.Append(UserId);
+        builder.Append(", Token = [redacted]");
+        return true;
+    }
+}
 
 public record ResendVerificationRequest(string Email);
 
 public record ForgotPasswordRequest(string Email);
 
-public record ResetPasswordRequest(Guid UserId, string Token, string NewPassword);
+public record ResetPasswordRequest(Guid UserId, string Token, string NewPassword)
+{
+    // ASP.NET Core logs action arguments at Trace level through the record's
+    // ToString, so the token and the new password print as [redacted].
+    protected virtual bool PrintMembers(StringBuilder builder)
+    {
+        builder.Append("UserId = ");
+        builder.Append(UserId);
+        builder.Append(", Token = [redacted], NewPassword = [redacted]");
+        return true;
+    }
+}
 
 /// <summary>
 /// Response to POST /api/auth/extend-session — the new absolute expiry the
