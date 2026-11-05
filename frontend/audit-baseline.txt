@@ -1,0 +1,8 @@
+@typescript-eslint/eslint-plugin
+@typescript-eslint/parser
+@typescript-eslint/type-utils
+@typescript-eslint/typescript-estree
+@typescript-eslint/utils
+eslint-config-next
+minimatch
+typescript-eslint
