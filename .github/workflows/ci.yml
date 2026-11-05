@@ -493,6 +493,14 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: frontend - npm audit baseline check
+        working-directory: frontend
+        env:
+          npm_config_cache: ${{ runner.temp }}/npm-audit/cache
+          npm_config_logs_dir: ${{ runner.temp }}/npm-audit/logs
+          npm_config_update_notifier: 'false'
+        run: node ../scripts/npm-audit-baseline.mjs check .
+
       - name: frontend - eslint
         working-directory: frontend
         run: npm run lint
@@ -504,6 +512,14 @@ jobs:
       - name: widget-client - install
         working-directory: widget-client
         run: npm ci
+
+      - name: widget-client - npm audit baseline check
+        working-directory: widget-client
+        env:
+          npm_config_cache: ${{ runner.temp }}/npm-audit/cache
+          npm_config_logs_dir: ${{ runner.temp }}/npm-audit/logs
+          npm_config_update_notifier: 'false'
+        run: node ../scripts/npm-audit-baseline.mjs check .
 
       - name: widget-client - tsc --noEmit
         working-directory: widget-client
