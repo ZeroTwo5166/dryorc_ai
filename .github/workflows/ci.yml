@@ -528,3 +528,9 @@ jobs:
       - name: widget-client - vitest
         working-directory: widget-client
         run: npm test
+
+      - name: frontend - next build
+        working-directory: frontend
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: npm run build
