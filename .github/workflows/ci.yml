@@ -529,6 +529,24 @@ jobs:
         working-directory: widget-client
         run: npm test
 
+      - name: widget-client - build
+        working-directory: widget-client
+        run: npm run build
+
+      - name: widget-client - bundle drift check
+        run: |
+          rc=0
+          git diff --exit-code -- backend/wwwroot/widget/nivora-widget.js || {
+            diff_rc=$?
+            echo "git diff exit status: $diff_rc"
+            if [ "$diff_rc" -eq 1 ]; then rc=1; else rc=2; fi
+          }
+          if ! status="$(git status --porcelain --untracked-files=all -- backend/wwwroot/widget widget-client)"; then
+            echo "git status failed"; rc=2
+          fi
+          if [ -n "$status" ]; then printf '%s\n' "$status"; [ "$rc" -eq 2 ] || rc=1; fi
+          exit "$rc"
+
       - name: frontend - next build
         working-directory: frontend
         env:
