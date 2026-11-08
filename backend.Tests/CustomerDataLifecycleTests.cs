@@ -28,6 +28,10 @@ namespace backend.Tests;
 /// SQL in DisposeAsync, in FK-safe order, so this suite leaves the dev DB
 /// exactly as it found it — same discipline as the existing test suites.
 /// </summary>
+// Serialise with the global-sweep tests: this class runs global retention and
+// cleanup sweeps and seeds expired rows that their sweeps can purge first
+// (LE-RETENTION-RACE, R-D60). See ConversationAutoCloseTestCollection.
+[Collection("ConversationAutoClose")]
 public class CustomerDataLifecycleTests : IAsyncLifetime
 {
     private ServiceProvider _provider = null!;
